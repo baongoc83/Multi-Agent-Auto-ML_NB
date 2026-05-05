@@ -1,0 +1,28 @@
+{
+  "agent": "DataCleaner",
+  "original_shape": [
+    200,
+    10
+  ],
+  "final_shape": [
+    200,
+    8
+  ],
+  "actions_taken": [
+    "Dropped column 'employee_id': Unique identifier with no predictive value",
+    "Dropped column 'useless_feature': Over 80% missing values, not useful for analysis",
+    "Imputed 'age' with median: 15% missing numeric values",
+    "Imputed 'annual_income' with median: 10.5% missing numeric values"
+  ],
+  "summary": "Performed 4 cleaning actions: Dropped column 'employee_id': Unique identifier with no predictive value; Dropped column 'useless_feature': Over 80% missing values, not useful for analysis; Imputed 'age' with median: 15% missing numeric values; and 1 more actions.",
+  "columns_remaining": [
+    "age",
+    "years_experience",
+    "education_level",
+    "annual_income",
+    "department",
+    "location",
+    "random_noise",
+    "high_performer"
+  ]
+}

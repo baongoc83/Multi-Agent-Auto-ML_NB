@@ -1,0 +1,25 @@
+{
+  "agent": "DataCleaner",
+  "original_shape": [
+    100,
+    6
+  ],
+  "final_shape": [
+    100,
+    4
+  ],
+  "actions_taken": [
+    "Dropped column 'id': Unique identifier with no predictive value",
+    "Imputed 'age' with median: 31% missing numeric values",
+    "Imputed 'income' with median: 8% missing numeric values",
+    "Imputed 'category' with mode: 13% missing categorical values",
+    "Dropped column 'useless_col': 100% missing values, no useful information"
+  ],
+  "summary": "Performed 5 cleaning actions: Dropped column 'id': Unique identifier with no predictive value; Imputed 'age' with median: 31% missing numeric values; Imputed 'income' with median: 8% missing numeric values; and 2 more actions.",
+  "columns_remaining": [
+    "age",
+    "income",
+    "category",
+    "target"
+  ]
+}
