@@ -23,7 +23,7 @@ class BaseAgent:
         return any(kw in str(exc).lower() for kw in ("connection", "refused", "unreachable", "timeout", "connect"))
 
     def _call_via_proxy(self, model: str, system_prompt: str, prompt: str) -> str:
-        response = self.client.chat.completions.create(
+        response = self.client.chat.completions.create( 
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
