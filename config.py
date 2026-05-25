@@ -42,6 +42,20 @@ class Config:
     HIGH_CARDINALITY_THRESHOLD: int = int(os.getenv("HIGH_CARDINALITY_THRESHOLD", 50))
     # How many columns' stats to include in the analysis sample
     SAMPLE_STATS_PREVIEW: int = int(os.getenv("SAMPLE_STATS_PREVIEW", 3))
+    # Duplicate row percentage above this triggers a drop suggestion
+    DUPLICATE_PCT_THRESHOLD: float = float(os.getenv("DUPLICATE_PCT_THRESHOLD", 1.0))
+    # Composite key violation percentage above this triggers deduplicate_by_key suggestion
+    PK_VIOLATION_PCT_THRESHOLD: float = float(os.getenv("PK_VIOLATION_PCT_THRESHOLD", 1.0))
+    # Orphan entity percentage above this is flagged (no identity anchor at all)
+    ENTITY_ORPHAN_PCT_THRESHOLD: float = float(os.getenv("ENTITY_ORPHAN_PCT_THRESHOLD", 5.0))
+    # Ambiguous identity values percentage above this is flagged as potential fraud ring
+    AMBIGUOUS_IDENTITY_PCT_THRESHOLD: float = float(os.getenv("AMBIGUOUS_IDENTITY_PCT_THRESHOLD", 5.0))
+    # Outlier percentage (IQR 3x) above this triggers a clip suggestion
+    OUTLIER_PCT_THRESHOLD: float = float(os.getenv("OUTLIER_PCT_THRESHOLD", 5.0))
+    # Class imbalance ratio (max/min class count) above this is flagged
+    IMBALANCE_RATIO_THRESHOLD: float = float(os.getenv("IMBALANCE_RATIO_THRESHOLD", 10.0))
+    # Max numeric columns to run outlier detection on (for performance)
+    OUTLIER_NUMERIC_COLS_LIMIT: int = int(os.getenv("OUTLIER_NUMERIC_COLS_LIMIT", 10))
 
     # ── Feature Engineering ───────────────────────────────────────────────────
     HIGH_CORRELATION_THRESHOLD: float = float(os.getenv("HIGH_CORRELATION_THRESHOLD", 0.5))
