@@ -17,9 +17,11 @@ def main():
     if len(sys.argv) > 2:
         input_csv = sys.argv[1]
         target_column = sys.argv[2]
+        col_descriptions_path = sys.argv[3] if len(sys.argv) > 3 else None
     else:
         input_csv = f"{Config.OUTPUT_DIR}/sample_data.csv"
         target_column = "target"
+        col_descriptions_path = None
         print(f"Using sample data: {input_csv}")
         print(f"Target column: {target_column}\n")
 
@@ -27,7 +29,7 @@ def main():
 
     try:
         print("Starting the Multi-Agent Pipeline...\n")
-        final_metrics = pipeline.run(input_csv, target_column)
+        final_metrics = pipeline.run(input_csv, target_column, col_descriptions_path=col_descriptions_path)
 
         print("\nPIPELINE COMPLETE!")
         print(f"\nFinal Model Metrics (best: {final_metrics.get('best_model', 'unknown')}):")
@@ -57,7 +59,8 @@ def main():
 
 if __name__ == "__main__":
     print("\nUsage:")
-    print("  python main.py                          # use sample data")
-    print("  python main.py data.csv target_column   # use your own data")
+    print("  python main.py                                                    # use sample data")
+    print("  python main.py data.csv target_column                            # use your own data")
+    print("  python main.py data.csv target_column col_descriptions.json      # with column metadata")
     print()
     main()

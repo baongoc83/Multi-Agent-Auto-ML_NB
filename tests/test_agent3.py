@@ -1,12 +1,12 @@
 import sys
+import json
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 import pandas as pd
-from pathlib import Path
 from logger import AgentLogger
-from agent_model_trainer import ModelTrainerAgent
+from agent_train_model import TrainModelAgent
 from config import Config
-import json
 
 def test_agent3():
     print("Testing Agent 3: Model Trainer")
@@ -30,72 +30,72 @@ def test_agent3():
     print(f"  Shape: {df.shape}")
     print(f"  Features: {list(df.columns)}\n")
     
-    previous_report = {
-        "agent": "FeatureEngineer",
-        "summary": "Created 2 interaction features and encoded categorical variables"
-    }
+    fe_report_path = Path("outputs/feature_engineer_report.json")
+    if fe_report_path.exists():
+        with open(fe_report_path, encoding="utf-8") as f:
+            previous_report = json.load(f)
+        print(f"Loaded FeatureEngineer report from: {fe_report_path}")
+        print(f"  entity_id_col     : {previous_report.get('entity_id_col')}")
+        print(f"  composite_key_cols: {previous_report.get('composite_key_cols', [])}\n")
+    else:
+        previous_report = {
+            "agent": "FeatureEngineer",
+            "summary": "Created 2 interaction features and encoded categorical variables",
+        }
+        print("WARNING: feature_engineer_report.json not found — using mock report (no key columns)\n")
     
     logger = AgentLogger("outputs/test_agent3.log")
-    agent = ModelTrainerAgent(logger)
+    # agent = ModelTrainerAgent(logger)
+    agent = TrainModelAgent(logger)
     
     print("Agent 3 is now training models with feedback loop...")
     
     try:
         final_metrics, report = agent.process(df, previous_report, "target")
-        
-        print("AGENT 3 RESULTS")
-        
-        print(f"\nTraining complete!")
+
+        print("\nAGENT 3 RESULTS")
         print(f"Report saved to: outputs/model_trainer_report.json")
-        print(f"Final code saved to: outputs/final_model_code.py")
-        
-        print(f"\nTotal Iterations: {report['total_iterations']}")
-        
-        print("\nTraining History:")
-        for entry in report['training_history']:
-            print(f"  Iteration {entry['iteration']} (best: {entry['metrics'].get('best_model', 'unknown')}):")
-            for metric, value in entry['metrics'].items():
-                if isinstance(value, float):
-                    print(f"    - {metric}: {value:.4f}")
-            comparison = entry['metrics'].get('model_comparison', {})
-            if comparison:
-                primary = 'roc_auc_score' if any('roc_auc_score' in v for v in comparison.values()) else 'r2'
-                scores = ', '.join(f"{m}: {v.get(primary, 'N/A'):.4f}" if isinstance(v.get(primary), float) else f"{m}: N/A" for m, v in comparison.items())
-                print(f"    - comparison ({primary}): {scores}")
 
-        print(f"\nBest Model: {final_metrics.get('best_model', 'unknown')}")
-        print("\nFinal Metrics:")
-        for metric, value in final_metrics.items():
-            if isinstance(value, float):
-                print(f"  - {metric}: {value:.4f}")
-        comparison = final_metrics.get('model_comparison', {})
-        if comparison:
-            primary = 'roc_auc_score' if any('roc_auc_score' in v for v in comparison.values()) else 'r2'
-            print(f"  - model_comparison ({primary}):")
-            for model_name, model_metrics in comparison.items():
-                val = model_metrics.get(primary)
-                print(f"      {model_name}: {val:.4f}" if isinstance(val, float) else f"      {model_name}: N/A")
+        # Best model
+        print(f"\nBest Estimator : {report.get('best_estimator', 'unknown')}")
 
-        print(f"\nSummary: {report['summary']}")
+        # Feature pipeline reduction
+        fp = report.get("feature_pipeline", {})
+        print("\nFeature Pipeline:")
+        print(f"  Init features    : {fp.get('n_init', 'N/A')}")
+        print(f"  After RFE        : {fp.get('n_after_rfe', 'N/A')}")
+        print(f"  After PSI        : {fp.get('n_after_psi', 'N/A')}")
+        print(f"  After Stability  : {fp.get('n_after_stability', 'N/A')}")
+        print(f"  Final features   : {fp.get('n_final', 'N/A')}")
+        print(f"  Final feature list: {fp.get('final_features', [])}")
 
-        final_code_path = Path("outputs/final_model_code.py")
-        if final_code_path.exists():
-            final_code = final_code_path.read_text()
-            print("\nFinal Model Code (first 500 chars):")
-            print(final_code[:500] + ("..." if len(final_code) > 500 else ""))
-        else:
-            print(f"\nFinal model code not found at {final_code_path}")
-        
+        # Data split sizes
+        splits = report.get("splits", {})
+        if splits:
+            print("\nData Splits (rows):")
+            for split_name, n_rows in splits.items():
+                print(f"  {split_name:<18}: {n_rows}")
+
+        # Metrics — final_metrics is the same object as report["metrics"]
+        print("\nModel Metrics:")
+        for key in ("cv_auc_mean", "cv_auc_std", "valid_temporal_auc",
+                    "valid_random_auc", "valid_auc", "oot_auc"):
+            val = final_metrics.get(key)
+            if isinstance(val, float):
+                print(f"  {key:<22}: {val:.4f}")
+
+        # Best params (top 6)
+        best_params = report.get("best_params", {})
+        if best_params:
+            print("\nTop Hyperparameters:")
+            for k, v in list(best_params.items())[:6]:
+                print(f"  {k}: {v}")
+
+        print(f"\nSummary: {report.get('summary', 'N/A')}")
+
         logger.save()
         print(f"\nExecution log saved to: {logger.log_file}")
-        
-        print("FEEDBACK LOOP VERIFICATION")
-        if report['total_iterations'] > 1:
-            print(f"Agent made {report['total_iterations']} attempts")
-            print("Feedback loop worked: Agent iterated to improve performance")
-        else:
-            print("Agent achieved satisfactory performance in first attempt")
-        
+
     except Exception as e:
         print(f"\nError during processing: {e}")
         import traceback
