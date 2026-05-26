@@ -14,6 +14,8 @@ class DataCleanerAgent(BaseAgent):
         super().__init__(name="DataCleaner", role="Data Quality Auditor", logger=logger)
         self.df: pd.DataFrame = None
         self.tool_registry = ToolRegistry()
+        self._entity_id_col: Optional[str] = None
+        self._composite_key_cols: List[str] = []
         self._register_tools()
 
     def _register_tools(self):
@@ -448,6 +450,8 @@ class DataCleanerAgent(BaseAgent):
             "actions_taken": actions_taken,
             "summary": self._generate_summary(actions_taken),
             "columns_remaining": list(self.df.columns),
+            "entity_id_col": self._entity_id_col,
+            "composite_key_cols": self._composite_key_cols,
         }
         self.save_report(report, Config.DATA_CLEANER_REPORT_PATH)
 
@@ -490,6 +494,10 @@ class DataCleanerAgent(BaseAgent):
                      if any(kw in c.lower() for kw in ("date", "time", "timestamp", "dt"))]
         composite_key_cols = [entity_id_col] + date_cols[:1]
 
+        # Store for report so downstream agents can skip these cols
+        self._entity_id_col = entity_id_col
+        self._composite_key_cols = composite_key_cols
+
         # Auto-detect label col
         label_candidates = [c for c in self.df.columns
                             if c.lower() in ("target", "label", "y", "class", "output", "default_flag", "fraud")]
@@ -517,7 +525,8 @@ class DataCleanerAgent(BaseAgent):
             label_col=label_col,
             identity_cols=identity_cols if identity_cols else None,
         )
-
+# - For numeric columns with missing values, prefer median imputation
+# - For categorical columns with missing values, prefer mode imputation
     def _get_system_prompt(self) -> str:
         return f"""You are the Data Cleaner Agent, an expert data quality auditor.
 
@@ -535,14 +544,12 @@ Your task:
 Guidelines:
 - Drop columns with >{Config.NULL_DROP_THRESHOLD * 100:.0f}% missing values (unless they seem important)
 - Drop ID columns or columns with all unique values (no predictive power)
-- For numeric columns with missing values, prefer median imputation
-- For categorical columns with missing values, prefer mode imputation
 - Drop duplicate rows if exact_duplicate_pct > {Config.DUPLICATE_PCT_THRESHOLD:.1f}%
 - Clip outliers in a numeric column if outlier_percentage > {Config.OUTLIER_PCT_THRESHOLD:.1f}%
 - Flag (but do not drop) label column if imbalance_ratio > {Config.IMBALANCE_RATIO_THRESHOLD:.0f}
 - Flag future dates or potential leakage columns found in temporal integrity check
 
-PK & Uniqueness (Banking / Fraud domains — apply stricter thresholds):
+PK & Uniqueness (Banking / Fraud, Credit, Propensity domains — apply stricter thresholds):
 - Any label_contamination_count > 0                      → CRITICAL: deduplicate_by_key (keep='first')
 - Composite key violation > {Config.PK_VIOLATION_PCT_THRESHOLD:.1f}%                     → deduplicate_by_key
 - Ambiguous identity values > {Config.AMBIGUOUS_IDENTITY_PCT_THRESHOLD:.1f}% per identity column → flag as potential fraud ring (do not drop)

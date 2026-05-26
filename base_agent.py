@@ -110,7 +110,7 @@ class BaseAgent:
     def save_report(self, report: Dict[str, Any], filename: str):
         report_path = Path(filename)
         report_path.parent.mkdir(exist_ok=True)
-        with open(report_path, "w") as f:
+        with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report, indent=2, fp=f)
         self.logger.log(self.name, "Report Saved", f"Saved to {filename}")
 

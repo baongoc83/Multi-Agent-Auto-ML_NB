@@ -1,10 +1,10 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 import json
 from sklearn.preprocessing import LabelEncoder
-from sklearn.feature_selection import SelectKBest, f_classif, f_regression
+from sklearn.feature_selection import SelectKBest, f_classif, f_regression, VarianceThreshold
 from base_agent import BaseAgent, ToolRegistry
 from logger import AgentLogger
 from config import Config
@@ -12,12 +12,27 @@ from config import Config
 
 class FeatureEngineerAgent(BaseAgent):
 
-    def __init__(self, logger: AgentLogger):
+    def __init__(self, logger: AgentLogger, col_descriptions_path: Optional[str] = None):
         super().__init__(name="FeatureEngineer", role="Feature Architect", logger=logger)
         self.df: pd.DataFrame = None
         self.target_column: str = None
+        self._protected_cols: set = set()
+        self._col_descriptions: Dict[str, str] = self._load_col_descriptions(col_descriptions_path)
         self.tool_registry = ToolRegistry()
         self._register_tools()
+
+    def _load_col_descriptions(self, path: Optional[str]) -> Dict[str, str]:
+        if not path:
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+            self.logger.log(self.name, "WARN", f"col_descriptions file must be a JSON object, got {type(data).__name__}")
+        except Exception as e:
+            self.logger.log(self.name, "WARN", f"Could not load col_descriptions from '{path}': {e}")
+        return {}
 
     def _register_tools(self):
         self.tool_registry.register(
@@ -60,7 +75,13 @@ class FeatureEngineerAgent(BaseAgent):
             df[new_col] = eval(expression, {"__builtins__": {}}, safe_locals)  # noqa: S307
             df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
             df[new_col] = df[new_col].fillna(df[new_col].median())
+            # Drop if constant or all-NaN — causes divide-by-zero in correlation/SelectKBest
+            if df[new_col].isna().all() or df[new_col].std() == 0:
+                df = df.drop(columns=[new_col])
+                raise ValueError(f"Generated feature '{new_col}' is constant or all-NaN after fill — dropped")
             return df
+        except ValueError:
+            raise
         except Exception as e:
             raise ValueError(f"Error creating interaction '{new_col}': {e}")
 
@@ -89,9 +110,18 @@ class FeatureEngineerAgent(BaseAgent):
             numeric_cols.remove(target)
 
         correlations = {}
+        unreliable = []  # columns where null_pct > 30% — correlation may be biased
         for col in numeric_cols:
+            null_pct = df[col].isnull().mean() * 100
+            # Skip zero-variance columns — corr() divides by std=0 → RuntimeWarning + NaN
+            if df[col].std() == 0:
+                correlations[col] = 0.0
+                continue
+            # pandas corr() drops NaN pairwise — works but biased for high-null cols
             corr = df[col].corr(df[target])
             correlations[col] = round(corr, 4) if not pd.isna(corr) else 0.0
+            if null_pct > 30:
+                unreliable.append(f"{col} ({null_pct:.1f}% null)")
 
         sorted_corrs = dict(sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True))
 
@@ -99,6 +129,7 @@ class FeatureEngineerAgent(BaseAgent):
             "correlations": sorted_corrs,
             "high_correlation": [k for k, v in sorted_corrs.items() if abs(v) > Config.HIGH_CORRELATION_THRESHOLD],
             "low_correlation": [k for k, v in sorted_corrs.items() if abs(v) < Config.LOW_CORRELATION_THRESHOLD],
+            "unreliable_due_to_nulls": unreliable,
         }
         return json.dumps(result, indent=2)
 
@@ -109,23 +140,48 @@ class FeatureEngineerAgent(BaseAgent):
         X = df.drop(columns=[target])
         y = df[target]
 
-        numeric_features = X.select_dtypes(include=[np.number]).columns
-        X_numeric = X[numeric_features]
+        # Non-numeric columns cannot be scored by SelectKBest — always preserve them
+        non_numeric_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
+
+        # Drop rows where target is null — sklearn cannot handle NaN in y
+        valid_mask = y.notna()
+        X_valid = X[valid_mask]
+        y_valid = y[valid_mask]
+
+        numeric_features = X_valid.select_dtypes(include=[np.number]).columns
+        X_numeric = X_valid[numeric_features]
 
         if len(numeric_features) == 0:
-            raise ValueError("No numeric features available for selection")
+            # No numeric features to select — keep everything
+            return df
 
-        k = min(k, len(numeric_features))
-        is_classification = y.nunique() < Config.CLASSIFICATION_UNIQUE_THRESHOLD
+        # Impute NaN with column median for SelectKBest only — original df is unchanged
+        X_for_selection = X_numeric.fillna(X_numeric.median())
+
+        # Remove zero-variance columns before SelectKBest — they cause divide-by-zero warnings
+        vt = VarianceThreshold(threshold=0.0)
+        X_for_selection = pd.DataFrame(
+            vt.fit_transform(X_for_selection),
+            columns=X_for_selection.columns[vt.get_support()],
+        )
+        non_zero_var_features = X_for_selection.columns
+
+        k = min(k, len(non_zero_var_features))
+        if k == 0:
+            # All numeric features had zero variance — keep non-numeric cols + target only
+            final_cols = non_numeric_cols + [target]
+            return df[final_cols]
+
+        is_classification = y_valid.nunique() < Config.CLASSIFICATION_UNIQUE_THRESHOLD
         score_func = f_classif if is_classification else f_regression
 
         selector = SelectKBest(score_func=score_func, k=k)
-        selector.fit(X_numeric, y)
+        selector.fit(X_for_selection, y_valid)
 
-        selected_features = numeric_features[selector.get_support()].tolist()
-        selected_features.append(target)
-
-        return df[selected_features]
+        selected_numeric = non_zero_var_features[selector.get_support()].tolist()
+        # Preserve all non-numeric cols + selected numeric cols + target
+        final_cols = selected_numeric + non_numeric_cols + [target]
+        return df[final_cols]
 
     def process(
         self,
@@ -137,8 +193,20 @@ class FeatureEngineerAgent(BaseAgent):
         self.logger.log(self.name, "Process Start", f"Received clean data with shape {df.shape}")
 
         self.df = df.copy()
-        self.target_column = target_column
+        self.target_column = self._resolve_target_column(self.df, target_column)
         original_shape = self.df.shape
+
+        # Extract key columns flagged by DataCleaner — skip these in all FE steps
+        self._protected_cols = set(
+            previous_report.get("composite_key_cols", [])
+        )
+        if previous_report.get("entity_id_col"):
+            self._protected_cols.add(previous_report["entity_id_col"])
+        self._protected_cols.discard(self.target_column)
+
+        if self._protected_cols:
+            self.logger.log(self.name, "Protected Cols",
+                f"Skipping feature engineering for: {sorted(self._protected_cols)}")
 
         self.logger.log(self.name, "Previous Agent Summary", previous_report.get("summary", "No summary"))
 
@@ -159,38 +227,87 @@ class FeatureEngineerAgent(BaseAgent):
             "actions_taken": actions_taken,
             "summary": self._generate_summary(actions_taken),
             "final_features": list(self.df.columns),
+            # Forward key column info from DataCleaner for downstream agents
+            "entity_id_col": previous_report.get("entity_id_col"),
+            "composite_key_cols": previous_report.get("composite_key_cols", []),
         }
         self.save_report(report, Config.FEATURE_ENGINEER_REPORT_PATH)
 
         self.logger.log(self.name, "Process Complete", f"Shape: {original_shape} -> {self.df.shape}")
         return Config.ENGINEERED_DATA_PATH, report
 
+    def _resolve_target_column(self, df: pd.DataFrame, target_column: str) -> str:
+        """Resolve target column name — handles case differences and common aliases."""
+        if target_column in df.columns:
+            return target_column
+
+        # Case-insensitive match
+        lower_map = {c.lower(): c for c in df.columns}
+        if target_column.lower() in lower_map:
+            resolved = lower_map[target_column.lower()]
+            self.logger.log(self.name, "Target Resolved",
+                f"'{target_column}' → '{resolved}' (case-insensitive match)")
+            return resolved
+
+        # Try common target column names
+        _common = ["target", "label", "y", "class", "output",
+                   "default_flag", "fraud", "is_fraud", "churn", "bad_flag"]
+        for name in _common:
+            if name in lower_map:
+                resolved = lower_map[name]
+                self.logger.log(self.name, "Target Resolved",
+                    f"'{target_column}' not found → using '{resolved}' (common target name)")
+                return resolved
+
+        raise ValueError(
+            f"Target column '{target_column}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+
     def _analyze_features(self) -> Dict[str, Any]:
         numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
         categorical_cols = self.df.select_dtypes(exclude=[np.number]).columns.tolist()
 
-        if self.target_column in numeric_cols:
-            numeric_cols.remove(self.target_column)
-        if self.target_column in categorical_cols:
-            categorical_cols.remove(self.target_column)
+        exclude = self._protected_cols | {self.target_column}
+        numeric_cols = [c for c in numeric_cols if c not in exclude]
+        categorical_cols = [c for c in categorical_cols if c not in exclude]
 
-        analysis: Dict[str, Any] = {
-            "total_features": len(self.df.columns) - 1,
-            "numeric_features": numeric_cols,
-            "categorical_features": categorical_cols,
-            "shape": self.df.shape,
-            "sample_stats": {},
-        }
-
-        for col in numeric_cols[:Config.SAMPLE_STATS_PREVIEW]:
-            analysis["sample_stats"][col] = {
-                "mean": float(self.df[col].mean()),
-                "std": float(self.df[col].std()),
-                "min": float(self.df[col].min()),
-                "max": float(self.df[col].max()),
+        numeric_meta: Dict[str, Any] = {}
+        for col in numeric_cols[:Config.FEATURE_META_MAX_COLS]:
+            s = self.df[col]
+            entry: Dict[str, Any] = {
+                "null_pct": round(float(s.isnull().mean() * 100), 2),
+                "nunique": int(s.nunique()),
+                "mean": round(float(s.mean()), 4),
+                "std": round(float(s.std()), 4),
+                "min": round(float(s.min()), 4),
+                "max": round(float(s.max()), 4),
+                "skew": round(float(s.skew()), 4),
             }
+            if col in self._col_descriptions:
+                entry["description"] = self._col_descriptions[col]
+            numeric_meta[col] = entry
 
-        return analysis
+        categorical_meta: Dict[str, Any] = {}
+        for col in categorical_cols[:Config.FEATURE_META_MAX_COLS]:
+            s = self.df[col]
+            top_vals = s.value_counts().head(5).to_dict()
+            entry = {
+                "null_pct": round(float(s.isnull().mean() * 100), 2),
+                "nunique": int(s.nunique()),
+                "top_values": {str(k): int(v) for k, v in top_vals.items()},
+            }
+            if col in self._col_descriptions:
+                entry["description"] = self._col_descriptions[col]
+            categorical_meta[col] = entry
+
+        return {
+            "shape": self.df.shape,
+            "total_features": len(self.df.columns) - 1,
+            "protected_cols": sorted(self._protected_cols),
+            "numeric_features": numeric_meta,
+            "categorical_features": categorical_meta,
+        }
 
     def _get_system_prompt(self) -> str:
         return f"""You are the Feature Engineer Agent, an expert in creating predictive features.
@@ -208,10 +325,31 @@ Your task:
 5. Output your decisions in a structured format
 
 Guidelines:
-- Create meaningful interactions (e.g., income/age ratio, area*price)
-- Use label encoding for ordinal categories, one-hot for nominal
+Reading column metadata before creating interactions:
+- Each numeric column has: null_pct, nunique, mean, std, min, max, skew
+- Each categorical column has: null_pct, nunique, top_values
+
+Use metadata to make smart decisions:
+- Skip interactions if null_pct > 30% (too many missing values, result will be noisy)
+- If |skew| > 2: apply log1p before using in ratio → expression: "np.log1p(df['col'].clip(lower=0))"
+- If min >= 0 and the column is a count/amount: safe to use as denominator (add +1 to avoid div/0)
+- If nunique == 2: column is binary — consider product interactions instead of ratios
+- For categorical: use onehot if nunique <= 5 (low cardinality), label if nunique > 5
+
+Interaction ideas based on domain:
+- Ratios: debt/income, loan_amount/(income+1), overdue_count/(total_count+1)
+- Products: amount * rate, months * monthly_payment
+- Differences: age - account_age, limit - balance
+
+Encoding:
+- Use label encoding for ordinal categories (low/mid/high, grades)
+- Use one-hot for nominal categories (region, product_type) with nunique <= 5
+
+Filtering:
 - Remove features with |correlation| to target < {Config.MIN_CORRELATION_THRESHOLD}
 - Keep feature count reasonable (prefer {Config.TARGET_FEATURE_COUNT_MIN}-{Config.TARGET_FEATURE_COUNT_MAX} final features)
+- PROTECTED COLUMNS (DO NOT engineer, encode, or use in interactions): {sorted(self._protected_cols) if self._protected_cols else "none"}
+  These are composite key / entity ID columns identified by the DataCleaner agent.
 
 Output Format (JSON):
 {{
@@ -267,12 +405,23 @@ Provide your response in the JSON format specified."""
 
                 if action_type == "create_interaction":
                     new_col = action_spec.get("new_col")
-                    expression = action_spec.get("expression")
+                    expression = action_spec.get("expression", "")
+                    # Block if expression references any protected column
+                    refs_protected = any(f"'{c}'" in expression or f'"{c}"' in expression
+                                        for c in self._protected_cols)
+                    if refs_protected:
+                        self.logger.log(self.name, f"SKIP {action_type}",
+                            f"Expression references a protected column — skipped: {expression}")
+                        continue
                     self.df = self.execute_tool("create_interaction", df=self.df, new_col=new_col, expression=expression)
                     actions_taken.append(f"Created feature '{new_col}': {reason}")
 
                 elif action_type == "encode_categorical":
                     column = action_spec.get("column")
+                    if column in self._protected_cols:
+                        self.logger.log(self.name, f"SKIP {action_type}",
+                            f"'{column}' is a protected key column — skipped")
+                        continue
                     method = action_spec.get("method", "label")
                     self.df = self.execute_tool("encode_categorical", df=self.df, col=column, method=method)
                     actions_taken.append(f"Encoded '{column}' with {method}: {reason}")
@@ -284,7 +433,19 @@ Provide your response in the JSON format specified."""
 
                 elif action_type == "select_top_features":
                     k = action_spec.get("k", Config.DEFAULT_TOP_K_FEATURES)
+                    # Snapshot protected cols — SelectKBest drops them since they're non-numeric / not scored
+                    protected_snapshot = {
+                        col: self.df[col].copy()
+                        for col in self._protected_cols
+                        if col in self.df.columns
+                    }
                     self.df = self.execute_tool("select_top_features", df=self.df, target=self.target_column, k=k)
+                    # Re-add any protected cols that were removed by selection
+                    for col, series in protected_snapshot.items():
+                        if col not in self.df.columns:
+                            self.df[col] = series.values
+                            self.logger.log(self.name, "Protected Col Restored",
+                                f"Re-added '{col}' (composite key / entity ID) after feature selection")
                     actions_taken.append(f"Selected top {k} features: {reason}")
 
         except json.JSONDecodeError as e:
@@ -297,9 +458,10 @@ Provide your response in the JSON format specified."""
 
     def _fallback_engineering(self):
         categorical_cols = self.df.select_dtypes(exclude=[np.number]).columns.tolist()
-        if self.target_column in categorical_cols:
-            categorical_cols.remove(self.target_column)
+        skip = self._protected_cols | {self.target_column}
         for col in categorical_cols:
+            if col in skip:
+                continue
             self.df = self._tool_encode_categorical(self.df, col, "label")
             self.logger.log(self.name, "Fallback", f"Label encoded {col}")
 

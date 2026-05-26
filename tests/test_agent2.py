@@ -1,4 +1,5 @@
 import sys
+import json
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import pandas as pd
@@ -16,24 +17,40 @@ def test_agent2():
         return
     
     clean_data_path = "outputs/clean_data.csv"
-    
+    col_descriptions_path = "col_descriptions.json"
+
     if not Path(clean_data_path).exists():
         print(f"Error: {clean_data_path} not found")
         print("  Please run test_agent1.py first to generate clean data")
         return
-    
+
+    if Path(col_descriptions_path).exists():
+        print(f"Column descriptions loaded from: {col_descriptions_path}")
+    else:
+        col_descriptions_path = None
+        print("No col_descriptions.json found — running without column descriptions")
+
     df = pd.read_csv(clean_data_path)
     print(f"Loaded clean data from Agent 1")
     print(f"  Shape: {df.shape}")
     print(f"  Columns: {list(df.columns)}\n")
-    
-    previous_report = {
-        "agent": "DataCleaner",
-        "summary": "Dropped 2 columns (id, useless_col) and imputed missing values in 3 columns"
-    }
-    
+
+    cleaner_report_path = Path("outputs/data_cleaner_report.json")
+    if cleaner_report_path.exists():
+        with open(cleaner_report_path, encoding="utf-8") as f:
+            previous_report = json.load(f)
+        print(f"Loaded DataCleaner report from: {cleaner_report_path}")
+        print(f"  entity_id_col     : {previous_report.get('entity_id_col')}")
+        print(f"  composite_key_cols: {previous_report.get('composite_key_cols', [])}\n")
+    else:
+        previous_report = {
+            "agent": "DataCleaner",
+            "summary": "Dropped 2 columns (id, useless_col) and imputed missing values in 3 columns",
+        }
+        print("WARNING: data_cleaner_report.json not found — using mock report (no key columns)\n")
+
     logger = AgentLogger("outputs/test_agent2.log")
-    agent = FeatureEngineerAgent(logger)
+    agent = FeatureEngineerAgent(logger, col_descriptions_path=col_descriptions_path)
     
     print("Agent 2 is now engineering features...")
     
