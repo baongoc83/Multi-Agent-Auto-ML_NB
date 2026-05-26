@@ -110,6 +110,10 @@ class ModelTrainerAgent(BaseAgent):
             "r2_score": r2_score,
             "XGBClassifier": xgboost.XGBClassifier,
             "XGBRegressor": xgboost.XGBRegressor,
+            # "LGBMClassifier": lightgbm.LGBMClassifier,
+            # "LGBMRegressor": lightgbm.LGBMRegressor,
+            # "CatBoostClassifier": catboost.CatBoostClassifier,
+            # "CatBoostRegressor": catboost.CatBoostRegressor,
             "RandomForestClassifier": RandomForestClassifier,
             "RandomForestRegressor": RandomForestRegressor,
             "ExtraTreesClassifier": ExtraTreesClassifier,
@@ -240,7 +244,7 @@ class ModelTrainerAgent(BaseAgent):
         self.save_report(report, Config.MODEL_TRAINER_REPORT_PATH)
 
         if final_code:
-            with open(Config.FINAL_MODEL_CODE_PATH, "w") as f:
+            with open(Config.FINAL_MODEL_CODE_PATH, "w", encoding="utf-8") as f:
                 f.write(final_code)
 
         self.logger.log(self.name, "Process Complete", f"Best model: {best_metrics.get('best_model', 'unknown')} | Metrics: {json.dumps({k: v for k, v in best_metrics.items() if k not in ('model_comparison',)}, indent=2)}")

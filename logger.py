@@ -1,3 +1,4 @@
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
@@ -7,6 +8,12 @@ from config import Config
 class AgentLogger:
 
     def __init__(self, log_file: str = None):
+        # Force UTF-8 on Windows terminals that default to cp1252
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
         self.log_file = Path(log_file or Config.EXECUTION_LOG_PATH)
         self.log_file.parent.mkdir(exist_ok=True)
         self.logs: List[Dict] = []
@@ -24,7 +31,7 @@ class AgentLogger:
         print(f"  {details}")
 
     def save(self):
-        with open(self.log_file, "w") as f:
+        with open(self.log_file, "w", encoding="utf-8") as f:
             for entry in self.logs:
                 f.write(f"[{entry['timestamp']}] {entry['agent']} - {entry['action']}\n")
                 f.write(f"  {entry['details']}\n\n")

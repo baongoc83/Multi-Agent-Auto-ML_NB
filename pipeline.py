@@ -15,7 +15,7 @@ class AutoMLPipeline:
         self.handoff = Handoff(self.logger)
         Path(Config.OUTPUT_DIR).mkdir(exist_ok=True)
 
-    def run(self, input_csv: str, target_column: str):
+    def run(self, input_csv: str, target_column: str, col_descriptions_path: str = None):
         """Execute the full three-agent pipeline."""
         self.logger.log("PIPELINE", "Starting", f"Input: {input_csv}, Target: {target_column}")
 
@@ -25,7 +25,7 @@ class AutoMLPipeline:
         self.handoff.set_data(clean_data_path, report1, "DataCleaner")
 
         self.logger.log("PIPELINE", "Stage 2", "Initializing Feature Engineer Agent")
-        agent2 = FeatureEngineerAgent(self.logger)
+        agent2 = FeatureEngineerAgent(self.logger, col_descriptions_path=col_descriptions_path)
         engineered_data_path, report2 = agent2.process(
             self.handoff.get_data(),
             self.handoff.get_report(),
@@ -58,7 +58,7 @@ class AutoMLPipeline:
         markdown += "## Agent 3: Model Trainer\n"
         markdown += f"- Final Metrics: {metrics}\n\n"
 
-        with open(Config.FINAL_REPORT_PATH, "w") as f:
+        with open(Config.FINAL_REPORT_PATH, "w", encoding="utf-8") as f:
             f.write(markdown)
 
         print(f"Final Report saved to: {Config.FINAL_REPORT_PATH}")

@@ -7,3 +7,12 @@ venv/
 .DS_Store
 Thumbs.db
 .env.example
+
+# Large data files — not tracked in git
+outputs/clean_data.csv
+outputs/engineered_data.csv
+outputs/sample_data.csv
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
+Temp/
+check.ipynb

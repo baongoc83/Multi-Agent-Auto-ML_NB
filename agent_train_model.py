@@ -1,0 +1,763 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, Tuple, List, Optional
+import json
+from pathlib import Path
+
+from base_agent import BaseAgent
+from logger import AgentLogger
+from config import Config
+
+
+class TrainModelAgent(BaseAgent):
+    """
+    Advanced model training agent: FLAML → Optuna → RFE → PSI → Stability → Final Model.
+
+    Pipeline steps:
+      1. Split   : OOT temporal split (fallback to simple split if no date col)
+      2. FLAML   : AutoML selects best estimator + base hyperparams
+      3. Optuna  : TPE fine-tunes hyperparams on valid-temporal (no leakage)
+      4. RFE     : Recursive feature elimination → target N features
+      5. PSI     : Drop features with high distribution drift (train vs OOT)
+      6. Stability: Drop features with unstable monthly Gini
+      7. Top-N   : Final cut by feature importance if still > MAX_FINAL_FEATURES
+      8. Final   : Train + evaluate on CV / valid-temporal / valid-random / OOT
+    """
+
+    def __init__(self, logger: AgentLogger):
+        super().__init__(name="TrainModel", role="Advanced ML Pipeline Engineer", logger=logger)
+        self.df: pd.DataFrame = None
+        self.target_column: str = None
+        self.date_col: Optional[str] = None
+        self.id_col: Optional[str] = None
+        self.splits: Dict[str, pd.DataFrame] = {}
+        self.feature_cols: List[str] = []
+        self._cat_encoders: Dict[str, Any] = {}
+
+    # ── Column auto-detection ─────────────────────────────────────────────────
+
+    def _auto_detect_date_col(self, df: pd.DataFrame) -> Optional[str]:
+        for col in df.columns:
+            if any(kw in col.lower() for kw in ["date", "dt", "time", "month", "snap", "period"]):
+                try:
+                    pd.to_datetime(df[col], errors="raise")
+                    return col
+                except Exception:
+                    continue
+        return None
+
+    def _auto_detect_id_col(self, df: pd.DataFrame) -> Optional[str]:
+        for col in df.columns:
+            lc = col.lower()
+            if lc in ("customer_id", "user_id", "id", "cif") or lc.endswith("_id"):
+                return col
+        return None
+
+    def _resolve_target_column(self, df: pd.DataFrame, target_column: str) -> str:
+        if target_column in df.columns:
+            return target_column
+        lower_map = {c.lower(): c for c in df.columns}
+        if target_column.lower() in lower_map:
+            resolved = lower_map[target_column.lower()]
+            self.logger.log(self.name, "Target Resolved",
+                f"'{target_column}' → '{resolved}' (case-insensitive match)")
+            return resolved
+        _common = ["target", "label", "y", "class", "output",
+                   "default_flag", "fraud", "is_fraud", "churn", "bad_flag"]
+        for name in _common:
+            if name in lower_map:
+                resolved = lower_map[name]
+                self.logger.log(self.name, "Target Resolved",
+                    f"'{target_column}' not found → using '{resolved}' (common target name)")
+                return resolved
+        raise ValueError(
+            f"Target column '{target_column}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    def _get_feature_cols(self, df: pd.DataFrame) -> List[str]:
+        exclude = {self.target_column}
+        if self.date_col:
+            exclude.add(self.date_col)
+        if self.id_col:
+            exclude.add(self.id_col)
+        return [c for c in df.columns if c not in exclude]
+
+    def _fit_prepare_X(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Fit encoders on train data and transform. Call once on X_train."""
+        from sklearn.preprocessing import LabelEncoder
+        self._cat_encoders = {}
+        out = df.copy()
+        for col in out.columns:
+            if out[col].dtype == object or hasattr(out[col].dtype, "categories"):
+                le = LabelEncoder()
+                series = out[col].fillna("__NA__").astype(str)
+                # Always include "__NA__" so valid/OOT NaN values can be encoded
+                # even when train has no NaN for this column
+                le.fit(sorted(set(series.tolist()) | {"__NA__"}))
+                out[col] = le.transform(series)
+                self._cat_encoders[col] = le
+            else:
+                out[col] = out[col].fillna(-999)
+        return out
+
+    def _transform_X(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Transform using encoders fitted on train. Use for valid/oot splits."""
+        out = df.copy()
+        for col in out.columns:
+            if col in self._cat_encoders:
+                le = self._cat_encoders[col]
+                known = set(le.classes_)
+                vals = out[col].fillna("__NA__").astype(str)
+                # Unseen labels → "__NA__" (must exist in le.classes_ from fit)
+                out[col] = le.transform(vals.apply(lambda x: x if x in known else "__NA__"))
+            else:
+                out[col] = out[col].fillna(-999)
+        return out
+
+    # ── Model class lookup ────────────────────────────────────────────────────
+
+    def _get_n_estimators_key(self, estimator_name: str) -> str:
+        """CatBoost uses 'iterations', all others use 'n_estimators'."""
+        return "iterations" if estimator_name in ("catboost", "CatBoost") else "n_estimators"
+
+    def _get_model_class(self, estimator_name: str):
+        from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+        mapping = {
+            "rf": RandomForestClassifier,
+            "RandomForest": RandomForestClassifier,
+            "extra_tree": ExtraTreesClassifier,
+            "ExtraTrees": ExtraTreesClassifier,
+        }
+        try:
+            import lightgbm as lgb
+            mapping["lgbm"] = lgb.LGBMClassifier
+            mapping["LightGBM"] = lgb.LGBMClassifier
+        except ImportError:
+            pass
+        try:
+            import xgboost as xgb
+            mapping["xgboost"] = xgb.XGBClassifier
+            mapping["XGBoost"] = xgb.XGBClassifier
+        except ImportError:
+            pass
+        try:
+            from catboost import CatBoostClassifier
+            mapping["catboost"] = CatBoostClassifier
+            mapping["CatBoost"] = CatBoostClassifier
+        except ImportError:
+            pass
+        return mapping.get(estimator_name, mapping.get("lgbm", RandomForestClassifier))
+
+    # ── Step 1: Data split ────────────────────────────────────────────────────
+
+    def _tool_split_data(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        from sklearn.model_selection import train_test_split as _split
+        target = self.target_column
+        rs = Config.RANDOM_STATE
+        empty = pd.DataFrame(columns=df.columns)
+
+        if self.date_col and self.date_col in df.columns:
+            df = df.copy()
+            df[self.date_col] = pd.to_datetime(df[self.date_col], errors="coerce")
+            df["_ym"] = df[self.date_col].dt.to_period("M")
+            sorted_months = sorted(df["_ym"].unique())
+            total = len(df)
+
+            # Expand OOT window until >= OOT_MIN_RATIO
+            n_oot = Config.OOT_INIT_MONTHS
+            while n_oot < len(sorted_months):
+                if df["_ym"].isin(sorted_months[-n_oot:]).sum() / total >= Config.OOT_MIN_RATIO:
+                    break
+                n_oot += 1
+
+            mask_oot = df["_ym"].isin(set(sorted_months[-n_oot:]))
+            oot_df = df[mask_oot].drop(columns=["_ym"]).reset_index(drop=True)
+            pool_df = df[~mask_oot].drop(columns=["_ym"]).reset_index(drop=True)
+
+            # Valid-temporal: closest records to OOT boundary
+            valid_size = max(1, int(round(len(pool_df) * Config.TRAIN_TEST_SPLIT_SIZE)))
+            n_temporal = max(1, int(round(valid_size * Config.VALID_TEMPORAL_RATIO)))
+            temporal_idx = set(pool_df.sort_values(self.date_col, ascending=False).iloc[:n_temporal].index)
+            mask_temp = pool_df.index.isin(temporal_idx)
+            valid_temp_df = pool_df[mask_temp].reset_index(drop=True)
+            remain_df = pool_df[~mask_temp].reset_index(drop=True)
+
+            # Valid-random: stratified from remaining pool
+            n_rand = valid_size - len(valid_temp_df)
+            rand_ratio = n_rand / len(remain_df) if len(remain_df) > 0 else 0.0
+            if 0 < rand_ratio < 1:
+                train_df, valid_rand_df = _split(
+                    remain_df, test_size=rand_ratio,
+                    stratify=remain_df[target], random_state=rs,
+                )
+                train_df = train_df.reset_index(drop=True)
+                valid_rand_df = valid_rand_df.reset_index(drop=True)
+            else:
+                train_df = remain_df
+                valid_rand_df = empty.copy()
+
+            valid_df = pd.concat([valid_temp_df, valid_rand_df], ignore_index=True)
+
+            self.logger.log(self.name, "Split (OOT)",
+                f"train={len(train_df)} | valid_temp={len(valid_temp_df)} | "
+                f"valid_rand={len(valid_rand_df)} | oot={len(oot_df)}")
+            return {
+                "train": train_df, "valid_temporal": valid_temp_df,
+                "valid_random": valid_rand_df, "valid": valid_df, "oot": oot_df,
+            }
+
+        # Fallback: no date col → simple stratified split
+        stratify = df[target] if df[target].nunique() < 20 else None
+        train_df, valid_df = _split(
+            df, test_size=Config.TRAIN_TEST_SPLIT_SIZE, stratify=stratify, random_state=rs,
+        )
+        self.logger.log(self.name, "Split (simple)", f"train={len(train_df)} | valid={len(valid_df)} | no OOT")
+        return {
+            "train": train_df.reset_index(drop=True), "valid_temporal": empty.copy(),
+            "valid_random": empty.copy(), "valid": valid_df.reset_index(drop=True), "oot": empty.copy(),
+        }
+
+    # ── Step 2: FLAML AutoML ──────────────────────────────────────────────────
+
+    def _tool_run_flaml(
+        self,
+        X_train: pd.DataFrame, y_train: pd.Series,
+        X_valid: pd.DataFrame, y_valid: pd.Series,
+    ) -> Tuple[str, Dict]:
+        try:
+            from flaml import AutoML
+            from sklearn.metrics import roc_auc_score
+        except ImportError:
+            self.logger.log(self.name, "FLAML", "flaml not installed → fallback to lgbm. Run: pip install flaml")
+            return "lgbm", {}
+
+        automl = AutoML()
+        estimators = [e.strip() for e in Config.FLAML_ESTIMATORS.split(",")]
+        has_valid = len(X_valid) > 0
+        settings: Dict[str, Any] = {
+            "time_budget": Config.FLAML_TIME_BUDGET,
+            "metric": "roc_auc",
+            "task": "classification",
+            "estimator_list": estimators,
+            "seed": Config.RANDOM_STATE,
+            "verbose": 0,
+            "log_training_metric": False,
+        }
+        if has_valid:
+            # Custom validation data requires eval_method='holdout', not 'cv'
+            settings["eval_method"] = "holdout"
+            settings["X_val"] = X_valid
+            settings["y_val"] = y_valid
+        else:
+            settings["eval_method"] = "cv"
+            settings["n_splits"] = Config.FLAML_N_SPLITS
+
+        automl.fit(X_train, y_train, **settings)
+
+        best_estimator = automl.best_estimator
+        best_config = automl.best_config
+        valid_auc = float("nan")
+        if len(X_valid) > 0:
+            try:
+                valid_auc = roc_auc_score(y_valid, automl.predict_proba(X_valid)[:, 1])
+            except Exception:
+                pass
+
+        self.logger.log(self.name, "FLAML",
+            f"best={best_estimator} | CV_loss={automl.best_loss:.4f} | valid_auc={valid_auc:.4f}")
+        return best_estimator, best_config
+
+    # ── Step 3: Optuna fine-tuning ────────────────────────────────────────────
+
+    def _build_optuna_params(self, estimator_name: str, trial) -> Dict:
+        if estimator_name in ("lgbm", "LightGBM"):
+            return {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 1000, step=50),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-4, 0.3, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 256),
+                "max_depth": trial.suggest_int("max_depth", 3, 12),
+                "min_child_samples": trial.suggest_int("min_child_samples", 5, 200),
+                "subsample": trial.suggest_float("subsample", 0.4, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+                "random_state": Config.RANDOM_STATE, "n_jobs": -1, "verbose": -1,
+            }
+        if estimator_name in ("xgboost", "XGBoost"):
+            return {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 1000, step=50),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-4, 0.3, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 12),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
+                "subsample": trial.suggest_float("subsample", 0.4, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+                "gamma": trial.suggest_float("gamma", 1e-8, 5.0, log=True),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+                "eval_metric": "logloss",
+                "random_state": Config.RANDOM_STATE, "n_jobs": -1, "verbosity": 0,
+            }
+        if estimator_name in ("catboost", "CatBoost"):
+            return {
+                "iterations": trial.suggest_int("iterations", 100, 1000, step=50),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-4, 0.3, log=True),
+                "depth": trial.suggest_int("depth", Config.CB_DEPTH_MIN, Config.CB_DEPTH_MAX),
+                "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-8, 10.0, log=True),
+                "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+                "random_strength": trial.suggest_float("random_strength", 1e-8, 10.0, log=True),
+                "random_seed": Config.RANDOM_STATE, "verbose": 0,
+            }
+        # rf / extra_tree / RandomForest / ExtraTrees
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 500, step=50),
+            "max_depth": trial.suggest_int("max_depth", 3, 20),
+            "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 15),
+            "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", 0.5, 0.7]),
+            "random_state": Config.RANDOM_STATE, "n_jobs": -1,
+        }
+
+    def _tool_run_optuna(
+        self,
+        estimator_name: str, base_params: Dict,
+        X_train: pd.DataFrame, y_train: pd.Series,
+        X_valid: pd.DataFrame, y_valid: pd.Series,
+    ) -> Dict:
+        try:
+            import optuna
+            from optuna.samplers import TPESampler
+            from optuna.trial import FixedTrial
+            from sklearn.metrics import roc_auc_score
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        except ImportError:
+            self.logger.log(self.name, "Optuna", "optuna not installed → skip. Run: pip install optuna")
+            return base_params
+
+        if len(X_valid) == 0:
+            self.logger.log(self.name, "Optuna", "No validation set → skip")
+            return base_params
+
+        ModelClass = self._get_model_class(estimator_name)
+        _estimator_name = estimator_name
+        _self = self
+
+        def objective(trial):
+            params = _self._build_optuna_params(_estimator_name, trial)
+            model = ModelClass(**params)
+            model.fit(X_train, y_train)
+            return roc_auc_score(y_valid, model.predict_proba(X_valid)[:, 1])
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=TPESampler(seed=Config.RANDOM_STATE),
+        )
+        study.optimize(
+            objective,
+            n_trials=Config.OPTUNA_N_TRIALS,
+            timeout=Config.OPTUNA_TIMEOUT,
+            show_progress_bar=False,
+        )
+        # Replay _build_optuna_params with FixedTrial to recover fixed params
+        # (random_state, n_jobs, verbose, etc.) that study.best_params doesn't contain
+        try:
+            full_best_params = self._build_optuna_params(estimator_name, FixedTrial(study.best_params))
+            self.logger.log(self.name, "Optuna",
+                f"best_AUC={study.best_value:.4f} | params={json.dumps(study.best_params)[:200]}")
+            return full_best_params
+        except Exception as e:
+            self.logger.log(self.name, "Optuna", f"No completed trials ({e}) → fallback to base_params")
+            return base_params
+
+    # ── Step 4: RFE ───────────────────────────────────────────────────────────
+
+    def _tool_run_rfe(
+        self,
+        estimator_name: str, best_params: Dict,
+        X_train: pd.DataFrame, y_train: pd.Series,
+    ) -> List[str]:
+        from sklearn.feature_selection import RFE, RFECV
+        from sklearn.model_selection import StratifiedKFold
+
+        ModelClass = self._get_model_class(estimator_name)
+        n_target = min(Config.RFE_TARGET_FEATURES, X_train.shape[1])
+        n_est_key = self._get_n_estimators_key(estimator_name)
+        base_model = ModelClass(**{**best_params, n_est_key: 200})
+
+        if Config.ENABLE_RFECV:
+            cv = StratifiedKFold(n_splits=Config.RFE_CV_SPLITS, shuffle=True,
+                                 random_state=Config.RANDOM_STATE)
+            selector = RFECV(
+                estimator=base_model, step=Config.RFE_STEP, cv=cv,
+                scoring="roc_auc", min_features_to_select=n_target, n_jobs=-1,
+            )
+        else:
+            selector = RFE(
+                estimator=base_model,
+                n_features_to_select=n_target,
+                step=Config.RFE_STEP,
+            )
+
+        selector.fit(X_train, y_train)
+        selected = list(X_train.columns[selector.support_])
+        self.logger.log(self.name, "RFE", f"{X_train.shape[1]} → {len(selected)} features")
+        return selected
+
+    # ── Step 5: PSI filter ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _calc_psi(expected: pd.Series, actual: pd.Series, bins: int = 10) -> float:
+        eps = 1e-8
+        try:
+            cuts = pd.qcut(expected, q=bins, duplicates="drop", retbins=True)[1]
+            cuts[0], cuts[-1] = -np.inf, np.inf
+            e_pct = pd.cut(expected, bins=cuts).value_counts(normalize=True).sort_index() + eps
+            a_pct = pd.cut(actual, bins=cuts).value_counts(normalize=True).sort_index() + eps
+            e_pct, a_pct = e_pct.align(a_pct, fill_value=eps)
+            return float(((a_pct - e_pct) * np.log(a_pct / e_pct)).sum())
+        except Exception:
+            return 999.0
+
+    def _tool_run_psi_filter(
+        self,
+        feature_cols: List[str],
+        train_df: pd.DataFrame,
+        oot_df: pd.DataFrame,
+    ) -> Tuple[List[str], pd.DataFrame]:
+        if len(oot_df) == 0:
+            self.logger.log(self.name, "PSI", "No OOT data → skip")
+            return feature_cols, pd.DataFrame()
+
+        records = []
+        for col in feature_cols:
+            if col not in train_df.columns or col not in oot_df.columns:
+                continue
+            psi_val = self._calc_psi(
+                train_df[col].dropna(), oot_df[col].dropna(), Config.PSI_BINS
+            )
+            records.append({"feature": col, "psi": round(psi_val, 4)})
+
+        if not records:
+            self.logger.log(self.name, "PSI", "No features found in both train and OOT → skip")
+            return feature_cols, pd.DataFrame()
+
+        psi_df = pd.DataFrame(records).sort_values("psi", ascending=False)
+        psi_df["flag"] = psi_df["psi"].apply(
+            lambda x: f"DROP (PSI={x:.3f})" if x > Config.PSI_THRESHOLD else "KEEP"
+        )
+        kept = psi_df.loc[psi_df["flag"] == "KEEP", "feature"].tolist()
+        dropped_n = (psi_df["flag"] != "KEEP").sum()
+        self.logger.log(self.name, "PSI", f"KEEP={len(kept)} | DROP={dropped_n}")
+        return kept, psi_df
+
+    # ── Step 6: Stability check ───────────────────────────────────────────────
+
+    @staticmethod
+    def _calc_gini(df: pd.DataFrame, feature: str, target: str) -> float:
+        from sklearn.metrics import roc_auc_score
+        try:
+            sub = df[[feature, target]].dropna()
+            if sub[target].nunique() < 2 or sub[feature].nunique() < 2:
+                return 0.0
+            return abs(2 * roc_auc_score(sub[target], sub[feature]) - 1)
+        except Exception:
+            return 0.0
+
+    def _tool_run_stability_check(
+        self,
+        feature_cols: List[str],
+        train_df: pd.DataFrame,
+    ) -> Tuple[List[str], pd.DataFrame]:
+        if not self.date_col or self.date_col not in train_df.columns:
+            self.logger.log(self.name, "Stability", "No date col → skip")
+            return feature_cols, pd.DataFrame()
+
+        tmp = train_df.copy()
+        tmp[self.date_col] = pd.to_datetime(tmp[self.date_col], errors="coerce")
+        tmp["_ym"] = tmp[self.date_col].dt.to_period("M")
+        periods = sorted(tmp["_ym"].unique())
+
+        if len(periods) < Config.STABILITY_MIN_MONTHS:
+            self.logger.log(self.name, "Stability",
+                f"Only {len(periods)} months < min={Config.STABILITY_MIN_MONTHS} → skip")
+            return feature_cols, pd.DataFrame()
+
+        records = []
+        for col in feature_cols:
+            ginis = [self._calc_gini(tmp[tmp["_ym"] == p], col, self.target_column) for p in periods]
+            mean_g = float(np.mean(ginis))
+            std_g = float(np.std(ginis))
+            flag = "KEEP"
+            if std_g > Config.STABILITY_GINI_STD_THRESHOLD:
+                flag = f"DROP (std_gini={std_g:.3f})"
+            elif mean_g < Config.STABILITY_MIN_GINI:
+                flag = f"DROP (mean_gini={mean_g:.3f})"
+            records.append({
+                "feature": col,
+                "mean_gini": round(mean_g, 4),
+                "std_gini": round(std_g, 4),
+                "flag": flag,
+            })
+
+        stab_df = pd.DataFrame(records).sort_values("mean_gini", ascending=False)
+        kept = stab_df.loc[stab_df["flag"] == "KEEP", "feature"].tolist()
+        dropped_n = (stab_df["flag"] != "KEEP").sum()
+        self.logger.log(self.name, "Stability", f"KEEP={len(kept)} | DROP={dropped_n}")
+        return kept, stab_df
+
+    # ── Step 7: Top-N cut by importance ──────────────────────────────────────
+
+    def _tool_pick_top_features(
+        self,
+        estimator_name: str, best_params: Dict,
+        X_train: pd.DataFrame, y_train: pd.Series,
+        n: int,
+    ) -> List[str]:
+        if X_train.shape[1] <= n:
+            return list(X_train.columns)
+
+        ModelClass = self._get_model_class(estimator_name)
+        n_est_key = self._get_n_estimators_key(estimator_name)
+        model = ModelClass(**{**best_params, n_est_key: 300})
+        model.fit(X_train, y_train)
+        imp = pd.Series(model.feature_importances_, index=X_train.columns)
+        top = imp.nlargest(n).index.tolist()
+        self.logger.log(self.name, "TopFeatures", f"{X_train.shape[1]} → {len(top)} (top-{n} by importance)")
+        return top
+
+    # ── Step 8: Final model training & evaluation ─────────────────────────────
+
+    def _tool_train_final_model(
+        self,
+        estimator_name: str,
+        best_params: Dict,
+        feature_cols: List[str],
+    ) -> Dict[str, Any]:
+        from sklearn.metrics import roc_auc_score
+        from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+        target = self.target_column
+        ModelClass = self._get_model_class(estimator_name)
+
+        def _prep(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+            avail = [c for c in feature_cols if c in df.columns]
+            return self._transform_X(df[avail]), df[target]
+
+        X_tr, y_tr = _prep(self.splits["train"])
+        model = ModelClass(**best_params)
+        model.fit(X_tr, y_tr)
+
+        metrics: Dict[str, Any] = {"best_model": estimator_name, "best_params": best_params}
+
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=Config.RANDOM_STATE)
+        cv_scores = cross_val_score(model, X_tr, y_tr, cv=cv, scoring="roc_auc", n_jobs=-1)
+        metrics["cv_auc_mean"] = round(float(cv_scores.mean()), 4)
+        metrics["cv_auc_std"] = round(float(cv_scores.std()), 4)
+        self.logger.log(self.name, "CV AUC",
+            f"{metrics['cv_auc_mean']:.4f} ± {metrics['cv_auc_std']:.4f}")
+
+        for split_name in ("valid_temporal", "valid_random", "valid", "oot"):
+            split_df = self.splits.get(split_name, pd.DataFrame())
+            if len(split_df) == 0:
+                continue
+            X_s, y_s = _prep(split_df)
+            if y_s.nunique() < 2:
+                continue
+            try:
+                auc = roc_auc_score(y_s, model.predict_proba(X_s)[:, 1])
+                metrics[f"{split_name}_auc"] = round(float(auc), 4)
+                self.logger.log(self.name, f"{split_name} AUC", f"{auc:.4f}")
+            except Exception as e:
+                self.logger.log(self.name, f"{split_name} AUC error", str(e))
+
+        return metrics
+
+    # ── Main process ──────────────────────────────────────────────────────────
+
+    def process(
+        self,
+        df: pd.DataFrame,
+        previous_report: Dict[str, Any],
+        target_column: str,
+        date_col: Optional[str] = None,
+        id_col: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        self.logger.log(self.name, "Process Start", f"Shape={df.shape}")
+        self.logger.log(self.name, "Previous Agent Summary",
+            previous_report.get("summary", "No summary"))
+
+        self.df = df.copy()
+        self.target_column = self._resolve_target_column(self.df, target_column)
+        target_column = self.target_column  # sync local var to resolved name
+
+        # Prefer key columns from DataCleaner/FeatureEngineer report over auto-detection
+        _report_id = previous_report.get("entity_id_col")
+        _ck_cols = previous_report.get("composite_key_cols", [])
+        _report_date = next(
+            (c for c in _ck_cols if c != _report_id and c in self.df.columns),
+            None,
+        )
+        self.id_col = id_col or (_report_id if _report_id in self.df.columns else None) or self._auto_detect_id_col(df)
+        self.date_col = date_col or _report_date or self._auto_detect_date_col(df)
+        self.feature_cols = self._get_feature_cols(self.df)
+
+        self.logger.log(self.name, "Config",
+            f"target={self.target_column} | date_col={self.date_col} | "
+            f"id_col={self.id_col} | n_features={len(self.feature_cols)}")
+
+        # ── 1. Split ──────────────────────────────────────────────────────────
+        self.splits = self._tool_split_data(self.df)
+        train_df = self.splits["train"]
+        valid_temp_df = self.splits["valid_temporal"]
+        valid_df = self.splits["valid"]
+        oot_df = self.splits["oot"]
+
+        feat_avail = [c for c in self.feature_cols if c in train_df.columns]
+        X_train = self._fit_prepare_X(train_df[feat_avail])
+        y_train = train_df[target_column]
+
+        # Use valid_temporal for Optuna (no leakage); fall back to valid if empty
+        if len(valid_temp_df) > 0:
+            X_valid = self._transform_X(valid_temp_df[feat_avail])
+            y_valid = valid_temp_df[target_column]
+        elif len(valid_df) > 0:
+            X_valid = self._transform_X(valid_df[feat_avail])
+            y_valid = valid_df[target_column]
+        else:
+            X_valid = pd.DataFrame(columns=feat_avail)
+            y_valid = pd.Series(dtype=float)
+
+        # ── 2. FLAML ──────────────────────────────────────────────────────────
+        self.logger.log(self.name, "FLAML Start",
+            f"time_budget={Config.FLAML_TIME_BUDGET}s | estimators={Config.FLAML_ESTIMATORS}")
+        best_estimator, flaml_params = self._tool_run_flaml(X_train, y_train, X_valid, y_valid)
+
+        # ── 3. Optuna ─────────────────────────────────────────────────────────
+        self.logger.log(self.name, "Optuna Start",
+            f"n_trials={Config.OPTUNA_N_TRIALS} | timeout={Config.OPTUNA_TIMEOUT}s")
+        best_params = self._tool_run_optuna(
+            best_estimator, flaml_params, X_train, y_train, X_valid, y_valid
+        )
+
+        # ── 4. RFE ────────────────────────────────────────────────────────────
+        self.logger.log(self.name, "RFE Start",
+            f"target={Config.RFE_TARGET_FEATURES} | rfecv={Config.ENABLE_RFECV}")
+        rfe_features = self._tool_run_rfe(best_estimator, best_params, X_train, y_train)
+
+        # ── 5. PSI ────────────────────────────────────────────────────────────
+        oot_feat_df = (
+            self._transform_X(oot_df[[c for c in rfe_features if c in oot_df.columns]])
+            if len(oot_df) > 0 else pd.DataFrame()
+        )
+        psi_features, psi_df = self._tool_run_psi_filter(
+            rfe_features,
+            self._transform_X(train_df[[c for c in rfe_features if c in train_df.columns]]),
+            oot_feat_df,
+        )
+
+        # ── 6. Stability ──────────────────────────────────────────────────────
+        # Build encoded train slice with date + target for stability Gini calc
+        train_for_stability = self._transform_X(
+            train_df[[c for c in psi_features if c in train_df.columns]]
+        )
+        train_for_stability[self.target_column] = train_df[self.target_column].values
+        if self.date_col and self.date_col in train_df.columns:
+            train_for_stability[self.date_col] = train_df[self.date_col].values
+        stable_features, stab_df = self._tool_run_stability_check(psi_features, train_for_stability)
+
+        # ── 7. Top-N cut ──────────────────────────────────────────────────────
+        X_tr_stable = self._transform_X(train_df[[c for c in stable_features if c in train_df.columns]])
+        final_features = self._tool_pick_top_features(
+            best_estimator, best_params, X_tr_stable, y_train, Config.MAX_FINAL_FEATURES
+        )
+
+        self.logger.log(self.name, "Feature Pipeline",
+            f"init={len(feat_avail)} → RFE={len(rfe_features)} → "
+            f"PSI={len(psi_features)} → Stability={len(stable_features)} → "
+            f"Final={len(final_features)}")
+
+        if not final_features:
+            raise ValueError(
+                "Feature pipeline eliminated all features. "
+                "Lower PSI_THRESHOLD / STABILITY_GINI_STD_THRESHOLD or reduce RFE_TARGET_FEATURES."
+            )
+
+        # ── 8. Final model ────────────────────────────────────────────────────
+        self.feature_cols = final_features
+        metrics = self._tool_train_final_model(best_estimator, best_params, final_features)
+
+        # ── 9. LLM summary ────────────────────────────────────────────────────
+        summary = self._generate_llm_summary(
+            best_estimator, best_params, metrics,
+            len(feat_avail), len(rfe_features), len(psi_features),
+            len(stable_features), len(final_features),
+            psi_df, stab_df,
+        )
+
+        # ── 10. Save report ───────────────────────────────────────────────────
+        report = {
+            "agent": self.name,
+            "best_estimator": best_estimator,
+            "best_params": best_params,
+            "feature_pipeline": {
+                "n_init": len(feat_avail),
+                "n_after_rfe": len(rfe_features),
+                "n_after_psi": len(psi_features),
+                "n_after_stability": len(stable_features),
+                "n_final": len(final_features),
+                "final_features": final_features,
+            },
+            "splits": {k: len(v) for k, v in self.splits.items()
+                       if isinstance(v, pd.DataFrame)},
+            "metrics": metrics,
+            "summary": summary,
+        }
+        self.save_report(report, Config.MODEL_TRAINER_REPORT_PATH)
+
+        Path(Config.OUTPUT_DIR).mkdir(exist_ok=True)
+        if not psi_df.empty:
+            psi_df.to_csv(f"{Config.OUTPUT_DIR}/psi_report.csv", index=False)
+        if not stab_df.empty:
+            stab_df.to_csv(f"{Config.OUTPUT_DIR}/stability_report.csv", index=False)
+
+        self.logger.log(self.name, "Process Complete",
+            f"best={best_estimator} | features={len(final_features)} | "
+            f"oot_auc={metrics.get('oot_auc', 'N/A')} | "
+            f"valid_auc={metrics.get('valid_auc', 'N/A')}")
+        return metrics, report
+
+    # ── LLM summary ───────────────────────────────────────────────────────────
+
+    def _generate_llm_summary(
+        self,
+        estimator_name: str,
+        best_params: Dict,
+        metrics: Dict,
+        n_init: int, n_rfe: int, n_psi: int, n_stable: int, n_final: int,
+        psi_df: pd.DataFrame,
+        stab_df: pd.DataFrame,
+    ) -> str:
+        psi_dropped = int((psi_df["flag"] != "KEEP").sum()) if not psi_df.empty else 0
+        stab_dropped = int((stab_df["flag"] != "KEEP").sum()) if not stab_df.empty else 0
+
+        prompt = f"""Summarize the ML training pipeline results in 3-5 sentences.
+
+PIPELINE FLOW:
+  Features: {n_init} → RFE: {n_rfe} → PSI (dropped {psi_dropped}): {n_psi} → Stability (dropped {stab_dropped}): {n_stable} → Final: {n_final}
+  Best model: {estimator_name}
+
+METRICS:
+{json.dumps({k: v for k, v in metrics.items() if k not in ("best_params",)}, indent=2)}
+
+Top hyperparams: {json.dumps({k: v for k, v in list(best_params.items())[:6]}, indent=2)}
+
+Write a concise professional summary focusing on model quality and key observations."""
+
+        system_prompt = (
+            "You are an ML expert summarizing pipeline results. "
+            "Be concise, professional, and focus on actionable insights."
+        )
+        return self.call_llm(prompt, system_prompt)
