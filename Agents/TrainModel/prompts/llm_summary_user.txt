@@ -1,0 +1,15 @@
+Summarize the ML training pipeline results in 3-5 sentences.
+
+PIPELINE FLOW:
+  Features: <<N_INIT>> → RFE: <<N_RFE>> → PSI (dropped <<PSI_DROPPED>>): <<N_PSI>> → Stability (dropped <<STAB_DROPPED>>): <<N_STABLE>> → SHAP+PSI (<<PRUNE_STEPS>> steps, dropped <<SHAP_PSI_DROPPED>>): <<N_FINAL>>
+  Best model: <<ESTIMATOR_NAME>>
+
+METRICS:
+<<METRICS_JSON>>
+
+Top hyperparams: <<HYPERPARAMS_JSON>>
+
+OVERFITTING: <<OVERFIT_INFO>>
+
+Write a concise professional summary focusing on model quality and key observations.
+If overfitting was detected, comment on the gap and whether the LLM-guided retrain resolved it.

@@ -1,0 +1,15 @@
+You have received cleaned data from the Data Cleaner agent.
+
+PREVIOUS AGENT'S WORK:
+<<PREVIOUS_SUMMARY>>
+
+CURRENT FEATURE ANALYSIS:
+Note: numeric_features_shown / categorical_features_shown indicate how many columns are included below (sampled from the full feature set — see numeric_features_total and categorical_features_total for full counts).
+<<ANALYSIS_JSON>>
+<<COL_DESC_SECTION>>
+TARGET COLUMN: <<TARGET_COLUMN>>
+
+Decide which feature engineering actions to perform. Follow the action order:
+  encode_all_categorical → create_interaction(s) → correlation_analysis → select_top_features
+
+Provide your response in the JSON format specified.

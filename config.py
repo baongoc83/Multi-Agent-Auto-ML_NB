@@ -13,16 +13,31 @@ class Config:
     TIMEOUT: int = int(os.getenv("TIMEOUT", 60))
 
     # ── LLM Behaviour ────────────────────────────────────────────────────────
-    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", 0.7))
-    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", 4000))
+    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", 0.2))
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", 2000))
+    # top_p: nucleus sampling — 0.95 keeps 95% probability mass, filters low-prob tokens
+    LLM_TOP_P: float = float(os.getenv("LLM_TOP_P", 0.95))
+    # frequency_penalty: reduces word repetition in output (0.0–2.0)
+    LLM_FREQUENCY_PENALTY: float = float(os.getenv("LLM_FREQUENCY_PENALTY", 0.1))
+    # presence_penalty: encourages introducing new topics (0.0–2.0)
+    LLM_PRESENCE_PENALTY: float = float(os.getenv("LLM_PRESENCE_PENALTY", 0.0))
+    # seed: fixed seed for reproducible LLM outputs; None = disabled
+    LLM_SEED: int = int(os.getenv("LLM_SEED")) if os.getenv("LLM_SEED") else None
+    # Max retries on rate-limit (429) or server errors (5xx) before giving up
+    LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", 3))
+    # Higher token budget for tasks that produce long output (FE decisions, model code generation)
+    LLM_MAX_TOKENS_LARGE: int = int(os.getenv("LLM_MAX_TOKENS_LARGE", 4000))
+    # Base delay in seconds for exponential backoff between retries
+    LLM_RETRY_DELAY: float = float(os.getenv("LLM_RETRY_DELAY", 2.0))
     # Prompts longer than this (chars) are routed to the cloud model
-    MODEL_ROUTING_THRESHOLD: int = int(os.getenv("MODEL_ROUTING_THRESHOLD", 3000))
+    MODEL_ROUTING_THRESHOLD: int = int(os.getenv("MODEL_ROUTING_THRESHOLD", 6000))
 
     # ── Output Paths ─────────────────────────────────────────────────────────
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "outputs")
     CLEAN_DATA_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_data.csv"
     ENGINEERED_DATA_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_data.csv"
     FINAL_MODEL_CODE_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/final_model_code.py"
+    FINAL_MODEL_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/final_model.pkl"
     FINAL_REPORT_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/final_report.md"
     EXECUTION_LOG_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/agent_execution.log"
     DATA_CLEANER_REPORT_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/data_cleaner_report.json"
@@ -50,6 +65,10 @@ class Config:
     ENTITY_ORPHAN_PCT_THRESHOLD: float = float(os.getenv("ENTITY_ORPHAN_PCT_THRESHOLD", 5.0))
     # Ambiguous identity values percentage above this is flagged as potential fraud ring
     AMBIGUOUS_IDENTITY_PCT_THRESHOLD: float = float(os.getenv("AMBIGUOUS_IDENTITY_PCT_THRESHOLD", 5.0))
+    # Soft duplicate percentage above this triggers deduplicate_by_key suggestion
+    SOFT_DUP_PCT_THRESHOLD: float = float(os.getenv("SOFT_DUP_PCT_THRESHOLD", 0.5))
+    # Duplicated application entities percentage above this triggers deduplicate_by_key
+    APP_DUP_PCT_THRESHOLD: float = float(os.getenv("APP_DUP_PCT_THRESHOLD", 10.0))
     # Outlier percentage (IQR 3x) above this triggers a clip suggestion
     OUTLIER_PCT_THRESHOLD: float = float(os.getenv("OUTLIER_PCT_THRESHOLD", 5.0))
     # Class imbalance ratio (max/min class count) above this is flagged
@@ -62,80 +81,112 @@ class Config:
     LOW_CORRELATION_THRESHOLD: float = float(os.getenv("LOW_CORRELATION_THRESHOLD", 0.04))
     # Features with |correlation| below this are flagged for removal
     MIN_CORRELATION_THRESHOLD: float = float(os.getenv("MIN_CORRELATION_THRESHOLD", 0.001))
-    DEFAULT_TOP_K_FEATURES: int = int(os.getenv("DEFAULT_TOP_K_FEATURES", 350))
-    TARGET_FEATURE_COUNT_MIN: int = int(os.getenv("TARGET_FEATURE_COUNT_MIN", 10))
-    TARGET_FEATURE_COUNT_MAX: int = int(os.getenv("TARGET_FEATURE_COUNT_MAX", 1000))
-    # Max columns to include full per-column metadata in the LLM prompt
-    FEATURE_META_MAX_COLS: int = int(os.getenv("FEATURE_META_MAX_COLS", 50))
+    # Ceiling for FeatureEngineerAgent.select_top_features (overridable via env var)
+    TOP_K_FEATURES_CAP: int = int(os.getenv("TOP_K_FEATURES_CAP", 350))
+    # Fraction of engineerable features kept by select_top_features (0 < ratio <= 1)
+    TOP_K_RATIO: float = float(os.getenv("TOP_K_RATIO", 0.70))
+    # Fraction of numeric columns to include in LLM prompt metadata (0 < ratio <= 1)
+    FEATURE_META_NUMERIC_RATIO: float = float(os.getenv("FEATURE_META_NUMERIC_RATIO", 0.6))
+    # Absolute ceiling for numeric columns in LLM prompt (safety net for very wide datasets)
+    FEATURE_META_MAX_NUMERIC_COLS: int = int(os.getenv("FEATURE_META_MAX_NUMERIC_COLS", 200))
+    # Max categorical columns to include full per-column metadata in the LLM prompt
+    FEATURE_META_MAX_CATEGORICAL_COLS: int = int(os.getenv("FEATURE_META_MAX_CATEGORICAL_COLS", 40))
+    # Max description entries shown per group in the LLM prompt column-description block
+    MAX_DESC_PER_GROUP: int = int(os.getenv("MAX_DESC_PER_GROUP", 30))
 
     # ── Model Training ────────────────────────────────────────────────────────
-    MAX_TRAINING_ITERATIONS: int = int(os.getenv("MAX_TRAINING_ITERATIONS", 800))
-    # Target column with fewer unique values than this is treated as classification
-    CLASSIFICATION_UNIQUE_THRESHOLD: int = int(os.getenv("CLASSIFICATION_UNIQUE_THRESHOLD", 5))
     TRAIN_TEST_SPLIT_SIZE: float = float(os.getenv("TRAIN_TEST_SPLIT_SIZE", 0.2))
     RANDOM_STATE: int = int(os.getenv("RANDOM_STATE", 42))
-    # Comma-separated list of models to train and compare each iteration
-    MODELS_TO_COMPARE: str = os.getenv("MODELS_TO_COMPARE", "XGBoost,RandomForest,LightGBM,CatBoost,ExtraTrees")
+    MAX_TRAINING_ITERATIONS: int = int(os.getenv("MAX_TRAINING_ITERATIONS", 3))
+    MODELS_TO_COMPARE: str = os.getenv("MODELS_TO_COMPARE", "XGBoost,RandomForest,ExtraTrees,LightGBM,CatBoost")
+    CLASSIFICATION_UNIQUE_THRESHOLD: int = int(os.getenv("CLASSIFICATION_UNIQUE_THRESHOLD", 10))
+    # n_splits for the final cross-validation evaluation of the trained model
+    CV_N_SPLITS: int = int(os.getenv("CV_N_SPLITS", 5))
+    TARGET_ROC_AUC: float = float(os.getenv("TARGET_ROC_AUC", 0.85))
+    TARGET_F1: float = float(os.getenv("TARGET_F1", 0.80))
+    TARGET_R2: float = float(os.getenv("TARGET_R2", 0.75))
+    TARGET_ACCURACY: float = float(os.getenv("TARGET_ACCURACY", 0.85))
 
-    # ── Stopping Criteria ─────────────────────────────────────────────────────
-    TARGET_ROC_AUC: float = float(os.getenv("TARGET_ROC_AUC", 0.70))
-    TARGET_F1: float = float(os.getenv("TARGET_F1", 0.75))
-    TARGET_R2: float = float(os.getenv("TARGET_R2", 0.1))
-    TARGET_ACCURACY: float = float(os.getenv("TARGET_ACCURACY", 0.75))
-
-    # ── Shared Hyperparameter Search Space ────────────────────────────────────
+    # ── Optuna Hyperparameter Search Space ────────────────────────────────────
+    # Shared across lgbm / xgboost / rf / extra_tree
     LR_MIN: float = float(os.getenv("LR_MIN", 0.01))
     LR_MAX: float = float(os.getenv("LR_MAX", 0.3))
     MAX_DEPTH_MIN: int = int(os.getenv("MAX_DEPTH_MIN", 3))
-    MAX_DEPTH_MAX: int = int(os.getenv("MAX_DEPTH_MAX", 8))
-    N_ESTIMATORS_MIN: int = int(os.getenv("N_ESTIMATORS_MIN", 50))
-    N_ESTIMATORS_MAX: int = int(os.getenv("N_ESTIMATORS_MAX", 300))
-    SUBSAMPLE_MIN: float = float(os.getenv("SUBSAMPLE_MIN", 0.6))
+    MAX_DEPTH_MAX: int = int(os.getenv("MAX_DEPTH_MAX", 10))
+    N_ESTIMATORS_MIN: int = int(os.getenv("N_ESTIMATORS_MIN", 100))
+    N_ESTIMATORS_MAX: int = int(os.getenv("N_ESTIMATORS_MAX", 1000))
+    SUBSAMPLE_MIN: float = float(os.getenv("SUBSAMPLE_MIN", 0.4))
     SUBSAMPLE_MAX: float = float(os.getenv("SUBSAMPLE_MAX", 1.0))
     # LightGBM-specific
     NUM_LEAVES_MIN: int = int(os.getenv("NUM_LEAVES_MIN", 15))
-    NUM_LEAVES_MAX: int = int(os.getenv("NUM_LEAVES_MAX", 63))
-    # CatBoost-specific (depth range differs from XGBoost)
+    NUM_LEAVES_MAX: int = int(os.getenv("NUM_LEAVES_MAX", 256))
+    # CatBoost-specific (depth range differs from XGBoost/LGBM)
     CB_DEPTH_MIN: int = int(os.getenv("CB_DEPTH_MIN", 4))
     CB_DEPTH_MAX: int = int(os.getenv("CB_DEPTH_MAX", 10))
 
     # ── OOT / Temporal Split ─────────────────────────────────────────────────────
-    OOT_INIT_MONTHS: int = int(os.getenv("OOT_INIT_MONTHS", 2))
-    OOT_MIN_RATIO: float = float(os.getenv("OOT_MIN_RATIO", 0.20))
+    OOT_INIT_MONTHS: int = int(os.getenv("OOT_INIT_MONTHS", 2))   # floor: always include >= this many months
+    OOT_MIN_RATIO: float = float(os.getenv("OOT_MIN_RATIO", 0.15))  # expand until OOT >= this ratio
+    OOT_MAX_RATIO: float = float(os.getenv("OOT_MAX_RATIO", 0.2))  # hard cap: shrink if OOT exceeds this
     VALID_TEMPORAL_RATIO: float = float(os.getenv("VALID_TEMPORAL_RATIO", 0.20))
 
     # ── FLAML AutoML ──────────────────────────────────────────────────────────
-    FLAML_TIME_BUDGET: int = int(os.getenv("FLAML_TIME_BUDGET", 300))
-    FLAML_ESTIMATORS: str = os.getenv("FLAML_ESTIMATORS", "lgbm,xgboost,rf,extra_tree")
+    FLAML_TIME_BUDGET: int = int(os.getenv("FLAML_TIME_BUDGET", 600))
+    FLAML_ESTIMATORS: str = os.getenv("FLAML_ESTIMATORS", "xgboost,lgbm,catboost,rf,extra_tree")
     FLAML_N_SPLITS: int = int(os.getenv("FLAML_N_SPLITS", 5))
+    # Max training rows passed to FLAML — FLAML internally copies the DataFrame for block
+    # consolidation which can OOM on large datasets. Sampling here keeps the copy small
+    # while still giving FLAML enough signal to select the best estimator type.
+    FLAML_MAX_ROWS: int = int(os.getenv("FLAML_MAX_ROWS", 100_000))
 
     # ── Optuna ────────────────────────────────────────────────────────────────
     OPTUNA_N_TRIALS: int = int(os.getenv("OPTUNA_N_TRIALS", 50))
-    OPTUNA_TIMEOUT: int = int(os.getenv("OPTUNA_TIMEOUT", 180))
+    OPTUNA_TIMEOUT: int = int(os.getenv("OPTUNA_TIMEOUT", 600))
 
     # ── RFE ───────────────────────────────────────────────────────────────────
     RFE_TARGET_FEATURES: int = int(os.getenv("RFE_TARGET_FEATURES", 50))
     RFE_STEP: float = float(os.getenv("RFE_STEP", 0.05))
     RFE_CV_SPLITS: int = int(os.getenv("RFE_CV_SPLITS", 3))
     ENABLE_RFECV: bool = os.getenv("ENABLE_RFECV", "false").lower() == "true"
+    # n_estimators used for the base model fitted during RFE selection
+    RFE_N_ESTIMATORS: int = int(os.getenv("RFE_N_ESTIMATORS", 200))
 
     # ── PSI ───────────────────────────────────────────────────────────────────
-    PSI_THRESHOLD: float = float(os.getenv("PSI_THRESHOLD", 0.25))
-    PSI_BINS: int = int(os.getenv("PSI_BINS", 10))
+    PSI_THRESHOLD: float = float(os.getenv("PSI_THRESHOLD", 0.3))
+    PSI_BINS: int = int(os.getenv("PSI_BINS", 100))
 
     # ── Stability ─────────────────────────────────────────────────────────────
     STABILITY_MIN_MONTHS: int = int(os.getenv("STABILITY_MIN_MONTHS", 6))
-    STABILITY_GINI_STD_THRESHOLD: float = float(os.getenv("STABILITY_GINI_STD_THRESHOLD", 0.10))
+    STABILITY_GINI_STD_THRESHOLD: float = float(os.getenv("STABILITY_GINI_STD_THRESHOLD", 0.15))
     STABILITY_MIN_GINI: float = float(os.getenv("STABILITY_MIN_GINI", 0.02))
 
     # ── Final Feature Cut ─────────────────────────────────────────────────────
     MAX_FINAL_FEATURES: int = int(os.getenv("MAX_FINAL_FEATURES", 100))
 
-    # ── Direct Cloud Fallback (used when LiteLLM proxy is unreachable) ─────────
-    # If OPENAI_API_KEY is set, the pipeline falls back to this model directly
-    # instead of failing completely when the local LiteLLM proxy is down.
+    # ── SHAP + PSI Iterative Pruning ──────────────────────────────────────────
+    # n_estimators for the quick model fitted at each SHAP pruning step
+    SHAP_N_ESTIMATORS: int = int(os.getenv("SHAP_N_ESTIMATORS", 100))
+    # Max training rows sampled for SHAP value computation (speed vs accuracy)
+    SHAP_SAMPLE_SIZE: int = int(os.getenv("SHAP_SAMPLE_SIZE", 2000))
+    # Stop pruning after this many consecutive steps without AUC improvement
+    SHAP_PSI_MAX_NO_IMPROVE: int = int(os.getenv("SHAP_PSI_MAX_NO_IMPROVE", 2))
+    # Absolute floor on minimum features kept after SHAP+PSI pruning
+    SHAP_PSI_MIN_FEATURES_FLOOR: int = int(os.getenv("SHAP_PSI_MIN_FEATURES_FLOOR", 5))
+    # Relative floor: keep at least this fraction of MAX_FINAL_FEATURES
+    SHAP_PSI_MIN_FEATURES_RATIO: float = float(os.getenv("SHAP_PSI_MIN_FEATURES_RATIO", 0.10))
+
+    # ── Overfitting Detection ─────────────────────────────────────────────────
+    # Relative gap (valid_auc - holdout_auc) / valid_auc above which overfitting
+    # is flagged and an LLM-guided retrain is triggered
+    OVERFIT_THRESHOLD: float = float(os.getenv("OVERFIT_THRESHOLD", 0.12))
+
+    # ── Direct Cloud Fallback — order: LiteLLM proxy → OpenAI → Claude ─────────
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_DIRECT_MODEL: str = os.getenv("OPENAI_DIRECT_MODEL", "gpt-4o-mini")
+    OPENAI_DIRECT_MODEL: str = os.getenv("OPENAI_DIRECT_MODEL", "gpt-4.1-mini")
+
+    # Claude (Anthropic) — last-resort fallback; pip install anthropic
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+    CLAUDE_DIRECT_MODEL: str = os.getenv("CLAUDE_DIRECT_MODEL", "claude-sonnet-4-6")
 
     @classmethod
     def validate(cls):
@@ -163,3 +214,13 @@ class Config:
         if not cls.OPENAI_API_KEY:
             return None
         return OpenAI(api_key=cls.OPENAI_API_KEY)
+
+    @classmethod
+    def get_claude_client(cls):
+        if not cls.ANTHROPIC_API_KEY:
+            return None
+        try:
+            import anthropic
+            return anthropic.Anthropic(api_key=cls.ANTHROPIC_API_KEY)
+        except ImportError:
+            return None

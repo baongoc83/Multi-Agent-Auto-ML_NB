@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 from logger import AgentLogger
-from agent_feature_engineer import FeatureEngineerAgent
+from Agents.FeatureEngineer.agent_feature_engineer import FeatureEngineerAgent
 from config import Config
 
 def test_agent2():
@@ -17,8 +17,14 @@ def test_agent2():
         return
     
     clean_data_path = "outputs/clean_data.csv"
-    col_descriptions_path = "col_descriptions.json"
-
+    # col_descriptions_path = "col_descriptions.json"
+    col_descriptions_path = "data/HomeCredit_columns_description.csv"
+    # Column mapping for HomeCredit CSV: Table=group, Row=col name, Description=desc
+    col_descriptions_kwargs = dict(
+        col_name_field="Row",
+        col_desc_field="Description",
+        col_group_field="Table",
+    )
     if not Path(clean_data_path).exists():
         print(f"Error: {clean_data_path} not found")
         print("  Please run test_agent1.py first to generate clean data")
@@ -50,7 +56,13 @@ def test_agent2():
         print("WARNING: data_cleaner_report.json not found — using mock report (no key columns)\n")
 
     logger = AgentLogger("outputs/test_agent2.log")
-    agent = FeatureEngineerAgent(logger, col_descriptions_path=col_descriptions_path)
+    agent = FeatureEngineerAgent(
+        logger,
+        col_descriptions_path=col_descriptions_path,
+        domain="credit_risk",
+        model_type="binary_classification",
+        **col_descriptions_kwargs,
+    )
     
     print("Agent 2 is now engineering features...")
     

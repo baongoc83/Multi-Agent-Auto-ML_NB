@@ -1,0 +1,11 @@
+DATASET METADATA (compressed summary — droppable columns listed explicitly; per-column dtype/null details are in FORMAT_STATS and OUTLIER_STATS below):
+<<METADATA>>
+
+COLUMN FORMAT CHECK (dtype mismatches, whitespace, mixed case, unexpected negatives):
+<<FORMAT_STATS>>
+
+OUTLIER ANALYSIS (IQR 3x — numeric columns sampled; binary/flag columns excluded from clipping):
+<<OUTLIER_STATS>>
+<<OPTIONAL_SECTIONS>>
+Based on all statistics above, decide which cleaning actions to perform.
+Apply only actions clearly justified by the data. Output in the JSON format specified.
