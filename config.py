@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,7 +23,7 @@ class Config:
     # presence_penalty: encourages introducing new topics (0.0–2.0)
     LLM_PRESENCE_PENALTY: float = float(os.getenv("LLM_PRESENCE_PENALTY", 0.0))
     # seed: fixed seed for reproducible LLM outputs; None = disabled
-    LLM_SEED: int = int(os.getenv("LLM_SEED")) if os.getenv("LLM_SEED") else None
+    LLM_SEED: Optional[int] = int(os.getenv("LLM_SEED")) if os.getenv("LLM_SEED") else None
     # Max retries on rate-limit (429) or server errors (5xx) before giving up
     LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", 3))
     # Higher token budget for tasks that produce long output (FE decisions, model code generation)
@@ -190,8 +191,33 @@ class Config:
 
     @classmethod
     def validate(cls):
-        if not cls.LITELLM_URL:
-            raise ValueError("Missing LITELLM_URL. Set it in .env or as an environment variable.")
+        """Validate that at least one LLM endpoint is configured.
+
+        Pipeline tolerates the LiteLLM proxy being unreachable at runtime
+        (it falls back to OpenAI direct → Claude direct), but at least one
+        of the three paths must be configured upfront. Also sanity-checks
+        the LITELLM_URL format.
+        """
+        if cls.LITELLM_URL and not cls.LITELLM_URL.startswith(("http://", "https://")):
+            raise ValueError(
+                f"Invalid LITELLM_URL '{cls.LITELLM_URL}'. "
+                "Expected a URL starting with http:// or https://"
+            )
+        has_proxy = bool(cls.LITELLM_URL)
+        has_openai = bool(cls.OPENAI_API_KEY)
+        has_claude = bool(cls.ANTHROPIC_API_KEY)
+        if not (has_proxy or has_openai or has_claude):
+            raise ValueError(
+                "No LLM endpoint configured. Set at least one of:\n"
+                "  - LITELLM_URL  (proxy)\n"
+                "  - OPENAI_API_KEY  (direct OpenAI fallback)\n"
+                "  - ANTHROPIC_API_KEY  (direct Claude fallback)"
+            )
+        if has_proxy and not (has_openai or has_claude):
+            print(
+                f"WARN: LITELLM_URL is set but no fallback API key configured. "
+                f"If the proxy at {cls.LITELLM_URL} becomes unreachable the pipeline will fail."
+            )
 
     @classmethod
     def is_proxy_reachable(cls) -> bool:

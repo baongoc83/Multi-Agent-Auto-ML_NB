@@ -54,6 +54,7 @@ Thứ tự fallback: **LiteLLM proxy → OpenAI → Claude**
 | `CLEAN_DATA_PATH` | `outputs/clean_data.csv` | File CSV sau khi Agent 1 (DataCleaner) xử lý xong |
 | `ENGINEERED_DATA_PATH` | `outputs/engineered_data.csv` | File CSV sau khi Agent 2 (FeatureEngineer) xử lý xong |
 | `FINAL_MODEL_CODE_PATH` | `outputs/final_model_code.py` | File Python chứa code model cuối cùng |
+| `FINAL_MODEL_PATH` | `outputs/final_model.pkl` | Artifact model đã train (joblib pickle) cùng encoders + feature list |
 | `FINAL_REPORT_PATH` | `outputs/final_report.md` | Báo cáo tổng hợp toàn pipeline dạng Markdown |
 | `EXECUTION_LOG_PATH` | `outputs/agent_execution.log` | Log toàn bộ quá trình chạy các agent |
 | `DATA_CLEANER_REPORT_PATH` | `outputs/data_cleaner_report.json` | JSON report của Agent 1 |
@@ -82,6 +83,8 @@ Thứ tự fallback: **LiteLLM proxy → OpenAI → Claude**
 | `PK_VIOLATION_PCT_THRESHOLD` | `1.0` | Tỷ lệ vi phạm composite key > 1% → gợi ý deduplicate_by_key |
 | `ENTITY_ORPHAN_PCT_THRESHOLD` | `5.0` | Tỷ lệ entity không có identity anchor > 5% → cảnh báo data quality |
 | `AMBIGUOUS_IDENTITY_PCT_THRESHOLD` | `5.0` | Tỷ lệ identity value dùng chung nhiều entity > 5% → flag fraud ring |
+| `SOFT_DUP_PCT_THRESHOLD` | `0.5` | Tỷ lệ soft-duplicate (cùng composite key, khác giá trị) > 0.5% → gợi ý deduplicate_by_key |
+| `APP_DUP_PCT_THRESHOLD` | `10.0` | Tỷ lệ entity có nhiều application > 10% → gợi ý deduplicate_by_key |
 | `OUTLIER_PCT_THRESHOLD` | `5.0` | Tỷ lệ outlier (IQR×3) > 5% → gợi ý clip |
 | `IMBALANCE_RATIO_THRESHOLD` | `20.0` | Tỷ lệ max/min class count > 20 → cảnh báo class imbalance |
 | `OUTLIER_NUMERIC_COLS_LIMIT` | `10` | Tối đa số cột numeric chạy outlier detection (tránh chậm với dataset rộng) |
@@ -95,8 +98,12 @@ Thứ tự fallback: **LiteLLM proxy → OpenAI → Claude**
 | `HIGH_CORRELATION_THRESHOLD` | `0.8` | Cặp feature có correlation > 0.8 → gợi ý bỏ một cái (multicollinearity) |
 | `LOW_CORRELATION_THRESHOLD` | `0.04` | Correlation với target < 0.04 → feature yếu, ưu tiên loại |
 | `MIN_CORRELATION_THRESHOLD` | `0.001` | Correlation với target < 0.001 → feature gần như vô nghĩa, flag xóa |
-| `TOP_K_FEATURES_CAP` | `350` | Trần tối đa số feature được chọn (dù 70% rule tính ra nhiều hơn vẫn bị cap) |
-| `FEATURE_META_MAX_COLS` | `50` | Tối đa số cột đưa metadata đầy đủ vào LLM prompt (tránh prompt quá dài) |
+| `TOP_K_FEATURES_CAP` | `350` | Trần tối đa số feature được chọn (dù `TOP_K_RATIO` tính ra nhiều hơn vẫn bị cap) |
+| `TOP_K_RATIO` | `0.70` | Tỷ lệ feature giữ lại khi `select_top_features` (0 < ratio ≤ 1) |
+| `FEATURE_META_NUMERIC_RATIO` | `0.6` | Tỷ lệ cột numeric đưa metadata vào prompt LLM (0 < ratio ≤ 1) |
+| `FEATURE_META_MAX_NUMERIC_COLS` | `200` | Trần cứng số cột numeric đưa vào prompt (an toàn cho dataset rất rộng) |
+| `FEATURE_META_MAX_CATEGORICAL_COLS` | `40` | Tối đa số cột categorical đưa metadata đầy đủ vào prompt |
+| `MAX_DESC_PER_GROUP` | `30` | Tối đa số description hiển thị mỗi group trong khối column-description của prompt |
 
 ---
 
@@ -109,6 +116,7 @@ Thứ tự fallback: **LiteLLM proxy → OpenAI → Claude**
 | `MAX_TRAINING_ITERATIONS` | `3` | Số vòng lặp feedback tối đa của training loop |
 | `MODELS_TO_COMPARE` | `XGBoost,RandomForest,ExtraTrees,LightGBM,CatBoost` | Danh sách model FLAML sẽ thử (comma-separated) |
 | `CLASSIFICATION_UNIQUE_THRESHOLD` | `10` | Target có ≤ 10 giá trị unique → classification, ngược lại → regression |
+| `CV_N_SPLITS` | `5` | Số fold StratifiedKFold cho đánh giá CV cuối cùng của model |
 | `TARGET_ROC_AUC` | `0.85` | Ngưỡng AUC mục tiêu để pipeline coi là "đạt" |
 | `TARGET_F1` | `0.80` | Ngưỡng F1 mục tiêu |
 | `TARGET_R2` | `0.75` | Ngưỡng R² mục tiêu (bài toán regression) |
@@ -134,6 +142,7 @@ Thứ tự fallback: **LiteLLM proxy → OpenAI → Claude**
 | `FLAML_TIME_BUDGET` | `600` | Thời gian tối đa (giây) FLAML được phép tìm kiếm model tốt nhất |
 | `FLAML_ESTIMATORS` | `xgboost,lgbm,catboost,rf,extra_tree` | Danh sách estimator FLAML thử |
 | `FLAML_N_SPLITS` | `5` | Số fold CV khi FLAML không có validation set riêng |
+| `FLAML_MAX_ROWS` | `100000` | Trần số row truyền vào FLAML; sample ngẫu nhiên nếu dataset lớn hơn (tránh OOM khi FLAML copy DataFrame) |
 
 ---
 
@@ -160,6 +169,7 @@ Thứ tự fallback: **LiteLLM proxy → OpenAI → Claude**
 | `RFE_STEP` | `0.05` | Mỗi vòng RFE loại bỏ 5% số feature còn lại |
 | `RFE_CV_SPLITS` | `3` | Số fold CV dùng trong RFECV (chỉ khi `ENABLE_RFECV=true`) |
 | `ENABLE_RFECV` | `false` | Bật RFECV (tự chọn số feature tối ưu qua CV). `false` = dùng RFE cố định |
+| `RFE_N_ESTIMATORS` | `200` | n_estimators cho base model fit trong RFE selection |
 
 ---
 
@@ -187,3 +197,25 @@ Thứ tự fallback: **LiteLLM proxy → OpenAI → Claude**
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
 | `MAX_FINAL_FEATURES` | `100` | Sau PSI + Stability, nếu còn > 100 feature thì cut tiếp bằng importance top-N |
+
+---
+
+## SHAP + PSI Iterative Pruning
+
+Loại bỏ feature có SHAP importance thấp + PSI drift cao theo từng bước cho đến khi AUC validation ngừng cải thiện.
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `SHAP_N_ESTIMATORS` | `100` | n_estimators cho model nhanh fit tại mỗi step pruning |
+| `SHAP_SAMPLE_SIZE` | `2000` | Tối đa số row sample để tính SHAP value (cân bằng tốc độ vs độ chính xác) |
+| `SHAP_PSI_MAX_NO_IMPROVE` | `2` | Dừng pruning sau N step liên tiếp không cải thiện AUC |
+| `SHAP_PSI_MIN_FEATURES_FLOOR` | `5` | Sàn cứng tối thiểu số feature giữ lại sau pruning |
+| `SHAP_PSI_MIN_FEATURES_RATIO` | `0.10` | Sàn tương đối: giữ ít nhất 10% × `MAX_FINAL_FEATURES` |
+
+---
+
+## Overfitting Detection
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `OVERFIT_THRESHOLD` | `0.12` | Gap tương đối `(valid_auc - holdout_auc) / valid_auc` > 12% → flag overfit và trigger LLM-guided retrain |

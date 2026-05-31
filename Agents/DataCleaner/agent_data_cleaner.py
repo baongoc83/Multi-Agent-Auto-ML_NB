@@ -37,15 +37,6 @@ class DataCleanerAgent(BaseAgent):
             "Returns distribution statistics or unique values for a column",
             {"df": "The dataframe", "col": "Column name to analyze"},
         )
-        # self.tool_registry.register(
-        #     "impute_missing",
-        #     "Fills missing values in a column using specified strategy",
-        #     {
-        #         "df": "The dataframe",
-        #         "col": "Column name",
-        #         "strategy": "One of: 'mean', 'median', 'mode', 'zero', 'forward_fill'",
-        #     },
-        # )
         self.tool_registry.register(
             "drop_column",
             "Removes a column from the dataset",
@@ -162,26 +153,6 @@ class DataCleanerAgent(BaseAgent):
             stats["note"] = f"High cardinality: {col_data.nunique()} unique values"
 
         return json.dumps(stats, indent=2)
-
-    # def _tool_impute_missing(self, df: pd.DataFrame, col: str, strategy: str) -> pd.DataFrame:
-    #     if col not in df.columns:
-    #         raise ValueError(f"Column '{col}' not found")
-
-    #     if strategy == "mean":
-    #         df[col] = df[col].fillna(df[col].mean())
-    #     elif strategy == "median":
-    #         df[col] = df[col].fillna(df[col].median())
-    #     elif strategy == "mode":
-    #         mode_value = df[col].mode()[0] if not df[col].mode().empty else 0
-    #         df[col] = df[col].fillna(mode_value)
-    #     elif strategy == "zero":
-    #         df[col] = df[col].fillna(0)
-    #     elif strategy == "forward_fill":
-    #         df[col] = df[col].ffill()
-    #     else:
-    #         raise ValueError(f"Unknown strategy: {strategy}")
-
-    #     return df
 
     def _tool_drop_column(self, df: pd.DataFrame, col: str) -> pd.DataFrame:
         if col not in df.columns:
@@ -932,11 +903,6 @@ class DataCleanerAgent(BaseAgent):
                                 continue
                         self.df = self.execute_tool("drop_column", df=self.df, col=column)
                         actions_taken.append(f"Dropped column '{column}': {reason}")
-
-                    # elif action_type == "impute_missing":  # disabled — impute_missing tool not active
-                    #     strategy = action_spec.get("strategy", "median")
-                    #     self.df = self.execute_tool("impute_missing", df=self.df, col=column, strategy=strategy)
-                    #     actions_taken.append(f"Imputed '{column}' with {strategy}: {reason}")
 
                     elif action_type == "drop_duplicates":
                         self.df = self.execute_tool("drop_duplicates", df=self.df)
