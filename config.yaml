@@ -6,4 +6,4 @@ model_list:
   - model_name: cloud-model
     litellm_params:
       model: openai/gpt-4o
-      api_key: OPENAI_API_KEY
+      api_key: "os.environ/OPENAI_API_KEY"

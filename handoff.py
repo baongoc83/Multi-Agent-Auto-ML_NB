@@ -1,7 +1,8 @@
-import pandas as pd
 from pathlib import Path
 from typing import Dict, Any
+import pandas as pd
 from logger import AgentLogger
+from Agents.BaseAgent.base_agent import BaseAgent
 
 
 class Handoff:
@@ -24,7 +25,7 @@ class Handoff:
     def get_data(self) -> pd.DataFrame:
         if self.data_path is None:
             raise ValueError("No data has been set for handoff")
-        return pd.read_csv(self.data_path)
+        return BaseAgent.load_dataframe(str(self.data_path))
 
     def get_report(self) -> Dict[str, Any]:
         return self.report

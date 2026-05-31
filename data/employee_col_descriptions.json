@@ -1,0 +1,12 @@
+{
+  "employee_id": "Unique employee identifier — not used for model training (surrogate row key)",
+  "age": "Employee age in years (float, ~15% missing values)",
+  "years_experience": "Total years of professional work experience",
+  "education_level": "Highest education level attained (1=High School, 2=Bachelor, 3=Master, 4=PhD)",
+  "annual_income": "Annual income in USD (float, ~10% missing values; lognormal distribution)",
+  "department": "Department the employee belongs to (Sales, Engineering, Marketing, HR)",
+  "location": "Work location type (Urban, Suburban, Rural)",
+  "random_noise": "Random noise column — uniform [0,1], no predictive value",
+  "useless_feature": "Sparse feature with ~90% missing values — very low information content",
+  "high_performer": "Target variable: 1 = high performer (above-median income AND >10 years experience), 0 = otherwise"
+}

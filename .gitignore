@@ -12,6 +12,19 @@ Thumbs.db
 outputs/clean_data.csv
 outputs/engineered_data.csv
 outputs/sample_data.csv
+outputs/test_employee_data.csv
+outputs/shap_psi_prune_log.csv
+outputs/psi_report.csv
+outputs/stability_report.csv
+outputs/*.pkl
+
+# Test outputs
+tests/outputs/
+
+# Raw datasets (large)
+data/home-credit-default-risk/*.csv
+data/bank+marketing/
+
 *.ipynb_checkpoints/
 .ipynb_checkpoints/
 Temp/
