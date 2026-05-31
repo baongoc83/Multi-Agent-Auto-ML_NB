@@ -6,7 +6,6 @@ venv/
 *.log
 .DS_Store
 Thumbs.db
-.env.example
 
 # Large data files — not tracked in git
 outputs/clean_data.csv
