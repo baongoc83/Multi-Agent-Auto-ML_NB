@@ -238,7 +238,7 @@ flowchart TD
     Check -->|no| Add[Add col to df]
 
     ST --> Snap[Snapshot protected cols]
-    Snap --> Sel[SelectKBest scoring<br/>col-by-col, O(n_rows) mem]
+    Snap --> Sel["SelectKBest scoring<br/>col-by-col, O(n_rows) mem"]
     Sel --> Restore[Re-add protected cols<br/>nếu bị loại]
 
     ENC --> Loop
@@ -328,7 +328,7 @@ flowchart TD
     Final --> Over{Overfit detected?<br/>gap > OVERFIT_THRESHOLD}
     Over -->|no| Save
     Over -->|yes| LLMReg[LLM-guided retrain<br/>regularization mạnh hơn]
-    LLMReg --> Cmp{Retry holdout<br/>>= original?}
+    LLMReg --> Cmp{"Retry holdout<br/>>= original?"}
     Cmp -->|yes| Save
     Cmp -->|no| Revert[Restore original model]
     Revert --> Save
@@ -360,7 +360,7 @@ flowchart TD
     HasDate -->|no| Fallback[60/20/20 split<br/>train + valid + test]
     HasDate -->|yes| Months[Extract year-month]
 
-    Months --> MinMo{>= 2 distinct<br/>months?}
+    Months --> MinMo{">= 2 distinct<br/>months?"}
     MinMo -->|no| Fallback
 
     MinMo -->|yes| FindOOT[Find n_oot:<br/>minimum months để đạt OOT_MIN_RATIO]
@@ -422,20 +422,20 @@ flowchart LR
 ```mermaid
 flowchart TD
     Start([Features after Stability]) --> Base[Compute baseline<br/>valid AUC]
-    Base --> Iter{len(features)<br/>> min_features?}
+    Base --> Iter{"len(features)<br/>> min_features?"}
 
     Iter -->|yes| Fit[Fit model fast<br/>SHAP_N_ESTIMATORS]
     Fit --> Shap[Compute SHAP importance<br/>+ PSI lookup]
-    Shap --> Score[removal_score =<br/>0.5×(1-shap_norm) + 0.5×psi_norm]
+    Shap --> Score["removal_score =<br/>0.5×(1-shap_norm) + 0.5×psi_norm"]
     Score --> Worst[Pick worst feature]
     Worst --> Try[Train without it<br/>compute candidate AUC]
-    Try --> Improve{candidate_auc<br/>>= best_auc?}
+    Try --> Improve{"candidate_auc<br/>>= best_auc?"}
 
     Improve -->|yes| Update[best_features = candidate<br/>reset streak]
     Improve -->|no| Streak[no_improve_streak++]
 
     Update --> Iter
-    Streak --> Stop{streak >=<br/>MAX_NO_IMPROVE?}
+    Streak --> Stop{"streak >=<br/>MAX_NO_IMPROVE?"}
     Stop -->|yes| End
     Stop -->|no| Iter
 
@@ -464,7 +464,7 @@ flowchart TD
     Conservative --> Retry
     Override --> Retry[Retrain với params mới]
 
-    Retry --> Cmp{retry_holdout_auc<br/>>= orig_holdout?}
+    Retry --> Cmp{"retry_holdout_auc<br/>>= orig_holdout?"}
     Cmp -->|yes| Keep[Keep retrained model]
     Cmp -->|no| Revert[Restore original model<br/>từ pickle]
 
