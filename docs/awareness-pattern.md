@@ -1,12 +1,12 @@
 # Awareness Pattern — Multi-Agent AutoML
 
-Tài liệu phân tích pattern thiết kế của các agent trong project: thuộc loại nào, dùng những lớp awareness gì, và vì sao chọn approach này.
+Tài liệu phân tích pattern thiết kế của các agents trong project: thuộc loại nào, dùng những lớp awareness gì, và vì sao chọn approach này.
 
 ---
 
 ## 1. Tổng thể — Pattern: "Stats-Grounded LLM-Planner + Code-Executor"
 
-Pipeline **KHÔNG** dùng ReAct loop (think → act → observe → think) như AutoGPT / Claude Code. Thay vào đó:
+Có 1 project khác dùng pattern ReAct loop (think → act → observe → think) như AutoGPT / Claude Code tuy nhiên không kiểm soát được đầu ra từng bước, và kết quả cuối nên propose --> Pipeline:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -32,7 +32,7 @@ Pipeline **KHÔNG** dùng ReAct loop (think → act → observe → think) như 
 
 **Đặc trưng cốt lõi**:
 - LLM chỉ được gọi **1-2 lần** mỗi agent — không loop nhiều bước
-- LLM nhận **stats thật** đã được code chuẩn bị — không phải tự inspect data
+- LLM nhận **stats thật** đã được code chuẩn bị — không phải tự inspect data (nhằm kiểm soát những dữ liệu LLM gọi là không bịa)
 - LLM output **JSON cố định** — action space giới hạn, không free-form
 - Code **verify** mọi action trước khi execute — không tin LLM tuyệt đối
 
@@ -51,7 +51,7 @@ Agent của project này thể hiện **12 lớp awareness**, từ low-level (da
 | 5 | **Tool-awareness** | Tool descriptions inject vào prompt | `ToolRegistry.get_tool_descriptions()` |
 | 6 | **Guard / Constraint-awareness** | Hard-coded checks sau LLM decision, override nếu sai | Block `drop_column` nếu null_rate < threshold AND not constant AND not all-unique |
 | 7 | **Cost-awareness** | Routing model theo prompt length | `MODEL_ROUTING_THRESHOLD` → local/cloud model |
-| 8 | **Failure-awareness** | 3-tier fallback + exponential retry | LiteLLM → OpenAI direct → Claude direct |
+| 8 | **Failure-awareness** | Backend-dependent + exponential retry. Legacy = 3-tier app fallback; Gateway = single source (gateway tự handle failover) | Legacy: LiteLLM → OpenAI direct → Claude direct. Gateway: ANTHROPIC_BASE_URL only |
 | 9 | **Resource-awareness** | Dynamic time budget + GPU auto-detect + sampling | `_compute_time_budget(n_rows, n_cols)`, `FLAML_MAX_ROWS` |
 | 10 | **Temporal-awareness** | OOT split theo date, valid_temporal cho Optuna tránh leak | `_tool_split_data` với date_col |
 | 11 | **Drift-awareness** | PSI filter train vs OOT | `_tool_run_psi_filter` |
@@ -171,7 +171,7 @@ flowchart TB
 
     style This fill:#dcedc1
     style React fill:#ffd3b6
-    style Conv fill:#a8d8ea
+    style Conv fill:#97C7D8
 ```
 
 | Pattern | Khi nào dùng | Khi nào KHÔNG dùng |

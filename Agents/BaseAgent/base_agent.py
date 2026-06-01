@@ -194,8 +194,67 @@ class BaseAgent:
                     raise
         raise last_exc
 
+    def _call_via_gateway(self, prompt: str, system_prompt: str,
+                          json_mode: bool = False,
+                          max_tokens: Optional[int] = None) -> str:
+        """Single-source call through the LiteLLM gateway (anthropic SDK).
+
+        No application-level fallback — the gateway itself is expected to
+        handle internal failover / multi-provider routing.
+        """
+        model = Config.choose_model(prompt)
+        effective_max = max_tokens if max_tokens is not None else Config.LLM_MAX_TOKENS
+        system = system_prompt
+        if json_mode:
+            system += "\n\nIMPORTANT: Respond with valid JSON only. No text outside the JSON object."
+
+        self.logger.log(self.name, "LLM Call",
+            f"model={model} | prompt_len={len(prompt)} chars | "
+            f"temp={Config.LLM_TEMPERATURE} | max_tokens={effective_max} | "
+            f"json_mode={json_mode} | backend=gateway")
+
+        last_exc = None
+        skip_temperature = False
+        for attempt in range(1, Config.LLM_MAX_RETRIES + 1):
+            try:
+                create_kwargs: Dict[str, Any] = {
+                    "model": model,
+                    "max_tokens": effective_max,
+                    "system": system,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                if not skip_temperature:
+                    create_kwargs["temperature"] = Config.LLM_TEMPERATURE
+                response = self.client.messages.create(**create_kwargs)
+                self._log_token_usage(model, response)
+                result = response.content[0].text
+                self.logger.log(self.name, "LLM Response",
+                    f"model={model} | {len(result)} chars | backend=gateway")
+                return result
+            except Exception as e:
+                # Some Claude variants reject temperature — drop it and retry once
+                if not skip_temperature and "temperature" in str(e) and "deprecated" in str(e):
+                    skip_temperature = True
+                    continue
+                last_exc = e
+                if attempt < Config.LLM_MAX_RETRIES and self._is_retryable_error(e):
+                    wait = Config.LLM_RETRY_DELAY * (2 ** (attempt - 1))
+                    self.logger.log(self.name, "LLM Retry",
+                        f"Gateway attempt {attempt}/{Config.LLM_MAX_RETRIES} — "
+                        f"{e} — retrying in {wait:.1f}s")
+                    time.sleep(wait)
+                else:
+                    self.logger.log(self.name, "ERROR", f"Gateway call failed: {e}")
+                    raise
+        raise last_exc
+
     def call_llm(self, prompt: str, system_prompt: str, json_mode: bool = False,
                  max_tokens: Optional[int] = None) -> str:
+        # ── Gateway backend: single source, no application-level fallback ─────
+        if getattr(Config, "BACKEND", "legacy") == "gateway":
+            return self._call_via_gateway(prompt, system_prompt, json_mode, max_tokens)
+
+        # ── Legacy backend: 3-tier fallback ───────────────────────────────────
         model = self._choose_model(prompt)
         fallback_model = Config.CLOUD_MODEL if model == Config.LOCAL_MODEL else Config.LOCAL_MODEL
         effective_max = max_tokens if max_tokens is not None else Config.LLM_MAX_TOKENS

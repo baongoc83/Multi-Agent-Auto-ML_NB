@@ -1,4 +1,16 @@
+# LiteLLM proxy serving config — used when running a LOCAL proxy via start_litellm.ps1.
+#
+# Two sections, both can co-exist:
+#   1. Legacy aliases (local-model / cloud-model) — for LLM_BACKEND=legacy
+#   2. Gateway tier aliases (Haiku/Sonnet/Opus)   — for LLM_BACKEND=gateway when
+#      pointing ANTHROPIC_BASE_URL at this local proxy (instead of a hosted one)
+#
+# If your gateway is hosted remotely (e.g. https://llm-gateway-dev.example.com),
+# you do NOT need to run this proxy locally — point ANTHROPIC_BASE_URL at the
+# hosted URL and ignore this file.
+
 model_list:
+  # ── Legacy backend aliases (LLM_BACKEND=legacy) ────────────────────────────
   - model_name: local-model
     litellm_params:
       model: ollama/qwen3.5:4b
@@ -7,3 +19,24 @@ model_list:
     litellm_params:
       model: openai/gpt-4o
       api_key: "os.environ/OPENAI_API_KEY"
+
+  # ── Gateway backend tier aliases (LLM_BACKEND=gateway, local proxy) ────────
+  # Uncomment to serve gateway-style aliases through THIS local proxy.
+  # Adjust the underlying `model:` to whichever provider you have access to —
+  # examples below route everything to OpenAI as a stand-in; replace with
+  # `anthropic/claude-*` if you have Anthropic credits.
+  #
+  # - model_name: claude-haiku-4-5
+  #   litellm_params:
+  #     model: openai/gpt-4o-mini
+  #     api_key: "os.environ/OPENAI_API_KEY"
+  #
+  # - model_name: claude-sonnet-4-6
+  #   litellm_params:
+  #     model: openai/gpt-4o
+  #     api_key: "os.environ/OPENAI_API_KEY"
+  #
+  # - model_name: claude-opus-4-7
+  #   litellm_params:
+  #     model: openai/gpt-4o
+  #     api_key: "os.environ/OPENAI_API_KEY"

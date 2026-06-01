@@ -4,7 +4,31 @@ Tất cả tham số đều đọc từ biến môi trường (`.env`). Nếu kh
 
 ---
 
-## LLM Endpoints
+## Backend selector
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `LLM_BACKEND` | `legacy` | Chọn backend LLM: `legacy` (LiteLLM proxy + OpenAI/Claude fallback) hoặc `gateway` (single LiteLLM gateway với Anthropic API). Khi set `gateway`, params Gateway phía dưới được dùng và các params Legacy bị ignore. |
+
+---
+
+## LLM Gateway (khi `LLM_BACKEND=gateway`)
+
+Single LiteLLM gateway speaking Anthropic API. Gateway tự xử lý internal failover — không có application-level fallback.
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `ANTHROPIC_AUTH_TOKEN` | `""` (bắt buộc) | Bearer token để authenticate với gateway |
+| `ANTHROPIC_BASE_URL` | `http://localhost:4000` | URL của LiteLLM gateway |
+| `API_TIMEOUT_MS` | `3000000` | Per-request timeout (ms). Default 50 phút — chịu được agent reasoning dài |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claude-haiku-4-5` | Alias tier nhanh/nhỏ — gateway dispatch tới underlying model |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `claude-sonnet-4-6` | Alias tier trung |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | `claude-opus-4-7` | Alias tier cao cấp |
+| `EFFORT_LEVEL` | `medium` | Routing: `low`=luôn Haiku, `medium`=Haiku/Sonnet theo size, `high`=Sonnet/Opus theo size |
+
+---
+
+## LLM Endpoints (khi `LLM_BACKEND=legacy`)
 
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|

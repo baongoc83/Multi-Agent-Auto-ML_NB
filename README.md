@@ -42,9 +42,34 @@ pip install litellm
 
 ### Cấu hình LLM endpoint
 
-Tạo file `.env` ở thư mục gốc với **ít nhất một** trong các phương án sau:
+Project hỗ trợ **2 backend** chọn qua `LLM_BACKEND` env var:
+
+#### Backend `gateway` (mới — đơn giản hơn)
+
+Toàn bộ call qua **một LiteLLM gateway duy nhất** dùng Anthropic API convention. Gateway tự xử lý failover.
 
 ```env
+LLM_BACKEND=gateway
+ANTHROPIC_AUTH_TOKEN=sk-xxxx
+ANTHROPIC_BASE_URL=https://llm-gateway-dev.example.com
+API_TIMEOUT_MS=3000000
+
+# Model aliases — gateway dispatch tới underlying model
+ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5
+ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6
+ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7
+
+# Routing: low=Haiku, medium=Haiku/Sonnet, high=Sonnet/Opus
+EFFORT_LEVEL=medium
+```
+
+#### Backend `legacy` (mặc định — fallback 3 lớp)
+
+LiteLLM proxy → OpenAI direct → Claude direct. Cần **ít nhất một**:
+
+```env
+LLM_BACKEND=legacy
+
 # Phương án A: LiteLLM proxy (khuyến nghị)
 LITELLM_URL=http://localhost:4000
 LOCAL_MODEL=local-model
@@ -59,7 +84,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 CLAUDE_DIRECT_MODEL=claude-sonnet-4-6
 ```
 
-Khởi động LiteLLM proxy (nếu dùng):
+Khởi động LiteLLM proxy local nếu dùng:
 ```powershell
 .\start_litellm.ps1
 ```

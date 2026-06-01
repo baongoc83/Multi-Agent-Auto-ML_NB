@@ -6,6 +6,9 @@ load_dotenv()
 
 
 class Config:
+    # Backend marker — overridden by GatewayConfig when LLM_BACKEND=gateway.
+    BACKEND: str = "legacy"
+
     # ── LLM Endpoints ────────────────────────────────────────────────────────
     LITELLM_URL: str = os.getenv("LITELLM_URL", "http://localhost:4000")
     API_KEY: str = os.getenv("API_KEY", "anything")
@@ -261,3 +264,11 @@ class Config:
             return anthropic.Anthropic(api_key=cls.ANTHROPIC_API_KEY)
         except ImportError:
             return None
+
+
+# ── Backend dispatcher ───────────────────────────────────────────────────────
+# When LLM_BACKEND=gateway, re-export GatewayConfig as Config so every
+# `from config import Config` transparently picks up the gateway-aware class.
+# Legacy behavior is the default — no change unless the env var is set.
+if os.getenv("LLM_BACKEND", "legacy").lower() == "gateway":
+    from config_gateway import GatewayConfig as Config   # noqa: F811

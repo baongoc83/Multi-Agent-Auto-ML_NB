@@ -543,7 +543,46 @@ sequenceDiagram
 
 ## 7. LLM Fallback Strategy
 
-Mỗi `call_llm()` trong `BaseAgent` đi qua chain 4 bước:
+Project hỗ trợ **2 backend** chọn qua env var `LLM_BACKEND`. Mỗi backend có chiến lược khác nhau:
+
+```mermaid
+flowchart LR
+    Env[LLM_BACKEND env var] --> L{legacy?}
+    L -->|yes default| Legacy[3-tier app-level fallback<br/>proxy + OpenAI + Claude]
+    L -->|no - gateway| Gateway[Single source<br/>LiteLLM gateway only<br/>gateway tự xử lý failover]
+
+    style Legacy fill:#ffd3b6
+    style Gateway fill:#dcedc1
+```
+
+### Gateway backend (`LLM_BACKEND=gateway`)
+
+Mỗi `call_llm()` đi thẳng tới gateway, KHÔNG có app-level fallback (gateway tự xử lý nội bộ):
+
+```mermaid
+flowchart TD
+    Call[call_llm prompt] --> Route{Effort level<br/>+ prompt size}
+    Route -->|low/short| H[Haiku tier]
+    Route -->|medium/short| H
+    Route -->|medium/long| S[Sonnet tier]
+    Route -->|high/short| S
+    Route -->|high/long| O[Opus tier]
+
+    H --> GW[ANTHROPIC_BASE_URL<br/>via anthropic SDK]
+    S --> GW
+    O --> GW
+
+    GW --> Retry{Retryable<br/>error?}
+    Retry -->|yes| Backoff[Exponential backoff<br/>up to LLM_MAX_RETRIES]
+    Backoff --> GW
+    Retry -->|no| Done([Return / raise])
+
+    style GW fill:#dcedc1
+```
+
+### Legacy backend (`LLM_BACKEND=legacy`, default)
+
+Mỗi `call_llm()` đi qua chain 4 bước:
 
 ```mermaid
 flowchart TD

@@ -2,6 +2,13 @@
 # Run this in a separate terminal before starting the pipeline.
 #
 # Usage:  .\start_litellm.ps1
+#
+# Compatible with both backends:
+#   - LLM_BACKEND=legacy  → serves local-model / cloud-model (default config.yaml)
+#   - LLM_BACKEND=gateway → serves Haiku/Sonnet/Opus aliases (uncomment in
+#                            config.yaml AND set ANTHROPIC_BASE_URL=http://localhost:4000)
+# Skip running this script if you use a hosted gateway (set ANTHROPIC_BASE_URL
+# to the remote URL instead).
 
 $litellm = "C:\Users\DATANEST\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\Scripts\litellm.exe"
 $config  = Join-Path $PSScriptRoot "config.yaml"
