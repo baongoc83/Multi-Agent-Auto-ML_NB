@@ -16,6 +16,18 @@ class BaseAgent:
     # Lazy-initialized pyarrow S3FileSystem (built once on first S3 access)
     _S3_FS: Optional[Any] = None
 
+    # Outer compression suffix → pandas compression arg.
+    # .b2 is a non-standard alias for .bz2 kept for convenience.
+    # zstd reading requires `pip install zstandard`.
+    _COMPRESSION_MAP: Dict[str, str] = {
+        ".gz":  "gzip",
+        ".bz2": "bz2",
+        ".b2":  "bz2",
+        ".xz":  "xz",
+        ".zst": "zstd",
+        ".zip": "zip",
+    }
+
     def __init__(self, name: str, role: str, logger: AgentLogger):
         self.name = name
         self.role = role
@@ -308,42 +320,70 @@ class BaseAgent:
             raise
 
     @classmethod
+    def _split_compression(cls, path: str):
+        """Return (inner_suffix, compression) tuple.
+
+        'train.csv.gz'   → ('.csv', 'gzip')
+        'train.json.zst' → ('.json', 'zstd')
+        'train.parquet'  → ('.parquet', None)
+        'train.gz'       → ('', 'gzip')
+        """
+        from pathlib import PurePosixPath
+        p = PurePosixPath(path)
+        outer = p.suffix.lower()
+        compression = cls._COMPRESSION_MAP.get(outer)
+        if compression is None:
+            return outer, None
+        inner = PurePosixPath(p.stem).suffix.lower()
+        return inner, compression
+
+    @classmethod
     def load_dataframe(cls, path: str) -> pd.DataFrame:
         """Load a DataFrame from a local or remote path.
 
-        Supported formats  : .csv, .tsv, .parquet, .orc, .feather/.ftr,
-                             .xls, .xlsx, .xlsm, .json
-        S3 / S3-compatible : s3://bucket/key — uses pyarrow with credentials
-                             from Config (S3_ACCESS_KEY / S3_SECRET_KEY /
-                             S3_ENDPOINT_URL). Supports partitioned datasets
-                             (point at a folder for parquet/feather/orc).
-        Other remote       : gs://..., az://...  (pandas + gcsfs/adlfs)
-        CSV encoding       : auto-tries utf-8 → utf-8-sig → cp1252 → latin-1
+        Supported formats   : .csv, .tsv, .parquet, .orc, .feather/.ftr,
+                              .xls, .xlsx, .xlsm, .json
+        Compression suffixes: .gz, .bz2 (alias .b2), .xz, .zst, .zip
+                              (e.g. train.csv.gz, data.json.zst) — auto-decoded.
+                              zstd requires `pip install zstandard`.
+        S3 / S3-compatible  : s3://bucket/key — uses pyarrow with credentials
+                              from Config (S3_ACCESS_KEY / S3_SECRET_KEY /
+                              S3_ENDPOINT_URL). Supports partitioned datasets
+                              (point at a folder for parquet/feather/orc).
+        Other remote        : gs://..., az://...  (pandas + gcsfs/adlfs)
+        CSV encoding        : auto-tries utf-8 → utf-8-sig → cp1252 → latin-1
         """
-        from pathlib import PurePosixPath
-        suffix = PurePosixPath(path).suffix.lower()
+        suffix, compression = cls._split_compression(path)
 
         if path.startswith("s3://"):
-            return cls._load_from_s3(path, suffix)
+            return cls._load_from_s3(path, suffix, compression)
 
-        if suffix == ".parquet":
-            return pd.read_parquet(path)
-        if suffix == ".orc":
-            return pd.read_orc(path)
-        if suffix in (".feather", ".ftr"):
-            return pd.read_feather(path)
-        if suffix in (".xls", ".xlsx", ".xlsm"):
-            return pd.read_excel(path)
+        # Uncompressed columnar / binary formats
+        if compression is None:
+            if suffix == ".parquet":
+                return pd.read_parquet(path)
+            if suffix == ".orc":
+                return pd.read_orc(path)
+            if suffix in (".feather", ".ftr"):
+                return pd.read_feather(path)
+            if suffix in (".xls", ".xlsx", ".xlsm"):
+                return pd.read_excel(path)
+
+        read_kwargs: Dict[str, Any] = {}
+        if compression is not None:
+            read_kwargs["compression"] = compression
+
         if suffix == ".json":
-            return pd.read_json(path)
-        # CSV / TSV (default for unknown extensions too)
+            return pd.read_json(path, **read_kwargs)
+
+        # CSV / TSV (default for unknown extensions and bare .gz/.bz2/... files too)
         sep = "\t" if suffix == ".tsv" else ","
         for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
             try:
-                return pd.read_csv(path, encoding=enc, sep=sep)
+                return pd.read_csv(path, encoding=enc, sep=sep, **read_kwargs)
             except UnicodeDecodeError:
                 continue
-        return pd.read_csv(path, encoding="latin-1", sep=sep)
+        return pd.read_csv(path, encoding="latin-1", sep=sep, **read_kwargs)
 
     @classmethod
     def _get_s3_filesystem(cls):
@@ -374,33 +414,39 @@ class BaseAgent:
         return cls._S3_FS
 
     @classmethod
-    def _load_from_s3(cls, path: str, suffix: str) -> pd.DataFrame:
+    def _load_from_s3(cls, path: str, suffix: str,
+                       compression: Optional[str] = None) -> pd.DataFrame:
         """Load DataFrame from s3:// path via pyarrow.
 
         Columnar formats (parquet/feather/orc) use pyarrow.dataset → supports
         partitioned folders. Row-oriented formats (json/excel/csv) stream the
-        single object through pandas.
+        single object through pandas, decompressing on the fly when needed.
         """
         import pyarrow.dataset as ds
         s3 = cls._get_s3_filesystem()
         s3_path = path[len("s3://"):]   # pyarrow expects 'bucket/key'
 
-        # Columnar / partitioned-capable — single file OR folder both work
-        if suffix in ("", ".parquet"):
-            return ds.dataset(s3_path, filesystem=s3, format="parquet").to_table().to_pandas()
-        if suffix in (".feather", ".ftr"):
-            return ds.dataset(s3_path, filesystem=s3, format="feather").to_table().to_pandas()
-        if suffix == ".orc":
-            return ds.dataset(s3_path, filesystem=s3, format="orc").to_table().to_pandas()
+        # Uncompressed columnar / partitioned-capable — single file OR folder both work
+        if compression is None:
+            if suffix in ("", ".parquet"):
+                return ds.dataset(s3_path, filesystem=s3, format="parquet").to_table().to_pandas()
+            if suffix in (".feather", ".ftr"):
+                return ds.dataset(s3_path, filesystem=s3, format="feather").to_table().to_pandas()
+            if suffix == ".orc":
+                return ds.dataset(s3_path, filesystem=s3, format="orc").to_table().to_pandas()
 
-        # Row-oriented / non-arrow — stream through pandas
+        # Row-oriented / compressed — stream through pandas
+        read_kwargs: Dict[str, Any] = {}
+        if compression is not None:
+            read_kwargs["compression"] = compression
+
         with s3.open_input_stream(s3_path) as f:
             if suffix == ".json":
-                return pd.read_json(f)
+                return pd.read_json(f, **read_kwargs)
             if suffix in (".xls", ".xlsx", ".xlsm"):
-                return pd.read_excel(f)
+                return pd.read_excel(f)   # excel rarely wrapped in outer compression
             sep = "\t" if suffix == ".tsv" else ","
-            return pd.read_csv(f, sep=sep)
+            return pd.read_csv(f, sep=sep, **read_kwargs)
 
     def save_report(self, report: Dict[str, Any], filename: str):
         report_path = Path(filename)
