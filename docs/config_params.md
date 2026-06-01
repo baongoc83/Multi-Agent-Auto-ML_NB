@@ -10,6 +10,15 @@ Tất cả tham số đều đọc từ biến môi trường (`.env`). Nếu kh
 |---------|----------|-------|
 | `LLM_BACKEND` | `legacy` | Chọn backend LLM: `legacy` (LiteLLM proxy + OpenAI/Claude fallback) hoặc `gateway` (single LiteLLM gateway với Anthropic API). Khi set `gateway`, params Gateway phía dưới được dùng và các params Legacy bị ignore. |
 
+**Chọn backend theo môi trường mạng**:
+
+| Vị trí mạng | `LLM_BACKEND` | Lý do |
+|---|---|---|
+| Mạng nội bộ (VPN / văn phòng) — reachable tới gateway nội bộ | `gateway` | Key chung của tổ chức, không cần key cá nhân |
+| Mạng ngoài (nhà / quán cafe) — KHÔNG có VPN | `legacy` | Đi thẳng OpenAI/Claude public Internet bằng key cá nhân |
+
+Switch không cần đổi code — chỉ đổi `LLM_BACKEND` trong `.env` rồi chạy lại pipeline.
+
 ---
 
 ## LLM Gateway (khi `LLM_BACKEND=gateway`)

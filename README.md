@@ -42,51 +42,95 @@ pip install litellm
 
 ### Cấu hình LLM endpoint
 
-Project hỗ trợ **2 backend** chọn qua `LLM_BACKEND` env var:
+Project hỗ trợ **2 backend** chọn qua biến `LLM_BACKEND` trong file `.env`. Chọn backend nào tuỳ vào **vị trí mạng** bạn đang dùng:
 
-#### Backend `gateway` (mới — đơn giản hơn)
+| Tình huống | Backend nên dùng | Lý do |
+|---|---|---|
+| **Đang trong mạng nội bộ** (VPN công ty, văn phòng) — có thể truy cập LLM gateway nội bộ | **`gateway`** | Gateway hosted trong mạng nội bộ, dùng key chung của tổ chức, không cần OpenAI/Claude key cá nhân |
+| **Đang ở mạng ngoài** (nhà, quán cafe, công cộng) — KHÔNG truy cập được gateway nội bộ | **`legacy`** | Đi thẳng tới OpenAI / Claude qua Internet công cộng bằng key cá nhân, không cần VPN |
 
-Toàn bộ call qua **một LiteLLM gateway duy nhất** dùng Anthropic API convention. Gateway tự xử lý failover.
+> Switch giữa 2 backend **không cần đổi code** — chỉ cần đổi `LLM_BACKEND` trong `.env` rồi chạy lại.
+
+---
+
+#### Backend `gateway` — dùng khi ở **mạng nội bộ**
+
+Toàn bộ call qua **một LiteLLM gateway nội bộ duy nhất** (Anthropic API convention). Gateway tự xử lý routing và failover phía sau.
+
+**Yêu cầu**: kết nối được tới `ANTHROPIC_BASE_URL` (thường chỉ accessible qua VPN / intranet).
 
 ```env
+# .env
 LLM_BACKEND=gateway
+
+# Endpoint nội bộ — phải reachable từ máy bạn
 ANTHROPIC_AUTH_TOKEN=sk-xxxx
 ANTHROPIC_BASE_URL=https://llm-gateway-dev.example.com
 API_TIMEOUT_MS=3000000
 
-# Model aliases — gateway dispatch tới underlying model
+# Model aliases — gateway tự dispatch tới underlying model
 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5
 ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6
 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7
 
-# Routing: low=Haiku, medium=Haiku/Sonnet, high=Sonnet/Opus
+# Routing strategy: low=luôn Haiku | medium=Haiku/Sonnet | high=Sonnet/Opus
 EFFORT_LEVEL=medium
 ```
 
-#### Backend `legacy` (mặc định — fallback 3 lớp)
+**Test nhanh trước khi chạy pipeline**:
+```powershell
+$env:GATEWAY_DEMO_REAL = "1"
+python examples/gateway_demo.py
+```
+Nếu thấy response từ LLM → gateway sống → có thể yên tâm chạy `python main.py ...`.
 
-LiteLLM proxy → OpenAI direct → Claude direct. Cần **ít nhất một**:
+Nếu lỗi `Connection refused` / `timeout` → kiểm tra VPN, hoặc switch sang backend `legacy`.
+
+---
+
+#### Backend `legacy` — dùng khi ở **mạng ngoài** (mặc định)
+
+3-tier fallback đi qua Internet công cộng: LiteLLM proxy local → OpenAI direct → Claude direct. Cần **ít nhất một** trong 3 phương án.
 
 ```env
+# .env
 LLM_BACKEND=legacy
 
-# Phương án A: LiteLLM proxy (khuyến nghị)
+# Phương án A: LiteLLM proxy chạy local (port 4000)
 LITELLM_URL=http://localhost:4000
 LOCAL_MODEL=local-model
 CLOUD_MODEL=cloud-model
 
-# Phương án B: OpenAI trực tiếp (fallback nếu proxy down)
+# Phương án B: OpenAI trực tiếp qua Internet công cộng
 OPENAI_API_KEY=sk-...
 OPENAI_DIRECT_MODEL=gpt-4.1-mini
 
-# Phương án C: Claude trực tiếp (fallback cuối)
+# Phương án C: Claude trực tiếp qua Internet công cộng (fallback cuối)
 ANTHROPIC_API_KEY=sk-ant-...
 CLAUDE_DIRECT_MODEL=claude-sonnet-4-6
 ```
 
-Khởi động LiteLLM proxy local nếu dùng:
+Nếu dùng phương án A (proxy local), khởi động proxy ở terminal khác trước:
 ```powershell
 .\start_litellm.ps1
+```
+
+Nếu chỉ dùng phương án B hoặc C (OpenAI/Claude trực tiếp), không cần chạy `start_litellm.ps1` — pipeline tự fallback xuống provider trực tiếp.
+
+---
+
+#### Verify đang dùng backend nào
+
+Trước khi chạy pipeline lớn, kiểm tra nhanh backend:
+
+```powershell
+python -c "from config import Config; print(f'Backend={Config.BACKEND}')"
+```
+
+Sau khi pipeline chạy xong, kiểm tra log:
+```powershell
+# Nếu thấy nhiều dòng có 'backend=gateway' = đã đi qua gateway
+Select-String -Path outputs/agent_execution.log -Pattern "backend=gateway" | Measure-Object | Select-Object Count
 ```
 
 ---
