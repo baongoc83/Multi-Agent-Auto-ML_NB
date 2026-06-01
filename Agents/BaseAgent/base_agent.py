@@ -13,6 +13,9 @@ class BaseAgent:
     # Root folder for all agent prompt templates (Agents/BaseAgent/ → Agents/)
     _PROMPTS_ROOT: Path = Path(__file__).parent.parent
 
+    # Lazy-initialized pyarrow S3FileSystem (built once on first S3 access)
+    _S3_FS: Optional[Any] = None
+
     def __init__(self, name: str, role: str, logger: AgentLogger):
         self.name = name
         self.role = role
@@ -304,19 +307,24 @@ class BaseAgent:
             self.logger.log(self.name, "ERROR", f"Error executing tool {tool_name}: {e}")
             raise
 
-    @staticmethod
-    def load_dataframe(path: str) -> pd.DataFrame:
-        """Load a DataFrame from a local or S3 path.
+    @classmethod
+    def load_dataframe(cls, path: str) -> pd.DataFrame:
+        """Load a DataFrame from a local or remote path.
 
         Supported formats  : .csv, .tsv, .parquet, .orc, .feather/.ftr,
                              .xls, .xlsx, .xlsm, .json
-        Remote storage     : s3://bucket/key  (requires: pip install s3fs)
-                             gs://bucket/key  (requires: pip install gcsfs)
-                             az://...         (requires: pip install adlfs)
+        S3 / S3-compatible : s3://bucket/key — uses pyarrow with credentials
+                             from Config (S3_ACCESS_KEY / S3_SECRET_KEY /
+                             S3_ENDPOINT_URL). Supports partitioned datasets
+                             (point at a folder for parquet/feather/orc).
+        Other remote       : gs://..., az://...  (pandas + gcsfs/adlfs)
         CSV encoding       : auto-tries utf-8 → utf-8-sig → cp1252 → latin-1
         """
         from pathlib import PurePosixPath
         suffix = PurePosixPath(path).suffix.lower()
+
+        if path.startswith("s3://"):
+            return cls._load_from_s3(path, suffix)
 
         if suffix == ".parquet":
             return pd.read_parquet(path)
@@ -336,6 +344,63 @@ class BaseAgent:
             except UnicodeDecodeError:
                 continue
         return pd.read_csv(path, encoding="latin-1", sep=sep)
+
+    @classmethod
+    def _get_s3_filesystem(cls):
+        """Build pyarrow.fs.S3FileSystem from Config — cached after first call.
+
+        Empty credentials fall back to pyarrow's default chain
+        (env vars → ~/.aws/credentials → IAM role).
+        """
+        if cls._S3_FS is not None:
+            return cls._S3_FS
+        try:
+            import pyarrow.fs as fs
+        except ImportError as e:
+            raise ImportError(
+                "pyarrow is required for s3:// paths. Run: pip install pyarrow"
+            ) from e
+        kwargs: Dict[str, Any] = {
+            "connect_timeout": Config.S3_CONNECT_TIMEOUT,
+            "request_timeout": Config.S3_REQUEST_TIMEOUT,
+        }
+        if Config.S3_ACCESS_KEY:
+            kwargs["access_key"] = Config.S3_ACCESS_KEY
+        if Config.S3_SECRET_KEY:
+            kwargs["secret_key"] = Config.S3_SECRET_KEY
+        if Config.S3_ENDPOINT_URL:
+            kwargs["endpoint_override"] = Config.S3_ENDPOINT_URL
+        cls._S3_FS = fs.S3FileSystem(**kwargs)
+        return cls._S3_FS
+
+    @classmethod
+    def _load_from_s3(cls, path: str, suffix: str) -> pd.DataFrame:
+        """Load DataFrame from s3:// path via pyarrow.
+
+        Columnar formats (parquet/feather/orc) use pyarrow.dataset → supports
+        partitioned folders. Row-oriented formats (json/excel/csv) stream the
+        single object through pandas.
+        """
+        import pyarrow.dataset as ds
+        s3 = cls._get_s3_filesystem()
+        s3_path = path[len("s3://"):]   # pyarrow expects 'bucket/key'
+
+        # Columnar / partitioned-capable — single file OR folder both work
+        if suffix in ("", ".parquet"):
+            return ds.dataset(s3_path, filesystem=s3, format="parquet").to_table().to_pandas()
+        if suffix in (".feather", ".ftr"):
+            return ds.dataset(s3_path, filesystem=s3, format="feather").to_table().to_pandas()
+        if suffix == ".orc":
+            return ds.dataset(s3_path, filesystem=s3, format="orc").to_table().to_pandas()
+
+        # Row-oriented / non-arrow — stream through pandas
+        with s3.open_input_stream(s3_path) as f:
+            if suffix == ".json":
+                return pd.read_json(f)
+            if suffix in (".xls", ".xlsx", ".xlsm"):
+                return pd.read_excel(f)
+            sep = "\t" if suffix == ".tsv" else ","
+            return pd.read_csv(f, sep=sep)
 
     def save_report(self, report: Dict[str, Any], filename: str):
         report_path = Path(filename)

@@ -1,6 +1,7 @@
 # Core data
 numpy==2.3.3
 pandas==2.3.3
+pyarrow>=14.0.0   # parquet/feather/orc + S3FileSystem with custom credentials
 
 # ML / model training
 scikit-learn==1.7.2

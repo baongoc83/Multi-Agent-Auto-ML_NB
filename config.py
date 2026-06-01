@@ -45,6 +45,17 @@ class Config:
     FEATURE_ENGINEER_REPORT_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/feature_engineer_report.json"
     MODEL_TRAINER_REPORT_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/model_trainer_report.json"
 
+    # ── S3 / S3-compatible storage (MinIO, Wasabi, ...) ───────────────────────
+    # Used by BaseAgent.load_dataframe when path starts with s3://
+    # Leave keys empty to fall back to AWS default credential chain (boto3-style)
+    S3_ACCESS_KEY: str = os.getenv("S3_ACCESS_KEY", "")
+    S3_SECRET_KEY: str = os.getenv("S3_SECRET_KEY", "")
+    # Override for S3-compatible endpoints (MinIO etc.); leave empty for AWS S3
+    S3_ENDPOINT_URL: str = os.getenv("S3_ENDPOINT_URL", "")
+    # Network timeouts in seconds — bumped to handle large parquet datasets
+    S3_CONNECT_TIMEOUT: int = int(os.getenv("S3_CONNECT_TIMEOUT", 300))
+    S3_REQUEST_TIMEOUT: int = int(os.getenv("S3_REQUEST_TIMEOUT", 3600))
+
     # ── Logging ───────────────────────────────────────────────────────────────
     # Max chars of a tool result shown in logs
     LOG_RESULT_PREVIEW_CHARS: int = int(os.getenv("LOG_RESULT_PREVIEW_CHARS", 200))

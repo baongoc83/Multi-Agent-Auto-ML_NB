@@ -63,6 +63,20 @@ Thứ tự fallback: **LiteLLM proxy → OpenAI → Claude**
 
 ---
 
+## S3 / S3-compatible storage
+
+Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compatible (MinIO, Wasabi, ...) qua `S3_ENDPOINT_URL`.
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `S3_ACCESS_KEY` | `""` | Access key. Để trống → dùng AWS default credential chain |
+| `S3_SECRET_KEY` | `""` | Secret key |
+| `S3_ENDPOINT_URL` | `""` | Endpoint override cho S3-compatible (MinIO...). Để trống = AWS S3 |
+| `S3_CONNECT_TIMEOUT` | `300` | Timeout kết nối (giây) |
+| `S3_REQUEST_TIMEOUT` | `3600` | Timeout request (giây) — tăng cho parquet rất lớn |
+
+---
+
 ## Logging
 
 | Tham số | Mặc định | Mô tả |
