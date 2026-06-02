@@ -1,11 +1,18 @@
 from logger import AgentLogger
 from handoff import Handoff
 from pathlib import Path
+import pandas as pd
 from config import Config
 from Agents.BaseAgent.base_agent import BaseAgent
 from Agents.DataCleaner.agent_data_cleaner import DataCleanerAgent
 from Agents.FeatureEngineer.agent_feature_engineer import FeatureEngineerAgent
 from Agents.TrainModel.agent_train_model import TrainModelAgent
+
+
+# Marker column used to preserve user-specified splits through Agents 1+2.
+# Agents protect this column from drop/encode/interaction; Agent 3 reads it
+# to reconstruct train/valid/oot instead of auto-splitting.
+SPLIT_MARKER = "_split_"
 
 
 class AutoMLPipeline:
@@ -16,6 +23,48 @@ class AutoMLPipeline:
         self.handoff = Handoff(self.logger)
         Path(Config.OUTPUT_DIR).mkdir(exist_ok=True)
 
+    def _build_combined_input(
+        self,
+        input_path: str,
+        valid_path: str = None,
+        oot_path: str = None,
+    ) -> str:
+        """Concat train + (optional) valid + (optional) oot with a `_split_`
+        marker column so Agents 1+2 apply identical cleaning + feature
+        engineering to every partition, while Agent 3 still reconstructs the
+        exact user-defined splits.
+
+        - train: always present (= input_path)
+        - valid: included only if valid_path provided; otherwise Agent 3
+                 auto-splits 20% of train into valid
+        - oot:   included only if oot_path provided
+
+        Returns the combined file path; written to OUTPUT_DIR/combined_input.csv.
+        """
+        train_df = BaseAgent.load_dataframe(input_path)
+        train_df[SPLIT_MARKER] = "train"
+        parts = [train_df]
+        sizes = {"train": len(train_df)}
+
+        if valid_path:
+            valid_df = BaseAgent.load_dataframe(valid_path)
+            valid_df[SPLIT_MARKER] = "valid"
+            parts.append(valid_df)
+            sizes["valid"] = len(valid_df)
+
+        if oot_path:
+            oot_in_df = BaseAgent.load_dataframe(oot_path)
+            oot_in_df[SPLIT_MARKER] = "oot"
+            parts.append(oot_in_df)
+            sizes["oot"] = len(oot_in_df)
+
+        combined = pd.concat(parts, ignore_index=True, sort=False)
+        combined_path = f"{Config.OUTPUT_DIR}/combined_input.csv"
+        combined.to_csv(combined_path, index=False)
+        self.logger.log("PIPELINE", "Pre-split concat",
+            f"Combined sizes={sizes} | total={len(combined)} | saved={combined_path}")
+        return combined_path
+
     def run(
         self,
         input_path: str,
@@ -24,6 +73,7 @@ class AutoMLPipeline:
         col_descriptions_kwargs: dict = None,
         entity_id_col: str = None,
         composite_key_cols: list = None,
+        valid_path: str = None,
         oot_path: str = None,
         domain: str = "generic",
         model_type: str = "binary_classification",
@@ -31,20 +81,44 @@ class AutoMLPipeline:
         """Execute the full three-agent pipeline.
 
         Args:
-            input_path: Path to the input dataset. Any format supported by
-                        BaseAgent.load_dataframe: .csv, .tsv, .parquet, .orc,
-                        .feather, .xlsx, .xls, .xlsm, .json, and remote paths
-                        (s3://, gs://, az://).
-            oot_path: Optional path to a pre-split OOT dataset. Supports the same
-                      formats as input_path. When provided, Agent 3 skips temporal
-                      extraction and only splits the pool 80/20.
-            domain: Feature engineering domain context. Options: credit_risk,
-                    propensity, fraud, generic (default).
-            model_type: ML problem type passed to Agent 2 prompt context.
+            input_path: Path to the input dataset (always interpreted as
+                        TRAIN when valid_path or oot_path is also provided).
+                        Any format supported by BaseAgent.load_dataframe.
+            valid_path: Optional path to a pre-split VALID dataset.
+            oot_path:   Optional path to a pre-split OOT dataset.
+
+            Pre-split mode is enabled whenever valid_path OR oot_path is set.
+            In that mode, the three (or two) files are concatenated with a
+            `_split_` marker column so Agents 1+2 apply identical cleaning +
+            feature engineering to every partition. Agent 3 then reconstructs
+            the splits from the marker:
+              - train+valid+oot supplied → use all three exactly as marked.
+              - train+valid only        → no OOT; use train/valid as marked.
+              - train+oot only          → train auto-splits 20% into valid;
+                                          OOT used as marked.
+              - train only              → 60/20/20 auto-split (no marker).
+
+            domain:     Feature engineering domain context. Options:
+                        credit_risk, propensity, fraud, generic (default).
+            model_type: ML problem type passed to Agent 2 prompt.
                         Options: binary_classification (default), regression, multiclass.
         """
+        pre_split = (valid_path is not None) or (oot_path is not None)
+        mode_label = "auto-split"
+        if pre_split:
+            parts_label = ["train"]
+            if valid_path: parts_label.append("valid")
+            if oot_path: parts_label.append("oot")
+            mode_label = f"pre-split ({'+'.join(parts_label)})"
         self.logger.log("PIPELINE", "Starting",
-            f"Input: {input_path} | Target: {target_column} | Domain: {domain} | Model: {model_type}")
+            f"Input: {input_path} | Target: {target_column} | Domain: {domain} | "
+            f"Model: {model_type} | Mode: {mode_label}")
+
+        # Pre-split mode: concat train + (valid) + (oot) with marker → use as input.
+        # This makes Agents 1+2 process the SAME schema for every partition, so
+        # column drops / engineered features from Agent 2 apply consistently.
+        if pre_split:
+            input_path = self._build_combined_input(input_path, valid_path, oot_path)
 
         self.logger.log("PIPELINE", "Stage 1", "Initializing Data Cleaner Agent")
         agent1 = DataCleanerAgent(
@@ -71,9 +145,10 @@ class AutoMLPipeline:
         )
         self.handoff.set_data(engineered_data_path, report2, "FeatureEngineer")
 
-        oot_df = BaseAgent.load_dataframe(oot_path) if oot_path else None
-        if oot_df is not None:
-            self.logger.log("PIPELINE", "Stage 3", f"OOT provided externally: {oot_path} ({len(oot_df)} rows)")
+        # OOT routing: when pre_split is on, OOT is already in the combined input
+        # via the marker (went through Agents 1+2), so we don't pass it separately
+        # to Agent 3 here. The auto-split branch (pre_split=False) means no OOT at all.
+        oot_df = None
 
         self.logger.log("PIPELINE", "Stage 3", "Initializing Train Model Agent")
         agent3 = TrainModelAgent(self.logger)

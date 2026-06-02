@@ -8,6 +8,11 @@ from logger import AgentLogger
 from config import Config
 
 
+# Marker column used in pre-split mode (set by AutoMLPipeline._build_combined_input).
+# Always protected from drop/encode/dtype-fix in every agent.
+_SPLIT_MARKER = "_split_"
+
+
 class DataCleanerAgent(BaseAgent):
 
     def __init__(
@@ -425,14 +430,17 @@ class DataCleanerAgent(BaseAgent):
     _DATE_NAME_KEYWORDS = ("date", "dt", "time", "timestamp", "snap", "period", "month", "year", "week", "day")
 
     def _tool_check_column_formats(self, df: pd.DataFrame) -> str:
-        # Columns excluded from format checks — PK, composite keys, and target.
-        # Target is excluded because _execute_llm_decisions blocks fixes on it anyway;
-        # reporting format issues for target would waste LLM tokens on unfixable items.
+        # Columns excluded from format checks — PK, composite keys, target, and the
+        # _split_ marker (when pre-split mode is active). Target is excluded because
+        # _execute_llm_decisions blocks fixes on it anyway; reporting format issues
+        # for target would waste LLM tokens on unfixable items.
         protected: set = set(self._composite_key_cols)
         if self._entity_id_col:
             protected.add(self._entity_id_col)
         if self._target_column:
             protected.add(self._target_column)
+        if _SPLIT_MARKER in df.columns:
+            protected.add(_SPLIT_MARKER)
 
         issues: Dict[str, list] = {}
         for col in df.columns:
@@ -954,12 +962,15 @@ class DataCleanerAgent(BaseAgent):
 
     @property
     def _pk_protected_cols(self) -> set:
-        """Set of columns that must never be dropped or coerced — entity ID, composite keys, and target."""
+        """Set of columns that must never be dropped or coerced — entity ID, composite keys, target,
+        and the `_split_` marker (when pre-split mode is active)."""
         protected = set(self._composite_key_cols)
         if self._entity_id_col:
             protected.add(self._entity_id_col)
         if self._target_column:
             protected.add(self._target_column)
+        if self.df is not None and _SPLIT_MARKER in self.df.columns:
+            protected.add(_SPLIT_MARKER)
         return protected
 
     def _fallback_cleaning(self):

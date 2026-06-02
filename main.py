@@ -36,8 +36,13 @@ Examples:
       --col-desc data/HomeCredit_columns_description.csv \\
       --col-name-field Row --col-desc-field Description --col-group-field Table
 
-  # With pre-split OOT dataset
+  # With pre-split OOT dataset (legacy — OOT bypasses Agents 1+2)
   python main.py data/train.parquet TARGET --oot data/oot.parquet
+
+  # Pre-split mode — train + valid + oot all preserved exactly
+  python main.py data/train.parquet TARGET \\
+      --valid data/valid.parquet --oot data/oot.parquet \\
+      --domain credit_risk --entity-id customer_id --keys customer_id,snap_dt
 
   # Full options
   python main.py data/train.csv TARGET \\
@@ -70,9 +75,18 @@ Examples:
              "Agent 3 extracts the date partner for OOT temporal split.",
     )
     parser.add_argument(
+        "--valid", metavar="PATH", dest="valid_path", default=None,
+        help="Pre-split VALID dataset. When provided, switches to PRE-SPLIT MODE: "
+             "input_path (train) + this file + --oot are concatenated with a "
+             "`_split_` marker so Agents 1+2 apply identical cleaning + feature "
+             "engineering to every partition; Agent 3 then reconstructs the exact "
+             "user-defined train/valid/oot via the marker.",
+    )
+    parser.add_argument(
         "--oot", metavar="PATH", dest="oot_path", default=None,
         help="Pre-split OOT dataset (.csv / .parquet / .feather / .xlsx). "
-             "When provided Agent 3 skips temporal extraction and splits the pool 80/20.",
+             "Without --valid: legacy behaviour — pool input_path 80/20 + raw OOT (bypasses Agents 1+2). "
+             "With --valid: OOT joins the concat + marker flow.",
     )
     parser.add_argument(
         "--col-desc", metavar="PATH", dest="col_descriptions_path", default=None,
@@ -190,6 +204,8 @@ def main() -> None:
         print(f"Entity ID    : {args.entity_id_col}")
     if composite_key_cols:
         print(f"Composite key: {composite_key_cols}")
+    if args.valid_path:
+        print(f"Valid path   : {args.valid_path}  (pre-split mode)")
     if args.oot_path:
         print(f"OOT path     : {args.oot_path}")
     if args.col_descriptions_path:
@@ -218,6 +234,7 @@ def main() -> None:
             col_descriptions_kwargs=col_desc_kwargs,
             entity_id_col=args.entity_id_col,
             composite_key_cols=composite_key_cols,
+            valid_path=args.valid_path,
             oot_path=args.oot_path,
             domain=args.domain,
             model_type=args.model_type,

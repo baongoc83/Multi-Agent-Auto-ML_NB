@@ -13,6 +13,12 @@ from logger import AgentLogger
 from config import Config
 
 
+# Marker column used in pre-split mode (set by AutoMLPipeline._build_combined_input).
+# When present in self.df, _tool_split_data uses it to reconstruct exact
+# user-defined splits instead of running the temporal / random auto-split.
+_SPLIT_MARKER = "_split_"
+
+
 class TrainModelAgent(BaseAgent):
     """
     Advanced model training agent: FLAML → Optuna → RFE → PSI → Stability → Final Model.
@@ -56,6 +62,8 @@ class TrainModelAgent(BaseAgent):
             exclude.add(self.date_col)
         if self.id_col:
             exclude.add(self.id_col)
+        # Pre-split marker is metadata, never a feature
+        exclude.add(_SPLIT_MARKER)
         return [c for c in df.columns if c not in exclude]
 
     def _fit_prepare_X(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -246,8 +254,51 @@ class TrainModelAgent(BaseAgent):
     ) -> Dict[str, pd.DataFrame]:
         target = self.target_column
         rs = Config.RANDOM_STATE
-        empty = pd.DataFrame(columns=df.columns)
         total = len(df)
+
+        # ── Pre-split mode: reconstruct train/valid/oot from `_split_` marker ──
+        # AutoMLPipeline._build_combined_input writes the marker whenever the
+        # caller supplies valid_path or oot_path. Agents 1+2 protected the
+        # column so it survived cleaning + feature engineering. Honour it
+        # exactly. Three sub-cases by which marker values are present:
+        #   {train, valid, oot} → use all three as marked.
+        #   {train, valid}      → no OOT; use train/valid as marked.
+        #   {train, oot}        → split train 80/20 into train+valid; oot as marked.
+        if _SPLIT_MARKER in df.columns:
+            marker = df[_SPLIT_MARKER].astype(str)
+            feat_df = df.drop(columns=[_SPLIT_MARKER])
+            empty = pd.DataFrame(columns=feat_df.columns)
+
+            train_marked = feat_df[marker == "train"].reset_index(drop=True)
+            valid_marked = feat_df[marker == "valid"].reset_index(drop=True)
+            oot_marked   = feat_df[marker == "oot"].reset_index(drop=True)
+
+            has_explicit_valid = len(valid_marked) > 0
+            if has_explicit_valid:
+                train_df = train_marked
+                valid_df = valid_marked
+                self.logger.log(self.name, "Split (pre-split marker)",
+                    f"train={len(train_df)} | valid={len(valid_df)} | "
+                    f"oot={len(oot_marked)} (all from marker)")
+            else:
+                # valid missing — auto-split 80/20 from the train portion
+                train_df, valid_df = self._stratified_split(train_marked, target, 0.20, rs)
+                train_df = train_df.reset_index(drop=True)
+                valid_df = valid_df.reset_index(drop=True)
+                self.logger.log(self.name, "Split (pre-split marker, auto-valid)",
+                    f"train={len(train_df)} | valid={len(valid_df)} (auto 20% of train) | "
+                    f"oot={len(oot_marked)} (from marker)")
+
+            return {
+                "train":          train_df,
+                "valid_temporal": empty.copy(),
+                "valid_random":   empty.copy(),
+                "valid":          valid_df,
+                "oot":            oot_marked,
+                "test":           empty.copy(),
+            }
+
+        empty = pd.DataFrame(columns=df.columns)
 
         # ── Fast path: OOT already supplied — split pool 80/20 only ─────────
         if provided_oot is not None:

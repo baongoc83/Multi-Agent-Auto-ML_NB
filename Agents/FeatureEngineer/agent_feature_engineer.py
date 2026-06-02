@@ -11,6 +11,11 @@ from logger import AgentLogger
 from config import Config
 
 
+# Marker column used in pre-split mode (set by AutoMLPipeline._build_combined_input).
+# Always protected from encode/interaction/selection in this agent.
+_SPLIT_MARKER = "_split_"
+
+
 class FeatureEngineerAgent(BaseAgent):
 
     _DOMAIN_GUIDANCE: Dict[str, str] = {
@@ -407,6 +412,10 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         self._protected_cols = set(_composite)
         if _entity_id:
             self._protected_cols.add(_entity_id)
+        # Pre-split mode: protect the _split_ marker column so Agent 3 can
+        # reconstruct user-defined train/valid/oot from it.
+        if _SPLIT_MARKER in self.df.columns:
+            self._protected_cols.add(_SPLIT_MARKER)
         self._protected_cols.discard(self.target_column)
 
         # Infer date column from composite key (the non-entity partner, if any).
