@@ -237,11 +237,27 @@ class DataCleanerAgent(BaseAgent):
         return df
 
     def _tool_clip_outliers(self, df: pd.DataFrame, col: str, factor: float = 3.0) -> pd.DataFrame:
+        """Clip values to ±factor × IQR.
+
+        FIT-on-train, TRANSFORM-on-all:
+          - When `_split_` marker exists, Q1/Q3 are computed on TRAIN rows
+            only so valid/oot do not leak into the clipping bounds. The
+            bounds are then applied to the FULL frame.
+          - Otherwise (no marker), Q1/Q3 are computed on the whole frame.
+        """
         if col not in df.columns:
             raise ValueError(f"Column '{col}' not found")
         if not pd.api.types.is_numeric_dtype(df[col]):
             raise ValueError(f"Column '{col}' is not numeric")
-        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+
+        if _SPLIT_MARKER in df.columns:
+            train_vals = df.loc[df[_SPLIT_MARKER] == "train", col]
+            if len(train_vals.dropna()) < 2:
+                train_vals = df[col]   # too few train rows — fall back to full
+        else:
+            train_vals = df[col]
+
+        q1, q3 = train_vals.quantile(0.25), train_vals.quantile(0.75)
         iqr = q3 - q1
         df[col] = df[col].clip(lower=q1 - factor * iqr, upper=q3 + factor * iqr)
         return df
@@ -547,24 +563,51 @@ class DataCleanerAgent(BaseAgent):
             )
         return df
 
+    def _train_view(self) -> pd.DataFrame:
+        """Return rows where marker == 'train' (pre-split mode) OR full df.
+
+        All decisions / statistics are computed on this view to avoid data
+        leakage from valid + oot. Actions are still applied to self.df
+        (full combined frame), so the transformation derived from train
+        propagates to valid + oot during writing.
+        """
+        if _SPLIT_MARKER in self.df.columns:
+            view = self.df[self.df[_SPLIT_MARKER] == "train"]
+            if len(view) > 0:
+                return view
+        return self.df
+
     def process(self, input_path: str) -> Tuple[str, Dict[str, Any]]:
         """Returns (path_to_clean_data, report_dict).
 
         Accepts any format supported by BaseAgent.load_dataframe:
         .csv, .tsv, .parquet, .orc, .feather, .xlsx, .xls, .xlsm, .json
         and remote paths (s3://, gs://, az://).
+
+        Pre-split mode (combined input has `_split_` marker):
+            - All stats and LLM decisions derive from TRAIN portion only
+              (no leakage from valid/oot).
+            - Actions (drop_column / fix_dtype / clip_outliers / dedup) are
+              applied to the FULL combined frame so train + valid + oot
+              receive identical cleaning.
         """
         self.logger.log(self.name, "Process Start", f"Loading data from {input_path}")
 
         self.df = self.load_dataframe(input_path)
         original_shape = self.df.shape
 
-        metadata = self.execute_tool("inspect_metadata", df=self.df)
-        label_stats = self._collect_label_stats()    # resolves self._target_column first
-        pk_stats = self._collect_pk_stats()          # uses self._target_column; sets self._entity_id_col / _composite_key_cols
-        format_stats = self.execute_tool("check_column_formats", df=self.df)
-        outlier_stats = self._collect_outlier_stats()
-        temporal_stats = self._collect_temporal_stats()
+        # Train-only view drives every analysis below; self.df is full combined
+        train_df = self._train_view()
+        if train_df is not self.df:
+            self.logger.log(self.name, "Train view",
+                f"Pre-split detected — analysing TRAIN only ({len(train_df)} of {len(self.df)} rows)")
+
+        metadata = self.execute_tool("inspect_metadata", df=train_df)
+        label_stats = self._collect_label_stats(train_df)
+        pk_stats = self._collect_pk_stats(train_df)
+        format_stats = self.execute_tool("check_column_formats", df=train_df)
+        outlier_stats = self._collect_outlier_stats(train_df)
+        temporal_stats = self._collect_temporal_stats(train_df)
 
         llm_response = self.call_llm(
             self._build_analysis_prompt(metadata, format_stats, outlier_stats, label_stats, temporal_stats, pk_stats),
@@ -591,14 +634,23 @@ class DataCleanerAgent(BaseAgent):
         }
         self.save_report(report, Config.DATA_CLEANER_REPORT_PATH)
 
-        self.logger.log(self.name, "Process Complete", f"Shape: {original_shape} -> {self.df.shape}")
+        # If pre-split mode, report train-only sizes too for transparency
+        if _SPLIT_MARKER in self.df.columns:
+            split_sizes = self.df[_SPLIT_MARKER].value_counts().to_dict()
+            self.logger.log(self.name, "Process Complete",
+                f"Shape: {original_shape} -> {self.df.shape} | splits: {split_sizes}")
+        else:
+            self.logger.log(self.name, "Process Complete", f"Shape: {original_shape} -> {self.df.shape}")
         return Config.CLEAN_DATA_PATH, report
 
-    def _collect_outlier_stats(self) -> str:
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+    def _collect_outlier_stats(self, df: Optional[pd.DataFrame] = None) -> str:
+        """Compute outlier stats on the given df (train view by default)."""
+        if df is None:
+            df = self.df
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         results = {}
         for col in numeric_cols[:Config.OUTLIER_NUMERIC_COLS_LIMIT]:
-            results[col] = json.loads(self.execute_tool("detect_outliers", df=self.df, col=col))
+            results[col] = json.loads(self.execute_tool("detect_outliers", df=df, col=col))
         return json.dumps(results, indent=2)
 
     _LABEL_NAMES = frozenset({
@@ -606,17 +658,24 @@ class DataCleanerAgent(BaseAgent):
         "default_flag", "fraud", "is_fraud", "bad_flag", "churn", "default",
     })
 
-    def _collect_label_stats(self) -> Optional[str]:
+    def _collect_label_stats(self, df: Optional[pd.DataFrame] = None) -> Optional[str]:
+        """Compute label quality stats on the given df (train view by default).
+
+        Target column resolution still looks at self.df.columns (column names
+        are identical between train view and full df), but the stats are
+        computed only on the train slice.
+        """
+        if df is None:
+            df = self.df
         if self._target_column:
             if self._target_column not in self.df.columns:
                 self.logger.log(self.name, "WARN",
                     f"Specified target_column '{self._target_column}' not found in columns — falling back to auto-detect")
-                self._target_column = None   # reset so auto-detect runs below
+                self._target_column = None
             else:
                 self.logger.log(self.name, "Label", f"Using supplied target_column='{self._target_column}'")
-                return self.execute_tool("check_label_quality", df=self.df, label_col=self._target_column)
+                return self.execute_tool("check_label_quality", df=df, label_col=self._target_column)
 
-        # Auto-detect
         candidates = [c for c in self.df.columns if c.lower() in self._LABEL_NAMES]
         if not candidates:
             self.logger.log(self.name, "WARN",
@@ -625,16 +684,18 @@ class DataCleanerAgent(BaseAgent):
             candidates = [self.df.columns[-1]]
         self._target_column = candidates[0]
         self.logger.log(self.name, "Label", f"Auto-detected target_column='{self._target_column}'")
-        return self.execute_tool("check_label_quality", df=self.df, label_col=self._target_column)
+        return self.execute_tool("check_label_quality", df=df, label_col=self._target_column)
 
-    def _collect_temporal_stats(self) -> Optional[str]:
-        date_cols = [c for c in self.df.columns
+    def _collect_temporal_stats(self, df: Optional[pd.DataFrame] = None) -> Optional[str]:
+        if df is None:
+            df = self.df
+        date_cols = [c for c in df.columns
                      if any(kw in c.lower() for kw in ("date", "time", "timestamp", "dt"))]
         if not date_cols:
             return None
         combined: Dict[str, Any] = {}
         for dc in date_cols:
-            combined[dc] = json.loads(self.execute_tool("check_temporal", df=self.df, date_col=dc))
+            combined[dc] = json.loads(self.execute_tool("check_temporal", df=df, date_col=dc))
         return json.dumps(combined, indent=2)
 
     @staticmethod
@@ -692,22 +753,25 @@ class DataCleanerAgent(BaseAgent):
         ),
     }
 
-    def _collect_pk_stats(self) -> Optional[str]:
+    def _collect_pk_stats(self, df: Optional[pd.DataFrame] = None) -> Optional[str]:
+        """PK / composite key / entity resolution stats. Detection uses the
+        full df schema (column names), but uniqueness checks run on the
+        provided df (train view in pre-split mode) so leakage is avoided.
+        """
+        if df is None:
+            df = self.df
         # ── Step 1: resolve entity_id_col ────────────────────────────────────
         if self._entity_id_col is not None:
-            # Caller supplied it explicitly — validate it exists in the data
             entity_id_col = self._entity_id_col
-            if entity_id_col not in self.df.columns:
+            if entity_id_col not in df.columns:
                 self.logger.log(self.name, "WARN",
                     f"Specified entity_id_col '{entity_id_col}' not found in columns — skipping PK check")
                 return None
             self.logger.log(self.name, "PK", f"Using supplied entity_id_col='{entity_id_col}'")
         else:
-            # Auto-detect: Priority 1 — exact known names (case-insensitive)
             entity_id_col = next(
-                (c for c in self.df.columns if c.lower() in self._ENTITY_ID_EXACT),
-                # Priority 2 — generic heuristic: ends _id or "id" is a middle word
-                next((c for c in self.df.columns if self._is_entity_id_col(c)), None),
+                (c for c in df.columns if c.lower() in self._ENTITY_ID_EXACT),
+                next((c for c in df.columns if self._is_entity_id_col(c)), None),
             )
             if entity_id_col is None:
                 return None
@@ -715,48 +779,35 @@ class DataCleanerAgent(BaseAgent):
 
         # ── Step 2: resolve composite_key_cols ───────────────────────────────
         if self._composite_key_cols:
-            # Caller supplied composite key — validate all cols exist
-            missing = [c for c in self._composite_key_cols if c not in self.df.columns]
+            missing = [c for c in self._composite_key_cols if c not in df.columns]
             if missing:
                 self.logger.log(self.name, "WARN",
                     f"Supplied composite_key_cols contain unknown columns {missing} — they will be ignored")
-            composite_key_cols = [c for c in self._composite_key_cols if c in self.df.columns]
+            composite_key_cols = [c for c in self._composite_key_cols if c in df.columns]
             if not composite_key_cols:
                 composite_key_cols = [entity_id_col]
             self.logger.log(self.name, "PK", f"Using supplied composite_key_cols={composite_key_cols}")
         else:
-            # Auto-detect composite key partner.
-            #
-            # A candidate column qualifies when:
-            #   1. No null values  (null → can't form a reliable key)
-            #   2. (entity_id_col, candidate) uniquely identifies every row
-            #      i.e. groupby ngroups == len(df)
-            #
-            # Search order:
-            #   Priority 1 — date/time/period columns (matched by keyword in name)
-            #   Priority 2 — any other column, but ONLY when entity_id is NOT
-            #                already unique per row (avoids attaching arbitrary
-            #                feature columns in one-row-per-entity tables).
-            n_rows = len(self.df)
-            n_entity_unique = self.df[entity_id_col].nunique()
+            n_rows = len(df)
+            n_entity_unique = df[entity_id_col].nunique()
             composite_key_cols = [entity_id_col]
 
             _DATE_KWS = ("date", "time", "timestamp", "dt", "month", "period", "year")
-            _excl = {entity_id_col, self._target_column}   # never use target as key partner
+            _excl = {entity_id_col, self._target_column}
             date_candidates = [
-                c for c in self.df.columns
+                c for c in df.columns
                 if c not in _excl
                 and any(kw in c.lower() for kw in _DATE_KWS)
             ]
             other_candidates = (
-                [c for c in self.df.columns if c not in _excl and c not in date_candidates]
+                [c for c in df.columns if c not in _excl and c not in date_candidates]
                 if n_entity_unique < n_rows else []
             )
 
             for dc in date_candidates + other_candidates:
-                if self.df[dc].isna().any():
+                if df[dc].isna().any():
                     continue
-                n_groups = self.df.groupby([entity_id_col, dc], sort=False).ngroups
+                n_groups = df.groupby([entity_id_col, dc], sort=False).ngroups
                 if n_groups == n_rows:
                     composite_key_cols = [entity_id_col, dc]
                     break
@@ -765,21 +816,17 @@ class DataCleanerAgent(BaseAgent):
         self._entity_id_col = entity_id_col
         self._composite_key_cols = composite_key_cols
 
-        # Use pre-resolved target_column (set by _collect_label_stats which runs before this)
         label_col = self._target_column
-
-        # Auto-detect secondary identity cols for entity resolution.
-        # Exclude entity_id_col itself — no point checking a column against itself.
         identity_cols = {
             label: col
             for label, kws in self._IDENTITY_MAP.items()
-            for col in self.df.columns
+            for col in df.columns
             if col.lower() in kws and col != entity_id_col
         }
 
         return self.execute_tool(
             "check_pk_uniqueness",
-            df=self.df,
+            df=df,
             entity_id_col=entity_id_col,
             composite_key_cols=composite_key_cols,
             label_col=label_col,

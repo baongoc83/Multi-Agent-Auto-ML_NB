@@ -190,6 +190,16 @@ class Config:
     # Relative floor: keep at least this fraction of MAX_FINAL_FEATURES
     SHAP_PSI_MIN_FEATURES_RATIO: float = float(os.getenv("SHAP_PSI_MIN_FEATURES_RATIO", 0.10))
 
+    # ── Pre-split memory savers (column pre-filter + stratified sampling) ─────
+    # Applied in AutoMLPipeline._build_combined_input BEFORE Agent 1, to shrink
+    # very wide datasets that would otherwise OOM during concat / cleaning.
+    # Pre-filter drops columns with null ratio above this threshold.
+    PREFILTER_MAX_NULL_RATIO: float = float(os.getenv("PREFILTER_MAX_NULL_RATIO", 0.95))
+    # Pre-filter drops columns where one value dominates above this fraction
+    # of non-null rows (catches near-constant cols). Cols with nunique > 1000
+    # skip this check (high-cardinality => not near-constant).
+    PREFILTER_MAX_DOMINANT_RATIO: float = float(os.getenv("PREFILTER_MAX_DOMINANT_RATIO", 0.99))
+
     # ── Overfitting Detection ─────────────────────────────────────────────────
     # Relative gap (valid_auc - holdout_auc) / valid_auc above which overfitting
     # is flagged and an LLM-guided retrain is triggered

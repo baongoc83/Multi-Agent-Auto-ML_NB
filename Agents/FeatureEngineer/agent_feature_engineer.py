@@ -80,6 +80,22 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         self.tool_registry = ToolRegistry()
         self._register_tools()
 
+    def _train_view(self, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        """Return rows where marker == 'train' (pre-split mode) OR full df.
+
+        Decisions/statistics are computed on this view to prevent valid+oot
+        from leaking into encoder fit, correlation, or top-k selection.
+        Transformations are applied to the FULL frame so all partitions
+        receive the same pipeline.
+        """
+        if df is None:
+            df = self.df
+        if df is not None and _SPLIT_MARKER in df.columns:
+            view = df[df[_SPLIT_MARKER] == "train"]
+            if len(view) > 0:
+                return view
+        return df
+
     def _get_domain_guidance(self) -> str:
         if self.domain not in self._DOMAIN_GUIDANCE:
             self.logger.log(self.name, "WARN",
@@ -277,16 +293,51 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             raise ValueError(f"Error creating interaction '{new_col}': {e}")
 
     def _tool_encode_categorical(self, df: pd.DataFrame, col: str, method: str) -> pd.DataFrame:
+        """FIT-on-train, TRANSFORM-on-all encoding.
+
+        - When `_split_` marker exists: the encoder is fit using TRAIN rows
+          only; the transformation is then applied to the FULL frame.
+          For label encoding, unseen categories in valid/oot map to a
+          sentinel "__NA__" class so transform never raises on novel
+          values.
+        - Without the marker: behaves as fit_transform on the whole frame
+          (legacy mode).
+        """
         if col not in df.columns:
             raise ValueError(f"Column '{col}' not found")
 
+        has_marker = _SPLIT_MARKER in df.columns
+
         if method == "label":
             le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].astype(str))
+            if has_marker:
+                train_mask = df[_SPLIT_MARKER] == "train"
+                train_vals = df.loc[train_mask, col].astype(str)
+                # Add sentinel so unseen valid/oot categories don't crash transform
+                le.fit(sorted(set(train_vals.tolist()) | {"__NA__"}))
+                known = set(le.classes_)
+                full_vals = df[col].astype(str).apply(
+                    lambda x: x if x in known else "__NA__"
+                )
+                df[col] = le.transform(full_vals)
+            else:
+                df[col] = le.fit_transform(df[col].astype(str))
+
         elif method == "onehot":
-            dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
-            df = pd.concat([df, dummies], axis=1)
-            df = df.drop(columns=[col])
+            if has_marker:
+                train_mask = df[_SPLIT_MARKER] == "train"
+                # Determine columns from TRAIN, then reindex full frame to match
+                train_dummies = pd.get_dummies(df.loc[train_mask, col],
+                                                prefix=col, drop_first=True)
+                full_dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
+                # Drop unseen-in-train columns; add train-only columns missing in full
+                full_dummies = full_dummies.reindex(columns=train_dummies.columns,
+                                                    fill_value=0)
+                df = pd.concat([df.drop(columns=[col]), full_dummies], axis=1)
+            else:
+                dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
+                df = pd.concat([df, dummies], axis=1)
+                df = df.drop(columns=[col])
         else:
             raise ValueError(f"Unknown encoding method: {method}")
 
@@ -295,14 +346,18 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
     def _tool_encode_all_categorical(self, df: pd.DataFrame, method: str = "label") -> pd.DataFrame:
         skip = self._protected_cols | {self.target_column}
         cat_cols = [c for c in df.select_dtypes(exclude=[np.number]).columns if c not in skip]
+        # Cardinality check (for onehot fallback) computed on TRAIN view when in
+        # pre-split mode, otherwise on the full frame.
+        train_view = self._train_view(df)
         encoded = 0
         for col in cat_cols:
-            # Guard: onehot on high-cardinality columns would explode column count → force label
             effective_method = method
-            if method == "onehot" and df[col].nunique() > 5:
-                effective_method = "label"
-                self.logger.log(self.name, "encode_all_categorical",
-                    f"'{col}' nunique={df[col].nunique()} > 5 — falling back to label encoding")
+            if method == "onehot":
+                col_nu = train_view[col].nunique() if col in train_view.columns else df[col].nunique()
+                if col_nu > 5:
+                    effective_method = "label"
+                    self.logger.log(self.name, "encode_all_categorical",
+                        f"'{col}' nunique={col_nu} > 5 (train view) — falling back to label encoding")
             df = self._tool_encode_categorical(df, col, effective_method)
             encoded += 1
         self.logger.log(self.name, "encode_all_categorical",
@@ -310,31 +365,38 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         return df
 
     def _tool_correlation_analysis(self, df: pd.DataFrame, target: str) -> str:
+        """Correlation of each feature with the target.
+
+        Computed on TRAIN portion when `_split_` marker is present (so the
+        score the LLM sees is leakage-free). Falls back to full frame
+        otherwise.
+        """
         if target not in df.columns:
             raise ValueError(f"Target column '{target}' not found")
 
-        # Cast target to numeric — object-dtype targets (e.g. "0"/"1" strings) cause
-        # Series.corr() to raise TypeError.
-        y = pd.to_numeric(df[target], errors="coerce")
+        # Train-only view for correlation (avoid valid/oot leakage in the score)
+        train_view = self._train_view(df)
+
+        y = pd.to_numeric(train_view[target], errors="coerce")
         if y.isna().all():
             raise ValueError(
                 f"Target '{target}' cannot be converted to numeric — correlation analysis skipped"
             )
 
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = train_view.select_dtypes(include=[np.number]).columns.tolist()
         if target in numeric_cols:
             numeric_cols.remove(target)
+        if _SPLIT_MARKER in numeric_cols:
+            numeric_cols.remove(_SPLIT_MARKER)
 
         correlations = {}
-        unreliable = []  # columns where null_pct > 30% — correlation may be biased
+        unreliable = []
         for col in numeric_cols:
-            null_pct = df[col].isnull().mean() * 100
-            # Skip zero-variance columns — corr() divides by std=0 → RuntimeWarning + NaN
-            if df[col].std() == 0:
+            null_pct = train_view[col].isnull().mean() * 100
+            if train_view[col].std() == 0:
                 correlations[col] = 0.0
                 continue
-            # pandas corr() drops NaN pairwise — works but biased for high-null cols
-            corr = df[col].corr(y)
+            corr = train_view[col].corr(y)
             correlations[col] = round(corr, 4) if not pd.isna(corr) else 0.0
             if null_pct > 30:
                 unreliable.append(f"{col} ({null_pct:.1f}% null)")
@@ -350,29 +412,51 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         return json.dumps(result, indent=2)
 
     def _tool_select_top_features(self, df: pd.DataFrame, target: str, k: int) -> pd.DataFrame:
+        """Score features on TRAIN rows (leakage-free) and apply the same
+        column selection to the FULL frame.
+
+        - Scoring (f_classif / f_regression) runs only on rows where
+          `_split_` marker == "train". When the marker is absent, scoring
+          falls back to the whole frame.
+        - The selected column set is then sliced from the full frame so
+          valid + oot are preserved with exactly the columns chosen on
+          train (zero leakage in the selection step).
+        """
         if target not in df.columns:
             raise ValueError(f"Target column '{target}' not found")
 
         feature_cols = [c for c in df.columns if c != target]
+        # Marker is metadata, never a feature
+        if _SPLIT_MARKER in feature_cols:
+            feature_cols.remove(_SPLIT_MARKER)
         non_numeric_cols = df[feature_cols].select_dtypes(exclude=[np.number]).columns.tolist()
         numeric_features = df[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
 
         if not numeric_features:
             return df
 
-        y = pd.to_numeric(df[target], errors="coerce")
+        # ── Score on TRAIN rows only ─────────────────────────────────────
+        if _SPLIT_MARKER in df.columns:
+            score_mask = df[_SPLIT_MARKER] == "train"
+        else:
+            score_mask = pd.Series(True, index=df.index)
+
+        y = pd.to_numeric(df.loc[score_mask, target], errors="coerce")
         valid_mask = y.notna()
         y_valid = y[valid_mask].values
+        if len(y_valid) < 2 or pd.Series(y_valid).nunique() < 2:
+            # Not enough training signal — return df unchanged
+            return df
 
-        is_classification = y[valid_mask].nunique() < Config.CLASSIFICATION_UNIQUE_THRESHOLD
+        is_classification = pd.Series(y_valid).nunique() < Config.CLASSIFICATION_UNIQUE_THRESHOLD
         score_func = f_classif if is_classification else f_regression
 
-        # Score columns one-at-a-time to avoid allocating the full feature matrix in memory.
-        # SelectKBest on the full matrix requires O(n_rows × n_cols) float64 — can exceed RAM
-        # on large datasets. Column-by-column scoring uses O(n_rows) memory per iteration.
+        # Re-index valid_mask to match df.index for slicing
+        score_idx = df.index[score_mask][valid_mask.values]
+
         scores: Dict[str, float] = {}
         for col in numeric_features:
-            x = df.loc[valid_mask, col]
+            x = df.loc[score_idx, col]
             med = x.median()
             if pd.isna(med):
                 scores[col] = 0.0
@@ -390,7 +474,10 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         eligible = [c for c, s in scores.items() if s > 0]
         k = min(k, len(eligible) if eligible else len(scores))
         selected_numeric = sorted(scores, key=scores.__getitem__, reverse=True)[:k]
+        # Preserve marker so Agent 3 can still reconstruct splits
         final_cols = selected_numeric + non_numeric_cols + [target]
+        if _SPLIT_MARKER in df.columns:
+            final_cols.append(_SPLIT_MARKER)
         return df[final_cols]
 
     def process(
@@ -462,12 +549,21 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         }
         self.save_report(report, Config.FEATURE_ENGINEER_REPORT_PATH)
 
-        self.logger.log(self.name, "Process Complete", f"Shape: {original_shape} -> {self.df.shape}")
+        if _SPLIT_MARKER in self.df.columns:
+            split_sizes = self.df[_SPLIT_MARKER].value_counts().to_dict()
+            self.logger.log(self.name, "Process Complete",
+                f"Shape: {original_shape} -> {self.df.shape} | splits: {split_sizes}")
+        else:
+            self.logger.log(self.name, "Process Complete", f"Shape: {original_shape} -> {self.df.shape}")
         return Config.ENGINEERED_DATA_PATH, report
 
     def _analyze_features(self) -> Dict[str, Any]:
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
-        categorical_cols = self.df.select_dtypes(exclude=[np.number]).columns.tolist()
+        # Stats for the LLM prompt are derived from TRAIN rows only in pre-split
+        # mode — valid/oot are intentionally excluded to avoid leakage in the
+        # feature-engineering decisions (which interactions to create, etc.).
+        train_view = self._train_view()
+        numeric_cols = train_view.select_dtypes(include=[np.number]).columns.tolist()
+        categorical_cols = train_view.select_dtypes(exclude=[np.number]).columns.tolist()
 
         exclude = self._protected_cols | {self.target_column}
         numeric_cols = [c for c in numeric_cols if c not in exclude]
@@ -479,7 +575,7 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             Config.FEATURE_META_MAX_NUMERIC_COLS,
         )
         for col in numeric_cols[:numeric_limit]:
-            s = self.df[col]
+            s = train_view[col]
             non_null = s.dropna()
             entry: Dict[str, Any] = {
                 "null_pct": round(float(s.isnull().mean() * 100), 2),
@@ -496,7 +592,7 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
 
         categorical_meta: Dict[str, Any] = {}
         for col in categorical_cols[:Config.FEATURE_META_MAX_CATEGORICAL_COLS]:
-            s = self.df[col]
+            s = train_view[col]
             top_vals = s.value_counts().head(5).to_dict()
             entry = {
                 "null_pct": round(float(s.isnull().mean() * 100), 2),

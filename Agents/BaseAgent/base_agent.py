@@ -28,6 +28,11 @@ class BaseAgent:
         ".zip": "zip",
     }
 
+    # S3 URI schemes recognised by load_dataframe. s3a:// and s3n:// are
+    # Hadoop/Spark conventions; functionally identical to s3:// for object
+    # storage access — pyarrow only needs the bucket/key portion.
+    _S3_SCHEMES: tuple = ("s3://", "s3a://", "s3n://")
+
     def __init__(self, name: str, role: str, logger: AgentLogger):
         self.name = name
         self.role = role
@@ -405,16 +410,17 @@ class BaseAgent:
         Compression suffixes: .gz, .bz2 (alias .b2), .xz, .zst, .zip
                               (e.g. train.csv.gz, data.json.zst) — auto-decoded.
                               zstd requires `pip install zstandard`.
-        S3 / S3-compatible  : s3://bucket/key — uses pyarrow with credentials
-                              from Config (S3_ACCESS_KEY / S3_SECRET_KEY /
-                              S3_ENDPOINT_URL). Supports partitioned datasets
-                              (point at a folder for parquet/feather/orc).
+        S3 / S3-compatible  : s3://bucket/key, s3a://..., s3n://... — uses
+                              pyarrow with credentials from Config
+                              (S3_ACCESS_KEY / S3_SECRET_KEY / S3_ENDPOINT_URL).
+                              Supports partitioned datasets (point at a folder
+                              for parquet/feather/orc).
         Other remote        : gs://..., az://...  (pandas + gcsfs/adlfs)
         CSV encoding        : auto-tries utf-8 → utf-8-sig → cp1252 → latin-1
         """
         suffix, compression = cls._split_compression(path)
 
-        if path.startswith("s3://"):
+        if path.startswith(cls._S3_SCHEMES):
             return cls._load_from_s3(path, suffix, compression)
 
         # Uncompressed columnar / binary formats
@@ -475,15 +481,25 @@ class BaseAgent:
     @classmethod
     def _load_from_s3(cls, path: str, suffix: str,
                        compression: Optional[str] = None) -> pd.DataFrame:
-        """Load DataFrame from s3:// path via pyarrow.
+        """Load DataFrame from s3:// / s3a:// / s3n:// path via pyarrow.
 
         Columnar formats (parquet/feather/orc) use pyarrow.dataset → supports
-        partitioned folders. Row-oriented formats (json/excel/csv) stream the
+        partitioned folders (path may have no file extension, e.g. a folder
+        ending with `/`). Row-oriented formats (json/excel/csv) stream the
         single object through pandas, decompressing on the fly when needed.
         """
         import pyarrow.dataset as ds
         s3 = cls._get_s3_filesystem()
-        s3_path = path[len("s3://"):]   # pyarrow expects 'bucket/key'
+
+        # Strip whichever scheme the caller used (s3://, s3a://, s3n://).
+        # pyarrow expects bare 'bucket/key' without the scheme prefix.
+        s3_path = path
+        for scheme in cls._S3_SCHEMES:
+            if path.startswith(scheme):
+                s3_path = path[len(scheme):]
+                break
+        # Drop trailing slash so pyarrow.dataset treats it as a folder consistently
+        s3_path = s3_path.rstrip("/")
 
         # Uncompressed columnar / partitioned-capable — single file OR folder both work
         if compression is None:

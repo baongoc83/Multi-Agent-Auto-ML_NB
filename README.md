@@ -170,11 +170,42 @@ python main.py data/txns.parquet is_fraud `
     --domain fraud --entity-id account_id --keys account_id,txn_ts
 ```
 
-### Với OOT đã tách sẵn
+### Với split đã tách sẵn — pre-split mode
+
+Bạn có thể truyền **train / valid / oot** riêng biệt. Khi `--valid` hoặc `--oot` được set, pipeline tự động:
+1. Concat các file vào 1 combined dataset với cột marker `_split_`
+2. Agents 1+2 xử lý đồng nhất (clean + feature engineering) trên combined
+3. Agent 3 đọc marker để dựng lại **exact** splits user đã chia
+
+Nhờ vậy OOT/valid cũng được encode + interaction giống train → schema khớp 100% khi predict.
 
 ```powershell
+# Full pre-split: cả train, valid, oot riêng biệt
+python main.py data/train.parquet TARGET `
+    --valid data/valid.parquet `
+    --oot   data/oot.parquet `
+    --domain credit_risk `
+    --entity-id customer_id --keys customer_id,snap_dt
+
+# Chỉ có train + valid (không có oot)
+python main.py data/train.parquet TARGET --valid data/valid.parquet
+
+# Chỉ có train + oot (không có valid)
+# → Pipeline tự auto-split 20% của train thành valid
 python main.py data/train.parquet TARGET --oot data/oot.parquet
 ```
+
+### Behavior matrix — 8 scenarios
+
+| Input | Có date_col trong keys | Splits Agent 3 tạo |
+|---|---|---|
+| `train + valid + oot` | * | train + valid + oot (exact theo marker) |
+| `train + valid` | * | train + valid (exact), no oot |
+| `train + oot` | * | train (80%) + valid (20% auto) + oot (exact) |
+| `train` only | Yes | train + valid_temporal + valid_random + oot (OOT temporal) |
+| `train` only | No  | train (60%) + valid (20%) + test (20%) |
+
+> Khi pre-split mode kích hoạt, date_col chỉ ảnh hưởng đến PSI drift + Stability check (cần date để tính monthly Gini), không ảnh hưởng đến split.
 
 ### Tham số CLI quan trọng
 
@@ -183,9 +214,30 @@ python main.py data/train.parquet TARGET --oot data/oot.parquet
 | `--domain` | `credit_risk \| propensity \| fraud \| generic` — định hướng feature engineering |
 | `--model-type` | `binary_classification \| regression \| multiclass` |
 | `--entity-id COL` | Cột entity ID (e.g. `customer_id`, `SK_ID_CURR`) — bảo vệ khỏi xoá / encode |
-| `--keys C1,C2` | Composite key cho dedup check + OOT temporal extraction |
-| `--oot PATH` | OOT đã split sẵn — bỏ qua bước extract temporal |
+| `--keys C1,C2` | Composite key cho dedup check + OOT temporal extraction (chỉ dùng khi auto-split) |
+| `--valid PATH` | Valid đã tách sẵn — kích hoạt pre-split mode, valid đi qua Agents 1+2 |
+| `--oot PATH` | OOT đã tách sẵn — kích hoạt pre-split mode, OOT đi qua Agents 1+2 |
+| `--sample-ratio R` | (Pre-split mode) Stratified sample TRAIN với tỉ lệ R, valid/oot giữ nguyên. VD `--sample-ratio 0.3` |
+| `--no-prefilter` | (Pre-split mode) Tắt auto-drop cột rác (null>95% / constant / dominant>99%). Mặc định: bật |
 | `--col-desc PATH` | File CSV/JSON mô tả cột — guide LLM tạo interaction có ý nghĩa |
+
+### Memory savers cho dataset lớn (1M+ rows × 1000+ features)
+
+Khi build combined input (pre-split mode), pipeline tự động:
+1. **Pre-filter cột** (default on): scan train, drop cột null>95% / constant / dominant>99% trước khi concat
+2. **Stream-write parquet** thay CSV: peak RAM ≈ 1 file lớn nhất, không phải tổng 3 file
+
+Nếu vẫn OOM (Agent 1+2 cần toàn bộ data trong RAM), thêm `--sample-ratio`:
+
+```powershell
+# Dataset 1M train x 3500 features → sample 30% train, valid/oot giữ nguyên
+python main.py data/train.parquet TARGET `
+    --valid data/valid.parquet --oot data/oot.parquet `
+    --sample-ratio 0.3 `
+    --domain credit_risk --entity-id customer_id --keys customer_id,snap_dt
+```
+
+Sampling chỉ áp dụng **train**, stratified theo target → giữ class balance. Valid/oot không bao giờ bị sample (để đánh giá đúng performance trên dữ liệu thật).
 
 ---
 

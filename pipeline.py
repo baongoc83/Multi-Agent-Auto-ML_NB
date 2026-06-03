@@ -23,46 +23,208 @@ class AutoMLPipeline:
         self.handoff = Handoff(self.logger)
         Path(Config.OUTPUT_DIR).mkdir(exist_ok=True)
 
+    def _scan_useful_columns(
+        self,
+        df: "pd.DataFrame",
+        target_column: str = None,
+        entity_id_col: str = None,
+        composite_key_cols: list = None,
+    ) -> list:
+        """Identify columns worth keeping before combining files. Drops:
+          - All-null cols
+          - High-null cols   (null ratio > PREFILTER_MAX_NULL_RATIO)
+          - Constant cols    (nunique <= 1)
+          - Near-constant    (dominant value ratio > PREFILTER_MAX_DOMINANT_RATIO,
+                              only checked when nunique <= 1000)
+
+        Always keeps: target_column, entity_id_col, composite_key_cols,
+                      SPLIT_MARKER (if present).
+        """
+        null_threshold = Config.PREFILTER_MAX_NULL_RATIO
+        dominant_threshold = Config.PREFILTER_MAX_DOMINANT_RATIO
+
+        keep_mandatory = {SPLIT_MARKER}
+        if target_column:
+            keep_mandatory.add(target_column)
+        if entity_id_col:
+            keep_mandatory.add(entity_id_col)
+        if composite_key_cols:
+            keep_mandatory.update(composite_key_cols)
+
+        cols_keep: list = []
+        n_dropped = {"null": 0, "constant": 0, "dominant": 0}
+        n_total = len(df) if len(df) > 0 else 1
+
+        for col in df.columns:
+            if col in keep_mandatory:
+                cols_keep.append(col)
+                continue
+
+            series = df[col]
+            null_ratio = series.isnull().sum() / n_total
+            if null_ratio > null_threshold:
+                n_dropped["null"] += 1
+                continue
+
+            non_null = series.dropna()
+            nunique = non_null.nunique()
+            if nunique <= 1:
+                n_dropped["constant"] += 1
+                continue
+
+            # Near-constant check (skip high-cardinality cols)
+            if nunique <= 1000:
+                try:
+                    top_count = non_null.value_counts(dropna=True).iloc[0]
+                    dominant_ratio = top_count / len(non_null)
+                    if dominant_ratio > dominant_threshold:
+                        n_dropped["dominant"] += 1
+                        continue
+                except Exception:
+                    pass
+
+            cols_keep.append(col)
+
+        self.logger.log("PIPELINE", "Pre-filter scan",
+            f"keep={len(cols_keep)} / drop={sum(n_dropped.values())} "
+            f"(null>{null_threshold:.0%}={n_dropped['null']} | "
+            f"constant={n_dropped['constant']} | "
+            f"dominant>{dominant_threshold:.0%}={n_dropped['dominant']})")
+        return cols_keep
+
+    def _stratified_sample(
+        self,
+        df: "pd.DataFrame",
+        target_col: str,
+        ratio: float,
+    ) -> "pd.DataFrame":
+        """Sample `ratio` fraction of rows stratified by target. Falls back to
+        random sample if target is absent or single-class.
+        """
+        rs = Config.RANDOM_STATE
+        if (target_col is None
+                or target_col not in df.columns
+                or df[target_col].nunique() < 2):
+            return df.sample(frac=ratio, random_state=rs).reset_index(drop=True)
+        sampled = (
+            df.groupby(target_col, group_keys=False, observed=True, sort=False)
+              .apply(lambda g: g.sample(frac=ratio, random_state=rs))
+        )
+        return sampled.reset_index(drop=True)
+
     def _build_combined_input(
         self,
         input_path: str,
         valid_path: str = None,
         oot_path: str = None,
+        target_column: str = None,
+        entity_id_col: str = None,
+        composite_key_cols: list = None,
+        train_sample_ratio: float = None,
+        prefilter: bool = True,
     ) -> str:
-        """Concat train + (optional) valid + (optional) oot with a `_split_`
-        marker column so Agents 1+2 apply identical cleaning + feature
-        engineering to every partition, while Agent 3 still reconstructs the
-        exact user-defined splits.
+        """Stream train + (optional) valid + (optional) oot to a single parquet
+        file with a `_split_` marker column.
 
-        - train: always present (= input_path)
-        - valid: included only if valid_path provided; otherwise Agent 3
-                 auto-splits 20% of train into valid
-        - oot:   included only if oot_path provided
+        Memory-efficient design for large datasets:
+          - Train is loaded ONCE: scanned for useful columns, filtered,
+            optionally stratified-sampled, then written to parquet and freed.
+          - Valid / oot loaded one at a time, filtered to train's column set,
+            then written and freed.
+          - Peak memory ≈ size of the largest single partition (not the sum).
+          - Output is parquet+snappy (typically 5–10× smaller than CSV) so
+            Agent 1 reads it back quickly with low overhead.
 
-        Returns the combined file path; written to OUTPUT_DIR/combined_input.csv.
+        Agents 1+2 see the combined data with the marker preserved, so all
+        partitions get identical cleaning + feature engineering. Agent 3
+        reconstructs the exact user-defined splits from the marker.
+
+        Args:
+            train_sample_ratio: When 0 < ratio < 1, apply stratified sampling
+                                to TRAIN only (valid/oot kept intact).
+            prefilter:          When True, drop useless columns from train (high
+                                null / constant / near-constant). Same filter
+                                applied to valid/oot for schema alignment.
+
+        Returns the combined file path: OUTPUT_DIR/combined_input.parquet
         """
+        import gc
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        combined_path = f"{Config.OUTPUT_DIR}/combined_input.parquet"
+        sizes: dict = {}
+        cols_keep: list = None
+        writer: pq.ParquetWriter | None = None
+        writer_schema: pa.Schema | None = None
+
+        # ── Pass 1: TRAIN — scan, filter, sample, write ──────────────────
         train_df = BaseAgent.load_dataframe(input_path)
+        n_train_raw, n_cols_raw = train_df.shape
+        self.logger.log("PIPELINE", "Pre-split load",
+            f"train loaded rows={n_train_raw} cols={n_cols_raw}")
+
+        if prefilter:
+            cols_keep = self._scan_useful_columns(
+                train_df,
+                target_column=target_column,
+                entity_id_col=entity_id_col,
+                composite_key_cols=composite_key_cols,
+            )
+            train_df = train_df[cols_keep]
+            gc.collect()
+
+        if train_sample_ratio is not None and 0 < train_sample_ratio < 1:
+            train_df = self._stratified_sample(train_df, target_column, train_sample_ratio)
+            self.logger.log("PIPELINE", "Pre-split sample",
+                f"train sampled {n_train_raw} → {len(train_df)} "
+                f"(ratio={train_sample_ratio:.2f}, stratified by {target_column!r})")
+
         train_df[SPLIT_MARKER] = "train"
-        parts = [train_df]
-        sizes = {"train": len(train_df)}
+        sizes["train"] = len(train_df)
 
-        if valid_path:
-            valid_df = BaseAgent.load_dataframe(valid_path)
-            valid_df[SPLIT_MARKER] = "valid"
-            parts.append(valid_df)
-            sizes["valid"] = len(valid_df)
+        table = pa.Table.from_pandas(train_df, preserve_index=False)
+        del train_df
+        gc.collect()
+        writer_schema = table.schema
+        writer = pq.ParquetWriter(combined_path, writer_schema, compression="snappy")
+        writer.write_table(table)
+        del table
+        gc.collect()
 
-        if oot_path:
-            oot_in_df = BaseAgent.load_dataframe(oot_path)
-            oot_in_df[SPLIT_MARKER] = "oot"
-            parts.append(oot_in_df)
-            sizes["oot"] = len(oot_in_df)
+        # ── Pass 2/3: VALID and OOT — filter only, no sampling ───────────
+        for path, marker in [(valid_path, "valid"), (oot_path, "oot")]:
+            if path is None:
+                continue
 
-        combined = pd.concat(parts, ignore_index=True, sort=False)
-        combined_path = f"{Config.OUTPUT_DIR}/combined_input.csv"
-        combined.to_csv(combined_path, index=False)
-        self.logger.log("PIPELINE", "Pre-split concat",
-            f"Combined sizes={sizes} | total={len(combined)} | saved={combined_path}")
+            df = BaseAgent.load_dataframe(path)
+            self.logger.log("PIPELINE", "Pre-split load",
+                f"{marker} loaded rows={len(df)} cols={df.shape[1]}")
+
+            if cols_keep is not None:
+                df = df[[c for c in cols_keep if c in df.columns]]
+
+            df[SPLIT_MARKER] = marker
+            sizes[marker] = len(df)
+
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            del df
+            gc.collect()
+            try:
+                table = table.cast(writer_schema)
+            except Exception as e:
+                self.logger.log("PIPELINE", "WARN",
+                    f"Schema mismatch in '{marker}' partition: {e}. "
+                    "Re-export inputs with identical schemas.")
+            writer.write_table(table)
+            del table
+            gc.collect()
+
+        if writer is not None:
+            writer.close()
+
+        self.logger.log("PIPELINE", "Pre-split concat (streaming parquet)",
+            f"Combined sizes={sizes} | total={sum(sizes.values())} | saved={combined_path}")
         return combined_path
 
     def run(
@@ -75,6 +237,8 @@ class AutoMLPipeline:
         composite_key_cols: list = None,
         valid_path: str = None,
         oot_path: str = None,
+        train_sample_ratio: float = None,
+        prefilter: bool = True,
         domain: str = "generic",
         model_type: str = "binary_classification",
     ):
@@ -118,7 +282,16 @@ class AutoMLPipeline:
         # This makes Agents 1+2 process the SAME schema for every partition, so
         # column drops / engineered features from Agent 2 apply consistently.
         if pre_split:
-            input_path = self._build_combined_input(input_path, valid_path, oot_path)
+            input_path = self._build_combined_input(
+                input_path,
+                valid_path=valid_path,
+                oot_path=oot_path,
+                target_column=target_column,
+                entity_id_col=entity_id_col,
+                composite_key_cols=composite_key_cols,
+                train_sample_ratio=train_sample_ratio,
+                prefilter=prefilter,
+            )
 
         self.logger.log("PIPELINE", "Stage 1", "Initializing Data Cleaner Agent")
         agent1 = DataCleanerAgent(

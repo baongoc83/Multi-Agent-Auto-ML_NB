@@ -89,6 +89,20 @@ Examples:
              "With --valid: OOT joins the concat + marker flow.",
     )
     parser.add_argument(
+        "--sample-ratio", metavar="RATIO", type=float, dest="train_sample_ratio", default=None,
+        help="Stratified sample fraction (0 < ratio < 1) applied to TRAIN only "
+             "in pre-split mode (--valid or --oot set). Valid / OOT kept intact. "
+             "Useful for very wide datasets that OOM during cleaning. "
+             "Example: --sample-ratio 0.3 keeps 30%% of train rows.",
+    )
+    parser.add_argument(
+        "--no-prefilter", action="store_false", dest="prefilter", default=True,
+        help="Disable column pre-filter (default: on). Pre-filter drops "
+             "constant / near-constant / mostly-null columns from train "
+             "before combining; the same filter applies to valid/oot. "
+             "Thresholds: PREFILTER_MAX_NULL_RATIO / PREFILTER_MAX_DOMINANT_RATIO in Config.",
+    )
+    parser.add_argument(
         "--col-desc", metavar="PATH", dest="col_descriptions_path", default=None,
         help="Column descriptions file (.csv / .json / .parquet / .xlsx). "
              "Passed to Agent 2 to guide interaction feature creation.",
@@ -208,6 +222,10 @@ def main() -> None:
         print(f"Valid path   : {args.valid_path}  (pre-split mode)")
     if args.oot_path:
         print(f"OOT path     : {args.oot_path}")
+    if args.train_sample_ratio is not None:
+        print(f"Sample ratio : {args.train_sample_ratio}  (stratified, train only)")
+    if not args.prefilter:
+        print(f"Prefilter    : DISABLED")
     if args.col_descriptions_path:
         print(f"Col desc     : {args.col_descriptions_path}")
         if col_desc_kwargs:
@@ -236,6 +254,8 @@ def main() -> None:
             composite_key_cols=composite_key_cols,
             valid_path=args.valid_path,
             oot_path=args.oot_path,
+            train_sample_ratio=args.train_sample_ratio,
+            prefilter=args.prefilter,
             domain=args.domain,
             model_type=args.model_type,
         )

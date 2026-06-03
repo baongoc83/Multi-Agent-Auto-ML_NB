@@ -78,8 +78,8 @@ def main():
     
     Path("outputs").mkdir(exist_ok=True)
     # input_csv = "outputs/sample_data.csv"
-    test_data_path = "data/home-credit-default-risk/application_train_processed.csv"
-    # test_data_path = "outputs/sample_data.csv"
+    # test_data_path = "data/home-credit-default-risk/application_train_processed.csv"
+    test_data_path = "outputs/test_employee_data.csv"
     
     print(f"Test dataset sample: {test_data_path}")
     # print(f"  - Shape: {df.shape}")
@@ -99,6 +99,10 @@ def main():
     pipeline = AutoMLPipeline()
     
     try:
+        # ── Mode 1: AUTO-SPLIT (mặc định) ──────────────────────────────────────
+        # input_path là toàn bộ dataset; pipeline tự split:
+        #   - Có date_col → train + valid_temporal + valid_random + oot (OOT temporal)
+        #   - Không date_col → train (60%) + valid (20%) + test (20%)
         final_metrics = pipeline.run(
             input_path=test_data_path,
             target_column="TARGET",
@@ -113,19 +117,54 @@ def main():
             domain="credit_risk",
             model_type="binary_classification",
         )
+
+        # ── Mode 2: PRE-SPLIT — train + valid + oot tách sẵn ───────────────────
+        # Khi bạn đã có train/valid/oot riêng biệt và muốn giữ chính xác splits đó.
+        # Pipeline concat 3 file với cột marker `_split_` → Agents 1+2 xử lý đồng
+        # nhất → Agent 3 đọc marker dựng lại splits.
+        #
         # final_metrics = pipeline.run(
-        #     input_path=test_data_path,
-        #     target_column="label",
-        #     col_descriptions_path="data/col_descriptions.json",
-        #     # col_descriptions_kwargs=dict(
-        #     #     col_name_field="Row",
-        #     #     col_desc_field="Description",
-        #     #     col_group_field="Table",
-        #     # ),
+        #     input_path="data/train.csv",         # train
+        #     valid_path="data/valid.csv",         # valid riêng
+        #     oot_path="data/oot.csv",             # oot riêng
+        #     target_column="TARGET",
         #     entity_id_col="customer_id",
-        #     composite_key_cols=["customer_id","snap_dt"],
+        #     composite_key_cols=["customer_id", "snap_dt"],
         #     domain="credit_risk",
         #     model_type="binary_classification",
+        # )
+
+        # ── Mode 3: PRE-SPLIT — chỉ train + valid (không oot) ──────────────────
+        # final_metrics = pipeline.run(
+        #     input_path="data/train.csv",
+        #     valid_path="data/valid.csv",
+        #     target_column="TARGET",
+        #     domain="credit_risk",
+        # )
+
+        # ── Mode 4: PRE-SPLIT — chỉ train + oot (không valid) ──────────────────
+        # Pipeline auto-split 20% train → valid; oot vẫn đi qua Agents 1+2.
+        # final_metrics = pipeline.run(
+        #     input_path="data/train.csv",
+        #     oot_path="data/oot.csv",
+        #     target_column="TARGET",
+        #     domain="credit_risk",
+        # )
+
+        # ── Mode 5: PRE-SPLIT + memory savers (dataset rất lớn) ────────────────
+        # Khi train 1M+ rows × 1000+ features có nguy cơ OOM:
+        #   - prefilter=True (default): drop cột null>95% / constant / dominant>99%
+        #   - train_sample_ratio=0.3: stratified sample 30% train (valid/oot intact)
+        # final_metrics = pipeline.run(
+        #     input_path="data/train.parquet",
+        #     valid_path="data/valid.parquet",
+        #     oot_path="data/oot.parquet",
+        #     target_column="TARGET",
+        #     entity_id_col="customer_id",
+        #     composite_key_cols=["customer_id", "snap_dt"],
+        #     train_sample_ratio=0.3,     # sample 30% train
+        #     prefilter=True,              # auto-drop junk columns
+        #     domain="credit_risk",
         # )
         
         print("PIPELINE COMPLETED")

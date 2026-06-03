@@ -16,6 +16,11 @@ outputs/shap_psi_prune_log.csv
 outputs/psi_report.csv
 outputs/stability_report.csv
 outputs/*.pkl
+outputs/*.parquet
+outputs/_*.csv
+
+# Claude harness artifacts
+.claude/scheduled_tasks.lock
 
 # Test outputs
 tests/outputs/
