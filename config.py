@@ -200,6 +200,12 @@ class Config:
     # skip this check (high-cardinality => not near-constant).
     PREFILTER_MAX_DOMINANT_RATIO: float = float(os.getenv("PREFILTER_MAX_DOMINANT_RATIO", 0.99))
 
+    # Chunk size (rows) used when streaming a partition through
+    # pa.Table.from_pandas -> ParquetWriter. Bounds peak memory during the
+    # combined-input build to ~chunk_rows × n_cols × 8 bytes instead of the
+    # full DataFrame. Smaller chunk -> lower peak but more write calls.
+    CONCAT_CHUNK_ROWS: int = int(os.getenv("CONCAT_CHUNK_ROWS", 100_000))
+
     # ── Overfitting Detection ─────────────────────────────────────────────────
     # Relative gap (valid_auc - holdout_auc) / valid_auc above which overfitting
     # is flagged and an LLM-guided retrain is triggered

@@ -112,6 +112,31 @@ class AutoMLPipeline:
         )
         return sampled.reset_index(drop=True)
 
+    @staticmethod
+    def _normalize_numeric_types(table):
+        """Cast Decimal columns to float64 so train/valid/oot can share one
+        writer schema.
+
+        Decimal columns store a fixed (precision, scale) in their pyarrow
+        type. If train's value range fits in Decimal(4, 2) but valid has a
+        larger value that needs Decimal(6, 2), the cast train_schema(valid)
+        fails with "Decimal value does not fit in precision N". Promoting
+        every Decimal column to float64 avoids the precision negotiation
+        entirely and matches what downstream ML libraries expect.
+        """
+        import pyarrow as pa
+        new_fields = []
+        needs_cast = False
+        for field in table.schema:
+            if pa.types.is_decimal(field.type):
+                new_fields.append(pa.field(field.name, pa.float64(), field.nullable))
+                needs_cast = True
+            else:
+                new_fields.append(field)
+        if needs_cast:
+            return table.cast(pa.schema(new_fields))
+        return table
+
     def _build_combined_input(
         self,
         input_path: str,
@@ -157,8 +182,9 @@ class AutoMLPipeline:
         cols_keep: list = None
         writer: pq.ParquetWriter | None = None
         writer_schema: pa.Schema | None = None
+        chunk_rows = max(1, Config.CONCAT_CHUNK_ROWS)
 
-        # ── Pass 1: TRAIN — scan, filter, sample, write ──────────────────
+        # ── Pass 1: TRAIN — scan, filter (in-place), sample, chunk-write ──
         train_df = BaseAgent.load_dataframe(input_path)
         n_train_raw, n_cols_raw = train_df.shape
         self.logger.log("PIPELINE", "Pre-split load",
@@ -171,28 +197,81 @@ class AutoMLPipeline:
                 entity_id_col=entity_id_col,
                 composite_key_cols=composite_key_cols,
             )
-            train_df = train_df[cols_keep]
-            gc.collect()
+            n_dropped = n_cols_raw - len(cols_keep)
+            self.logger.log("PIPELINE", "Pre-filter scan complete",
+                f"will project {len(cols_keep)} kept cols at write time "
+                f"({n_dropped} dropped — NO pandas drop to avoid OOM)")
+            # ── CRITICAL DESIGN ────────────────────────────────────────
+            # We do NOT drop columns from the pandas train_df here.
+            # pandas `df.drop(columns=..., inplace=True)` still allocates
+            # a full copy internally (BlockManager rebuild), peaking at
+            # 2× memory which silently kills the kernel on very wide
+            # datasets. Instead we PROJECT the kept columns at chunk
+            # write time below — the chunk slice handles only what the
+            # writer needs.
+            if n_dropped > 100 and (train_sample_ratio is None or train_sample_ratio >= 0.5):
+                self.logger.log("PIPELINE", "WARN",
+                    f"{n_dropped} cols to drop but no aggressive sampling. "
+                    f"If the kernel still dies during write, set "
+                    f"train_sample_ratio=0.3 (or smaller) in pipeline.run().")
+        else:
+            cols_keep = list(train_df.columns)
 
         if train_sample_ratio is not None and 0 < train_sample_ratio < 1:
             train_df = self._stratified_sample(train_df, target_column, train_sample_ratio)
             self.logger.log("PIPELINE", "Pre-split sample",
-                f"train sampled {n_train_raw} → {len(train_df)} "
+                f"train sampled {n_train_raw} -> {len(train_df)} "
                 f"(ratio={train_sample_ratio:.2f}, stratified by {target_column!r})")
+            gc.collect()
 
         train_df[SPLIT_MARKER] = "train"
-        sizes["train"] = len(train_df)
+        n_train = len(train_df)
+        sizes["train"] = n_train
 
-        table = pa.Table.from_pandas(train_df, preserve_index=False)
+        # Cols to materialise each chunk: kept cols + marker
+        cols_to_write = list(cols_keep)
+        if SPLIT_MARKER not in cols_to_write:
+            cols_to_write.append(SPLIT_MARKER)
+        # Filter to cols actually present (defensive)
+        cols_to_write = [c for c in cols_to_write if c in train_df.columns]
+
+        # Chunked write: peak RAM = chunk_rows × n_cols_kept × 8 bytes (per chunk),
+        # NOT the full train_df + arrow table at once. The chunk slice projects
+        # only kept cols so dropped cols never get converted to Arrow.
+        n_chunks = (n_train + chunk_rows - 1) // chunk_rows
+        self.logger.log("PIPELINE", "Pre-split write start",
+            f"train rows={n_train} cols_to_write={len(cols_to_write)} "
+            f"(of {train_df.shape[1]} in df) | chunk_rows={chunk_rows} | n_chunks={n_chunks}")
+        for chunk_idx, start in enumerate(range(0, n_train, chunk_rows), 1):
+            end = min(start + chunk_rows, n_train)
+            # Row-slice + col-project in one expression. iloc returns a view
+            # in pandas 2.x with copy-on-write; the [cols_to_write] selection
+            # materialises only the kept columns (smaller copy).
+            chunk_df = train_df.iloc[start:end][cols_to_write]
+            chunk_table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+            del chunk_df
+            # Normalize Decimal -> float64 (so valid/oot precision differences
+            # don't break the writer schema later)
+            chunk_table = self._normalize_numeric_types(chunk_table)
+            if writer is None:
+                writer_schema = chunk_table.schema
+                writer = pq.ParquetWriter(combined_path, writer_schema,
+                                          compression="snappy")
+            else:
+                # All train chunks share schema with the first chunk
+                chunk_table = chunk_table.cast(writer_schema)
+            writer.write_table(chunk_table)
+            del chunk_table
+            gc.collect()
+            if chunk_idx == 1 or chunk_idx == n_chunks or chunk_idx % 5 == 0:
+                self.logger.log("PIPELINE", "Pre-split write progress",
+                    f"train chunk {chunk_idx}/{n_chunks} done ({end} rows)")
+
         del train_df
         gc.collect()
-        writer_schema = table.schema
-        writer = pq.ParquetWriter(combined_path, writer_schema, compression="snappy")
-        writer.write_table(table)
-        del table
-        gc.collect()
+        self.logger.log("PIPELINE", "Pre-split write done", f"train fully written ({n_train} rows)")
 
-        # ── Pass 2/3: VALID and OOT — filter only, no sampling ───────────
+        # ── Pass 2/3: VALID and OOT — same chunked write, filter only ─────
         for path, marker in [(valid_path, "valid"), (oot_path, "oot")]:
             if path is None:
                 continue
@@ -201,24 +280,47 @@ class AutoMLPipeline:
             self.logger.log("PIPELINE", "Pre-split load",
                 f"{marker} loaded rows={len(df)} cols={df.shape[1]}")
 
-            if cols_keep is not None:
-                df = df[[c for c in cols_keep if c in df.columns]]
-
+            # Same memory-aware approach: do NOT drop cols from pandas; project
+            # at chunk write time instead.
             df[SPLIT_MARKER] = marker
-            sizes[marker] = len(df)
+            n_part = len(df)
+            sizes[marker] = n_part
 
-            table = pa.Table.from_pandas(df, preserve_index=False)
+            cols_to_write_p = list(cols_keep) if cols_keep is not None else list(df.columns)
+            if SPLIT_MARKER not in cols_to_write_p:
+                cols_to_write_p.append(SPLIT_MARKER)
+            cols_to_write_p = [c for c in cols_to_write_p if c in df.columns]
+
+            n_chunks_p = (n_part + chunk_rows - 1) // chunk_rows
+            self.logger.log("PIPELINE", "Pre-split write start",
+                f"{marker} rows={n_part} cols_to_write={len(cols_to_write_p)} | n_chunks={n_chunks_p}")
+            for chunk_idx, start in enumerate(range(0, n_part, chunk_rows), 1):
+                end = min(start + chunk_rows, n_part)
+                chunk_df = df.iloc[start:end][cols_to_write_p]
+                chunk_table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                del chunk_df
+                chunk_table = self._normalize_numeric_types(chunk_table)
+                try:
+                    chunk_table = chunk_table.cast(writer_schema)
+                except Exception as e:
+                    writer.close()
+                    raise RuntimeError(
+                        f"Schema mismatch in '{marker}' partition (chunk {chunk_idx}) "
+                        f"cannot be reconciled with train schema: {e}. Re-export "
+                        f"inputs so train, valid, and oot share identical column "
+                        f"types and order."
+                    ) from e
+                writer.write_table(chunk_table)
+                del chunk_table
+                gc.collect()
+                if chunk_idx == 1 or chunk_idx == n_chunks_p or chunk_idx % 5 == 0:
+                    self.logger.log("PIPELINE", "Pre-split write progress",
+                        f"{marker} chunk {chunk_idx}/{n_chunks_p} done ({end} rows)")
+
             del df
             gc.collect()
-            try:
-                table = table.cast(writer_schema)
-            except Exception as e:
-                self.logger.log("PIPELINE", "WARN",
-                    f"Schema mismatch in '{marker}' partition: {e}. "
-                    "Re-export inputs with identical schemas.")
-            writer.write_table(table)
-            del table
-            gc.collect()
+            self.logger.log("PIPELINE", "Pre-split write done",
+                f"{marker} fully written ({n_part} rows)")
 
         if writer is not None:
             writer.close()
