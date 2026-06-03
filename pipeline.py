@@ -93,46 +93,36 @@ class AutoMLPipeline:
             f"dominant>{dominant_threshold:.0%}={n_dropped['dominant']})")
         return cols_keep
 
-    def _stratified_sample(
+    def _stratified_sample_positions(
         self,
         df: "pd.DataFrame",
         target_col: str,
         ratio: float,
-    ) -> "pd.DataFrame":
-        """Sample `ratio` fraction of rows stratified by target — INDEX-based
-        to keep peak memory bounded.
+    ) -> "np.ndarray":
+        """Return SORTED row positions for a stratified sample. The caller
+        does the materialisation in chunks — we don't return a sampled
+        DataFrame because a single `df.iloc[all_positions]` peaks at
+        ~old_df + new_df + working buffers (≈ 1.3× original) and OOMs on
+        wide datasets even when the SAMPLED result is small.
 
-        pandas `df.groupby(target).apply(lambda g: g.sample(...))` first
-        materialises each group as a full sub-DataFrame, peaking at
-        ~2× memory and silently killing the kernel on 1M-row × 1000-col
-        datasets. This implementation instead:
-          1. Pulls target as a 1-D numpy array (cheap).
-          2. Computes per-class row positions then samples positions
-             (small integer arrays, MB-scale).
-          3. Does ONE final df.iloc[positions] copy of size ratio × N.
-
-        Peak overhead ≈ size of the SAMPLED result, not the whole frame.
+        Pulling positions instead lets the caller iloc one write-chunk
+        at a time, so peak overhead per step is `chunk_rows × n_cols ×
+        8` bytes, not the full sample.
         """
         rs = Config.RANDOM_STATE
         rng = np.random.default_rng(rs)
         n_rows = len(df)
 
-        self.logger.log("PIPELINE", "Pre-split sample starting",
-            f"input rows={n_rows} cols={df.shape[1]} target_ratio={ratio:.2f}")
-
-        # Fallback: random sample if no usable target
         if (target_col is None
                 or target_col not in df.columns
                 or df[target_col].nunique() < 2):
             n_sample = max(1, int(n_rows * ratio))
             positions = rng.choice(n_rows, n_sample, replace=False)
             positions.sort()
-            result = df.iloc[positions].reset_index(drop=True)
-            self.logger.log("PIPELINE", "Pre-split sample done (random)",
-                f"output rows={len(result)}")
-            return result
+            self.logger.log("PIPELINE", "Pre-split sample positions",
+                f"random | total={len(positions)} (of {n_rows})")
+            return positions
 
-        # Stratified: per-class position indices
         target_arr = df[target_col].to_numpy()
         sampled_positions = []
         class_summary = {}
@@ -145,15 +135,20 @@ class AutoMLPipeline:
         positions = np.concatenate(sampled_positions)
         positions.sort()
         del target_arr, sampled_positions
+        self.logger.log("PIPELINE", "Pre-split sample positions",
+            f"stratified | per-class={class_summary} | total={len(positions)}")
+        return positions
 
-        self.logger.log("PIPELINE", "Pre-split sample indices",
-            f"per-class kept = {class_summary} | total to materialise={len(positions)}")
-
-        # One vectorized .iloc — pandas does a single take operation.
-        result = df.iloc[positions].reset_index(drop=True)
-        self.logger.log("PIPELINE", "Pre-split sample done (stratified)",
-            f"output rows={len(result)} cols={result.shape[1]}")
-        return result
+    def _stratified_sample(
+        self,
+        df: "pd.DataFrame",
+        target_col: str,
+        ratio: float,
+    ) -> "pd.DataFrame":
+        """Materialise a stratified sample. Convenience wrapper for callers
+        that don't stream (used outside the combined-input builder)."""
+        positions = self._stratified_sample_positions(df, target_col, ratio)
+        return df.iloc[positions].reset_index(drop=True)
 
     @staticmethod
     def _normalize_numeric_types(table):
@@ -260,44 +255,51 @@ class AutoMLPipeline:
         else:
             cols_keep = list(train_df.columns)
 
+        # Compute sample positions but DO NOT materialise the sampled
+        # DataFrame — `train_df.iloc[all_positions]` on a 1M-row × 3000-col
+        # frame peaks at ~1.3× original (working buffers + result), which
+        # silently kills the kernel even when the SAMPLED size is small.
+        # We pass positions into the chunked write loop and iloc one
+        # write-chunk at a time.
+        sample_positions = None
         if train_sample_ratio is not None and 0 < train_sample_ratio < 1:
-            # Two-step rebind frees the original 24 GB train_df immediately
-            # after the sampled copy is materialised, instead of waiting for
-            # natural GC. Critical when memory is tight.
-            sampled_df = self._stratified_sample(train_df, target_column, train_sample_ratio)
-            del train_df
-            gc.collect()
-            train_df = sampled_df
-            del sampled_df
-            gc.collect()
+            self.logger.log("PIPELINE", "Pre-split sample starting",
+                f"computing stratified positions | input rows={n_train_raw} "
+                f"target_ratio={train_sample_ratio:.2f}")
+            sample_positions = self._stratified_sample_positions(
+                train_df, target_column, train_sample_ratio)
             self.logger.log("PIPELINE", "Pre-split sample",
-                f"train sampled {n_train_raw} -> {len(train_df)} "
+                f"train will be sampled {n_train_raw} -> {len(sample_positions)} "
                 f"(ratio={train_sample_ratio:.2f}, stratified by {target_column!r})")
+            gc.collect()
 
         train_df[SPLIT_MARKER] = "train"
-        n_train = len(train_df)
+        n_train = len(sample_positions) if sample_positions is not None else len(train_df)
         sizes["train"] = n_train
 
         # Cols to materialise each chunk: kept cols + marker
         cols_to_write = list(cols_keep)
         if SPLIT_MARKER not in cols_to_write:
             cols_to_write.append(SPLIT_MARKER)
-        # Filter to cols actually present (defensive)
         cols_to_write = [c for c in cols_to_write if c in train_df.columns]
 
-        # Chunked write: peak RAM = chunk_rows × n_cols_kept × 8 bytes (per chunk),
-        # NOT the full train_df + arrow table at once. The chunk slice projects
-        # only kept cols so dropped cols never get converted to Arrow.
+        # Chunked write: peak RAM per step = chunk_rows × n_cols_kept × 8 bytes.
+        # When sampling, each chunk pulls `chunk_rows` of the SAMPLE POSITIONS,
+        # so the iloc result is bounded — we never build the full sampled
+        # DataFrame, just the per-chunk slice that's about to be written.
         n_chunks = (n_train + chunk_rows - 1) // chunk_rows
         self.logger.log("PIPELINE", "Pre-split write start",
-            f"train rows={n_train} cols_to_write={len(cols_to_write)} "
-            f"(of {train_df.shape[1]} in df) | chunk_rows={chunk_rows} | n_chunks={n_chunks}")
+            f"train rows_to_write={n_train} cols_to_write={len(cols_to_write)} "
+            f"(of {train_df.shape[1]} in df) | chunk_rows={chunk_rows} | "
+            f"n_chunks={n_chunks} | sampled={sample_positions is not None}")
         for chunk_idx, start in enumerate(range(0, n_train, chunk_rows), 1):
             end = min(start + chunk_rows, n_train)
-            # Row-slice + col-project in one expression. iloc returns a view
-            # in pandas 2.x with copy-on-write; the [cols_to_write] selection
-            # materialises only the kept columns (smaller copy).
-            chunk_df = train_df.iloc[start:end][cols_to_write]
+            if sample_positions is not None:
+                # Pull `chunk_rows` of sampled positions, iloc only those
+                chunk_pos = sample_positions[start:end]
+                chunk_df = train_df.iloc[chunk_pos][cols_to_write]
+            else:
+                chunk_df = train_df.iloc[start:end][cols_to_write]
             chunk_table = pa.Table.from_pandas(chunk_df, preserve_index=False)
             del chunk_df
             # Normalize Decimal -> float64 (so valid/oot precision differences
@@ -318,6 +320,8 @@ class AutoMLPipeline:
                     f"train chunk {chunk_idx}/{n_chunks} done ({end} rows)")
 
         del train_df
+        if sample_positions is not None:
+            del sample_positions
         gc.collect()
         self.logger.log("PIPELINE", "Pre-split write done", f"train fully written ({n_train} rows)")
 
