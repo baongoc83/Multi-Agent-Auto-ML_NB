@@ -3,18 +3,23 @@
 Mocks LLM calls with canned JSON so the full Agent 1→2→3 flow runs without
 hitting any gateway / network. Verifies:
 
-1. AUTO-SPLIT mode (single input_path, no valid/oot)
+1. SINGLE-FILE mode (no valid/oot supplied)
    - Pipeline runs to completion
    - Final report contains AUC metrics
    - Model artifact + inference code written
-   - Splits dict matches expected fallback (train+valid+test or temporal)
+   - clean_data.parquet + engineered_data.parquet created
 
-2. PRE-SPLIT mode (train + valid + oot supplied separately)
-   - Combined parquet built with _split_ marker
-   - Marker preserved through Agents 1 + 2
-   - Agent 3 reconstructs the exact user-defined sizes
-   - No leakage: Agent 1's _train_view excludes valid/oot from stats
-   - No leakage: Agent 2's encoders/selection fit on train only
+2. SPLIT mode (train + valid + oot supplied separately)
+   - Agent 1 fits CleaningSpec on train → writes 3 clean_*.parquet
+   - Agent 2 fits FeatureSpec on train → writes 3 engineered_*.parquet
+   - Agent 3 reads 3 files, adds marker, concats, reconstructs exact splits
+   - Valid + oot row counts EXACTLY preserved (no row drops on transform)
+   - No leakage: Agent 1 + Agent 2 only see train during fit
+   - Junk cols dropped from train via prefilter ALSO dropped from valid/oot
+
+3. SPLIT mode with sample_ratio + prefilter savers
+   - train is sampled ~50%
+   - junk cols (constant/null/dominant) absent from all 3 outputs
 
 Run from project root:
     python _e2e_check.py
@@ -24,7 +29,6 @@ from __future__ import annotations
 import json
 import sys
 import warnings
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -78,7 +82,7 @@ _ba.BaseAgent.call_llm = _mock_call_llm
 
 # Now safe to import the pipeline
 from config import Config            # noqa: E402
-from pipeline import AutoMLPipeline, SPLIT_MARKER   # noqa: E402
+from pipeline import AutoMLPipeline   # noqa: E402
 
 # Tight time budgets so the test finishes in a reasonable time
 Config.FLAML_TIME_BUDGET = 30
@@ -144,10 +148,10 @@ def assert_files_exist(paths: list[str]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 1 — AUTO-SPLIT MODE (single dataset)
+# TEST 1 — SINGLE-FILE MODE
 # ─────────────────────────────────────────────────────────────────────────────
-def test_auto_split() -> None:
-    section("TEST 1 — AUTO-SPLIT mode (single input_path)")
+def test_single_file() -> None:
+    section("TEST 1 — SINGLE-FILE mode (no valid/oot)")
     reset_outputs()
 
     df = gen_data(800, seed=1, with_date=True)
@@ -169,9 +173,7 @@ def test_auto_split() -> None:
     assert "best_model" in metrics, "best_model missing from metrics"
     assert "cv_auc_mean" in metrics, "cv_auc_mean missing from metrics"
 
-    # In auto-split + date_col: expect OOT temporal split (oot key populated)
-    # If not enough months, falls back to test split. Either is fine — just verify
-    # we got a holdout AUC.
+    # In single-file + date_col: expect OOT temporal split (oot_auc) or test_auc fallback
     has_holdout_auc = any(k in metrics for k in ("oot_auc", "test_auc"))
     assert has_holdout_auc, "no holdout AUC (oot_auc or test_auc) present"
 
@@ -189,20 +191,18 @@ def test_auto_split() -> None:
         rep3 = json.load(f)
     print(f"  Splits sizes: {rep3.get('splits', {})}")
 
-    # Verify NO marker present in clean/engineered data (auto-split mode)
-    cleaned = pd.read_csv(Config.CLEAN_DATA_PATH)
-    engineered = pd.read_csv(Config.ENGINEERED_DATA_PATH)
-    assert SPLIT_MARKER not in cleaned.columns, "marker should NOT appear in auto-split mode"
-    assert SPLIT_MARKER not in engineered.columns, "marker should NOT appear in auto-split mode"
-    print("  [OK] no _split_ marker in auto-split outputs")
-    print("  [PASS] AUTO-SPLIT mode end-to-end works")
+    # Agent 1/2 reports should be mode='single'
+    with open(Config.DATA_CLEANER_REPORT_PATH, encoding="utf-8") as f:
+        rep1 = json.load(f)
+    assert rep1.get("mode") == "single", f"DataCleaner mode should be 'single', got {rep1.get('mode')}"
+    print("  [PASS] SINGLE-FILE mode end-to-end works")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 2 — PRE-SPLIT MODE (train + valid + oot supplied)
+# TEST 2 — SPLIT MODE (train + valid + oot supplied)
 # ─────────────────────────────────────────────────────────────────────────────
-def test_pre_split() -> None:
-    section("TEST 2 — PRE-SPLIT mode (train + valid + oot)")
+def test_split_mode() -> None:
+    section("TEST 2 — SPLIT mode (train + valid + oot)")
     reset_outputs()
 
     # Distinct seeds → distinct customer_id ranges (no overlap)
@@ -225,64 +225,79 @@ def test_pre_split() -> None:
         composite_key_cols=["customer_id", "snap_dt"],
         domain="generic",
         model_type="binary_classification",
-        prefilter=True,        # default-on
+        prefilter=True,
         train_sample_ratio=None,
     )
 
     print(f"\n  Final metrics keys: {sorted(metrics.keys())}")
     assert "best_model" in metrics
     assert "cv_auc_mean" in metrics
-    assert "valid_auc" in metrics, "valid_auc missing — pre-split valid set not evaluated"
-    assert "oot_auc" in metrics,   "oot_auc missing — pre-split oot set not evaluated"
+    assert "valid_auc" in metrics, "valid_auc missing — split valid set not evaluated"
+    assert "oot_auc" in metrics,   "oot_auc missing — split oot set not evaluated"
 
-    # ── Verify _split_ marker propagated through Agents 1+2 ────────────────
-    combined = pd.read_parquet(f"{Config.OUTPUT_DIR}/combined_input.parquet")
-    assert SPLIT_MARKER in combined.columns, "marker missing from combined input"
-    combined_marker = combined[SPLIT_MARKER].value_counts().to_dict()
-    print(f"  Combined input marker counts: {combined_marker}")
-    assert combined_marker.get("train") == n_train_in, "train rows mismatch in combined"
-    assert combined_marker.get("valid") == n_valid_in
-    assert combined_marker.get("oot")   == n_oot_in
-
-    cleaned = pd.read_csv(Config.CLEAN_DATA_PATH)
-    assert SPLIT_MARKER in cleaned.columns, "Agent 1 must preserve _split_ marker"
-    cleaned_marker = cleaned[SPLIT_MARKER].value_counts().to_dict()
-    print(f"  Post-Agent-1 marker counts : {cleaned_marker}")
-
-    engineered = pd.read_csv(Config.ENGINEERED_DATA_PATH)
-    assert SPLIT_MARKER in engineered.columns, "Agent 2 must preserve _split_ marker"
-    engineered_marker = engineered[SPLIT_MARKER].value_counts().to_dict()
-    print(f"  Post-Agent-2 marker counts : {engineered_marker}")
-
-    # ── Verify Agent 3 reconstructed splits from marker ────────────────────
-    with open(Config.MODEL_TRAINER_REPORT_PATH, encoding="utf-8") as f:
-        rep3 = json.load(f)
-    a3_splits = rep3.get("splits", {})
-    print(f"  Agent 3 split sizes        : {a3_splits}")
-    assert a3_splits.get("valid", 0) == engineered_marker.get("valid", 0), \
-        f"Agent 3 valid size {a3_splits.get('valid')} != marker valid {engineered_marker.get('valid')}"
-    assert a3_splits.get("oot", 0) == engineered_marker.get("oot", 0), \
-        f"Agent 3 oot size {a3_splits.get('oot')} != marker oot {engineered_marker.get('oot')}"
-
-    # train size in Agent 3 = engineered train (minus rows dropped by cleaning)
-    assert a3_splits.get("train", 0) <= engineered_marker.get("train", 0)
-    print("  [OK] splits propagated train+valid+oot exactly through full pipeline")
-
+    # ── Verify 3 separate clean_* files exist ─────────────────────────────
     assert_files_exist([
-        f"{Config.OUTPUT_DIR}/combined_input.parquet",
-        Config.CLEAN_DATA_PATH,
-        Config.ENGINEERED_DATA_PATH,
+        Config.CLEAN_TRAIN_PATH,
+        Config.CLEAN_VALID_PATH,
+        Config.CLEAN_OOT_PATH,
+        Config.ENGINEERED_TRAIN_PATH,
+        Config.ENGINEERED_VALID_PATH,
+        Config.ENGINEERED_OOT_PATH,
         Config.FINAL_MODEL_PATH,
         Config.FINAL_MODEL_CODE_PATH,
     ])
-    print("  [PASS] PRE-SPLIT mode end-to-end works")
+
+    # ── Verify NO marker leaked into the per-partition files ──────────────
+    clean_train = pd.read_parquet(Config.CLEAN_TRAIN_PATH)
+    clean_valid = pd.read_parquet(Config.CLEAN_VALID_PATH)
+    clean_oot   = pd.read_parquet(Config.CLEAN_OOT_PATH)
+    for name, df in [("clean_train", clean_train),
+                     ("clean_valid", clean_valid),
+                     ("clean_oot",   clean_oot)]:
+        assert "_split_" not in df.columns, f"marker leaked into {name}"
+    print(f"  Clean shapes: train={clean_train.shape} | valid={clean_valid.shape} | oot={clean_oot.shape}")
+
+    # ── Row-count invariants ──────────────────────────────────────────────
+    # Valid + oot must keep EXACT row counts (no row drops on transform)
+    assert len(clean_valid) == n_valid_in, \
+        f"valid rows must not change on transform: {len(clean_valid)} != {n_valid_in}"
+    assert len(clean_oot) == n_oot_in, \
+        f"oot rows must not change on transform: {len(clean_oot)} != {n_oot_in}"
+    # Train may lose rows to drop_duplicates (but only train, never valid/oot)
+    assert len(clean_train) <= n_train_in
+
+    # ── Columns must match across all 3 partitions ────────────────────────
+    eng_train = pd.read_parquet(Config.ENGINEERED_TRAIN_PATH)
+    eng_valid = pd.read_parquet(Config.ENGINEERED_VALID_PATH)
+    eng_oot   = pd.read_parquet(Config.ENGINEERED_OOT_PATH)
+    cols_train = set(eng_train.columns)
+    cols_valid = set(eng_valid.columns)
+    cols_oot   = set(eng_oot.columns)
+    assert cols_train == cols_valid, f"engineered train vs valid column mismatch: {cols_train ^ cols_valid}"
+    assert cols_train == cols_oot,   f"engineered train vs oot column mismatch: {cols_train ^ cols_oot}"
+    print(f"  Engineered shapes : train={eng_train.shape} | valid={eng_valid.shape} | oot={eng_oot.shape}")
+    print(f"  Schema parity     : OK (all 3 share {len(cols_train)} cols)")
+
+    # ── Agent 3 split sizes match the per-partition row counts ────────────
+    with open(Config.MODEL_TRAINER_REPORT_PATH, encoding="utf-8") as f:
+        rep3 = json.load(f)
+    a3_splits = rep3.get("splits", {})
+    print(f"  Agent 3 splits    : {a3_splits}")
+    assert a3_splits.get("valid", 0) == len(eng_valid)
+    assert a3_splits.get("oot", 0)   == len(eng_oot)
+
+    # Agent 1/2 reports should be mode='split'
+    with open(Config.DATA_CLEANER_REPORT_PATH, encoding="utf-8") as f:
+        rep1 = json.load(f)
+    assert rep1.get("mode") == "split", f"DataCleaner mode should be 'split', got {rep1.get('mode')}"
+    print("  [PASS] SPLIT mode end-to-end works (fit-on-train + transform-on-valid/oot)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 3 — PRE-SPLIT MODE with sample_ratio + prefilter
+# TEST 3 — SPLIT MODE + sample_ratio + prefilter
 # ─────────────────────────────────────────────────────────────────────────────
-def test_pre_split_with_savers() -> None:
-    section("TEST 3 — PRE-SPLIT mode + sample_ratio=0.5 + prefilter on")
+def test_split_with_savers() -> None:
+    section("TEST 3 — SPLIT mode + sample_ratio=0.5 + prefilter on")
     reset_outputs()
 
     train = gen_data(1000, seed=5)
@@ -321,31 +336,36 @@ def test_pre_split_with_savers() -> None:
         domain="generic",
     )
 
-    combined = pd.read_parquet(f"{Config.OUTPUT_DIR}/combined_input.parquet")
-    junk_in = [c for c in ("junk_constant", "junk_null", "junk_dominant")
-               if c in combined.columns]
-    print(f"  Junk cols still in combined: {junk_in}")
-    assert junk_in == [], f"prefilter should have dropped junk cols; found {junk_in}"
+    # ── junk cols must be absent from ALL 3 clean files (prefilter replay) ─
+    for path in (Config.CLEAN_TRAIN_PATH, Config.CLEAN_VALID_PATH, Config.CLEAN_OOT_PATH):
+        d = pd.read_parquet(path)
+        junk_in = [c for c in ("junk_constant", "junk_null", "junk_dominant")
+                   if c in d.columns]
+        assert junk_in == [], f"prefilter should drop junk cols from {path}; found {junk_in}"
+    print("  [OK] junk cols dropped from train, valid, oot (spec replay works)")
 
-    marker = combined[SPLIT_MARKER].value_counts().to_dict()
-    print(f"  Combined marker counts     : {marker}")
-    # Train sampled ~50% → 500 ±10
-    assert 440 < marker["train"] < 560, f"sampled train size off: {marker['train']}"
-    assert marker["valid"] == 200
-    assert marker["oot"]   == 200
+    # ── train sampled ~50% (440-560 range), valid/oot keep their full size ─
+    n_train = len(pd.read_parquet(Config.CLEAN_TRAIN_PATH))
+    n_valid = len(pd.read_parquet(Config.CLEAN_VALID_PATH))
+    n_oot   = len(pd.read_parquet(Config.CLEAN_OOT_PATH))
+    print(f"  Clean train rows  : {n_train} (target ~500)")
+    print(f"  Clean valid rows  : {n_valid}")
+    print(f"  Clean oot rows    : {n_oot}")
+    assert 440 < n_train < 560, f"sampled train size off: {n_train}"
+    assert n_valid == 200
+    assert n_oot   == 200
+
     assert "valid_auc" in metrics
     assert "oot_auc"   in metrics
-    print(f"  Train rows after 0.5 sample: {marker['train']} (target ~500)")
-    print(f"  AUC results                : "
-          f"valid={metrics.get('valid_auc')} | oot={metrics.get('oot_auc')}")
-    print("  [PASS] sample_ratio + prefilter integrate cleanly into the flow")
+    print(f"  AUC               : valid={metrics.get('valid_auc')} | oot={metrics.get('oot_auc')}")
+    print("  [PASS] sample_ratio + prefilter integrate cleanly into the split flow")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     failures: list[str] = []
-    for fn in (test_auto_split, test_pre_split, test_pre_split_with_savers):
+    for fn in (test_single_file, test_split_mode, test_split_with_savers):
         try:
             fn()
         except AssertionError as e:

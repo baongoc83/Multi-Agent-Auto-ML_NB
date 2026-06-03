@@ -2,6 +2,7 @@ import re
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, List, Optional
 import json
 from sklearn.preprocessing import LabelEncoder
@@ -11,9 +12,75 @@ from logger import AgentLogger
 from config import Config
 
 
-# Marker column used in pre-split mode (set by AutoMLPipeline._build_combined_input).
-# Always protected from encode/interaction/selection in this agent.
-_SPLIT_MARKER = "_split_"
+@dataclass
+class FeatureSpec:
+    """Captured transforms from TRAIN, replayed on VALID/OOT.
+
+    - interactions: list of (new_col, expression, fill_value) where fill_value
+      is the train-median used to fill NaN/inf so valid/oot get a deterministic
+      imputation, not their own median (leakage-free).
+    - label_encoders: fitted LabelEncoder per column. The fit includes an
+      `__NA__` sentinel so unseen categories in valid/oot map to it cleanly.
+    - onehot_columns: per-col list of dummy column names produced on train,
+      used to reindex valid/oot dummies (extra cols dropped, missing cols
+      back-filled with 0).
+    - selected_features: final column subset chosen by select_top_features
+      (target appended automatically at apply time).
+    """
+    interactions:      List[Tuple[str, str, float]] = field(default_factory=list)
+    label_encoders:    Dict[str, Any]               = field(default_factory=dict)
+    onehot_columns:    Dict[str, List[str]]         = field(default_factory=dict)
+    selected_features: Optional[List[str]]          = None
+    target_column:     Optional[str]                = None
+
+    def apply(self, df: pd.DataFrame, logger=None, name: str = "") -> pd.DataFrame:
+        """Replay every captured transform on `df` in fit-time order."""
+
+        # 1. Re-create interactions (same expression; NaN/inf filled with train median)
+        for new_col, expression, fill_value in self.interactions:
+            safe_locals = {"df": df, "np": np}
+            try:
+                df[new_col] = eval(expression, {"__builtins__": {}}, safe_locals)  # noqa: S307
+                df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
+                df[new_col] = df[new_col].fillna(fill_value)
+            except Exception as e:
+                if logger is not None:
+                    logger.log(name, "Transform WARN",
+                        f"interaction '{new_col}' failed on transform set: {e} — filling with train median")
+                df[new_col] = fill_value
+
+        # 2. Label encoders — unseen categories map to __NA__ sentinel
+        for col, le in self.label_encoders.items():
+            if col not in df.columns:
+                continue
+            known = set(le.classes_)
+            vals = df[col].astype(str).apply(lambda x: x if x in known else "__NA__")
+            df[col] = le.transform(vals)
+
+        # 3. One-hot — reindex against train's dummy column list
+        for col, dummy_cols in self.onehot_columns.items():
+            if col not in df.columns:
+                continue
+            dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
+            dummies = dummies.reindex(columns=dummy_cols, fill_value=0)
+            df = pd.concat([df.drop(columns=[col]), dummies], axis=1)
+
+        # 4. Column selection — keep only the train-chosen features (+ target)
+        if self.selected_features is not None:
+            keep = [c for c in self.selected_features if c in df.columns]
+            if self.target_column and self.target_column in df.columns and self.target_column not in keep:
+                keep.append(self.target_column)
+            df = df[keep]
+        return df
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "interactions": [[n, e, f] for (n, e, f) in self.interactions],
+            "label_encoders": sorted(self.label_encoders.keys()),
+            "onehot_columns": {c: list(v) for c, v in self.onehot_columns.items()},
+            "selected_features": self.selected_features,
+            "target_column": self.target_column,
+        }
 
 
 class FeatureEngineerAgent(BaseAgent):
@@ -77,24 +144,16 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         self._col_descriptions: Dict[str, str] = self._load_col_descriptions(
             col_descriptions_path, col_name_field, col_desc_field, col_group_field
         )
+        # Capture buffers populated by tool methods and harvested by _execute_llm_decisions
+        # into the FeatureSpec. Initialised to None so we never read stale state.
+        self._last_label_encoder: Optional[Any] = None
+        self._last_onehot_cols: Optional[List[str]] = None
+        self._last_selected_features: Optional[List[str]] = None
+        self._last_interaction_fill: float = 0.0
+        self._batch_label_encoders: Dict[str, Any] = {}
+        self._batch_onehot_cols: Dict[str, List[str]] = {}
         self.tool_registry = ToolRegistry()
         self._register_tools()
-
-    def _train_view(self, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """Return rows where marker == 'train' (pre-split mode) OR full df.
-
-        Decisions/statistics are computed on this view to prevent valid+oot
-        from leaking into encoder fit, correlation, or top-k selection.
-        Transformations are applied to the FULL frame so all partitions
-        receive the same pipeline.
-        """
-        if df is None:
-            df = self.df
-        if df is not None and _SPLIT_MARKER in df.columns:
-            view = df[df[_SPLIT_MARKER] == "train"]
-            if len(view) > 0:
-                return view
-        return df
 
     def _get_domain_guidance(self) -> str:
         if self.domain not in self._DOMAIN_GUIDANCE:
@@ -281,11 +340,17 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         try:
             df[new_col] = eval(expression, {"__builtins__": {}}, safe_locals)  # noqa: S307
             df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
-            df[new_col] = df[new_col].fillna(df[new_col].median())
+            train_median = df[new_col].median()
+            # Median can still be NaN if every value is NaN/inf — use 0.0 as a safe sentinel
+            if pd.isna(train_median):
+                train_median = 0.0
+            df[new_col] = df[new_col].fillna(train_median)
             # Drop if constant or all-NaN — causes divide-by-zero in correlation/SelectKBest
             if df[new_col].isna().all() or df[new_col].std() == 0:
                 df = df.drop(columns=[new_col])
                 raise ValueError(f"Generated feature '{new_col}' is constant or all-NaN after fill — dropped")
+            # Expose train median so _execute_llm_decisions can capture it for replay on valid/oot
+            self._last_interaction_fill = float(train_median)
             return df
         except ValueError:
             raise
@@ -293,110 +358,89 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             raise ValueError(f"Error creating interaction '{new_col}': {e}")
 
     def _tool_encode_categorical(self, df: pd.DataFrame, col: str, method: str) -> pd.DataFrame:
-        """FIT-on-train, TRANSFORM-on-all encoding.
-
-        - When `_split_` marker exists: the encoder is fit using TRAIN rows
-          only; the transformation is then applied to the FULL frame.
-          For label encoding, unseen categories in valid/oot map to a
-          sentinel "__NA__" class so transform never raises on novel
-          values.
-        - Without the marker: behaves as fit_transform on the whole frame
-          (legacy mode).
+        """FIT-on-train encoding. Fitted encoders / column lists are exposed via
+        `_last_label_encoder` and `_last_onehot_cols` so `_execute_llm_decisions`
+        can capture them into a FeatureSpec for valid/oot replay.
         """
         if col not in df.columns:
             raise ValueError(f"Column '{col}' not found")
 
-        has_marker = _SPLIT_MARKER in df.columns
-
         if method == "label":
             le = LabelEncoder()
-            if has_marker:
-                train_mask = df[_SPLIT_MARKER] == "train"
-                train_vals = df.loc[train_mask, col].astype(str)
-                # Add sentinel so unseen valid/oot categories don't crash transform
-                le.fit(sorted(set(train_vals.tolist()) | {"__NA__"}))
-                known = set(le.classes_)
-                full_vals = df[col].astype(str).apply(
-                    lambda x: x if x in known else "__NA__"
-                )
-                df[col] = le.transform(full_vals)
-            else:
-                df[col] = le.fit_transform(df[col].astype(str))
+            # Train values + __NA__ sentinel — guarantees transform never raises
+            # on unseen valid/oot categories when we replay this encoder.
+            train_vals = df[col].astype(str)
+            le.fit(sorted(set(train_vals.tolist()) | {"__NA__"}))
+            df[col] = le.transform(train_vals)
+            self._last_label_encoder = le
 
         elif method == "onehot":
-            if has_marker:
-                train_mask = df[_SPLIT_MARKER] == "train"
-                # Determine columns from TRAIN, then reindex full frame to match
-                train_dummies = pd.get_dummies(df.loc[train_mask, col],
-                                                prefix=col, drop_first=True)
-                full_dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
-                # Drop unseen-in-train columns; add train-only columns missing in full
-                full_dummies = full_dummies.reindex(columns=train_dummies.columns,
-                                                    fill_value=0)
-                df = pd.concat([df.drop(columns=[col]), full_dummies], axis=1)
-            else:
-                dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
-                df = pd.concat([df, dummies], axis=1)
-                df = df.drop(columns=[col])
+            dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
+            df = pd.concat([df.drop(columns=[col]), dummies], axis=1)
+            self._last_onehot_cols = list(dummies.columns)
         else:
             raise ValueError(f"Unknown encoding method: {method}")
 
         return df
 
     def _tool_encode_all_categorical(self, df: pd.DataFrame, method: str = "label") -> pd.DataFrame:
+        """Encode every non-numeric column (except protected/target) using `method`.
+
+        For each column, the fitted encoder is stored in `_batch_label_encoders` /
+        `_batch_onehot_cols` so `_execute_llm_decisions` can transfer them
+        into the FeatureSpec.
+        """
         skip = self._protected_cols | {self.target_column}
         cat_cols = [c for c in df.select_dtypes(exclude=[np.number]).columns if c not in skip]
-        # Cardinality check (for onehot fallback) computed on TRAIN view when in
-        # pre-split mode, otherwise on the full frame.
-        train_view = self._train_view(df)
+        self._batch_label_encoders: Dict[str, Any] = {}
+        self._batch_onehot_cols: Dict[str, List[str]] = {}
         encoded = 0
         for col in cat_cols:
             effective_method = method
             if method == "onehot":
-                col_nu = train_view[col].nunique() if col in train_view.columns else df[col].nunique()
+                col_nu = df[col].nunique()
                 if col_nu > 5:
                     effective_method = "label"
                     self.logger.log(self.name, "encode_all_categorical",
-                        f"'{col}' nunique={col_nu} > 5 (train view) — falling back to label encoding")
+                        f"'{col}' nunique={col_nu} > 5 — falling back to label encoding")
+            self._last_label_encoder = None
+            self._last_onehot_cols = None
             df = self._tool_encode_categorical(df, col, effective_method)
+            if effective_method == "label" and self._last_label_encoder is not None:
+                self._batch_label_encoders[col] = self._last_label_encoder
+            elif effective_method == "onehot" and self._last_onehot_cols is not None:
+                self._batch_onehot_cols[col] = self._last_onehot_cols
             encoded += 1
         self.logger.log(self.name, "encode_all_categorical",
             f"Encoded {encoded} categorical columns (requested method='{method}')")
         return df
 
     def _tool_correlation_analysis(self, df: pd.DataFrame, target: str) -> str:
-        """Correlation of each feature with the target.
-
-        Computed on TRAIN portion when `_split_` marker is present (so the
-        score the LLM sees is leakage-free). Falls back to full frame
-        otherwise.
+        """Correlation of each feature with the target. `df` is the TRAIN frame
+        in split mode (caller passes self.df, which IS train), so the score is
+        leakage-free.
         """
         if target not in df.columns:
             raise ValueError(f"Target column '{target}' not found")
 
-        # Train-only view for correlation (avoid valid/oot leakage in the score)
-        train_view = self._train_view(df)
-
-        y = pd.to_numeric(train_view[target], errors="coerce")
+        y = pd.to_numeric(df[target], errors="coerce")
         if y.isna().all():
             raise ValueError(
                 f"Target '{target}' cannot be converted to numeric — correlation analysis skipped"
             )
 
-        numeric_cols = train_view.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         if target in numeric_cols:
             numeric_cols.remove(target)
-        if _SPLIT_MARKER in numeric_cols:
-            numeric_cols.remove(_SPLIT_MARKER)
 
         correlations = {}
         unreliable = []
         for col in numeric_cols:
-            null_pct = train_view[col].isnull().mean() * 100
-            if train_view[col].std() == 0:
+            null_pct = df[col].isnull().mean() * 100
+            if df[col].std() == 0:
                 correlations[col] = 0.0
                 continue
-            corr = train_view[col].corr(y)
+            corr = df[col].corr(y)
             correlations[col] = round(corr, 4) if not pd.isna(corr) else 0.0
             if null_pct > 30:
                 unreliable.append(f"{col} ({null_pct:.1f}% null)")
@@ -412,36 +456,22 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         return json.dumps(result, indent=2)
 
     def _tool_select_top_features(self, df: pd.DataFrame, target: str, k: int) -> pd.DataFrame:
-        """Score features on TRAIN rows (leakage-free) and apply the same
-        column selection to the FULL frame.
-
-        - Scoring (f_classif / f_regression) runs only on rows where
-          `_split_` marker == "train". When the marker is absent, scoring
-          falls back to the whole frame.
-        - The selected column set is then sliced from the full frame so
-          valid + oot are preserved with exactly the columns chosen on
-          train (zero leakage in the selection step).
+        """Score features on the TRAIN frame (caller passes self.df=train) and
+        keep the top-k. The retained column list is exposed via
+        `_last_selected_features` so it can be captured into FeatureSpec and
+        applied to valid/oot during transform.
         """
         if target not in df.columns:
             raise ValueError(f"Target column '{target}' not found")
 
         feature_cols = [c for c in df.columns if c != target]
-        # Marker is metadata, never a feature
-        if _SPLIT_MARKER in feature_cols:
-            feature_cols.remove(_SPLIT_MARKER)
         non_numeric_cols = df[feature_cols].select_dtypes(exclude=[np.number]).columns.tolist()
         numeric_features = df[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
 
         if not numeric_features:
             return df
 
-        # ── Score on TRAIN rows only ─────────────────────────────────────
-        if _SPLIT_MARKER in df.columns:
-            score_mask = df[_SPLIT_MARKER] == "train"
-        else:
-            score_mask = pd.Series(True, index=df.index)
-
-        y = pd.to_numeric(df.loc[score_mask, target], errors="coerce")
+        y = pd.to_numeric(df[target], errors="coerce")
         valid_mask = y.notna()
         y_valid = y[valid_mask].values
         if len(y_valid) < 2 or pd.Series(y_valid).nunique() < 2:
@@ -451,8 +481,7 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         is_classification = pd.Series(y_valid).nunique() < Config.CLASSIFICATION_UNIQUE_THRESHOLD
         score_func = f_classif if is_classification else f_regression
 
-        # Re-index valid_mask to match df.index for slicing
-        score_idx = df.index[score_mask][valid_mask.values]
+        score_idx = df.index[valid_mask]
 
         scores: Dict[str, float] = {}
         for col in numeric_features:
@@ -474,40 +503,24 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         eligible = [c for c, s in scores.items() if s > 0]
         k = min(k, len(eligible) if eligible else len(scores))
         selected_numeric = sorted(scores, key=scores.__getitem__, reverse=True)[:k]
-        # Preserve marker so Agent 3 can still reconstruct splits
         final_cols = selected_numeric + non_numeric_cols + [target]
-        if _SPLIT_MARKER in df.columns:
-            final_cols.append(_SPLIT_MARKER)
+        # Exposed for capture into FeatureSpec
+        self._last_selected_features = list(final_cols)
         return df[final_cols]
 
-    def process(
-        self,
-        df: pd.DataFrame,
-        previous_report: Dict[str, Any],
-        target_column: str,
-    ) -> Tuple[str, Dict[str, Any]]:
-        """Returns (path_to_engineered_data, report_dict)."""
-        self.logger.log(self.name, "Process Start", f"Received clean data with shape {df.shape}")
-
-        self.df = df.copy()
-        self.target_column = self._resolve_target_column(self.df, target_column)
-        original_shape = self.df.shape
-
-        # Extract key columns flagged by DataCleaner — skip these in all FE steps
+    def _setup_protected_cols(self, previous_report: Dict[str, Any]) -> None:
+        """Compute self._protected_cols + self._date_col from prior agent's report.
+        Idempotent — called by both fit_transform and process (single-file mode).
+        """
         _entity_id = previous_report.get("entity_id_col")
         _composite = previous_report.get("composite_key_cols", [])
         self._protected_cols = set(_composite)
         if _entity_id:
             self._protected_cols.add(_entity_id)
-        # Pre-split mode: protect the _split_ marker column so Agent 3 can
-        # reconstruct user-defined train/valid/oot from it.
-        if _SPLIT_MARKER in self.df.columns:
-            self._protected_cols.add(_SPLIT_MARKER)
         self._protected_cols.discard(self.target_column)
 
         # Infer date column from composite key (the non-entity partner, if any).
-        # Add it to protected cols so it is never encoded or used in interactions.
-        self._date_col: Optional[str] = next(
+        self._date_col = next(
             (c for c in _composite if c != _entity_id and c in self.df.columns),
             None,
         )
@@ -521,6 +534,25 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             self.logger.log(self.name, "Date Col",
                 f"'{self._date_col}' identified as temporal column — excluded from interactions")
 
+    # ── FIT / TRANSFORM API ───────────────────────────────────────────────
+
+    def fit_transform(
+        self,
+        train_path: str,
+        previous_report: Dict[str, Any],
+        target_column: str,
+    ) -> Tuple[pd.DataFrame, FeatureSpec, List[str], Tuple[int, int]]:
+        """Load TRAIN, run LLM feature-engineering, return (engineered_train, spec, actions, original_shape).
+
+        The spec captures every column transform so valid/oot can be transformed
+        without re-running the LLM. Encoders are fitted on train only.
+        """
+        self.logger.log(self.name, "fit_transform start", f"Loading train from {train_path}")
+        self.df = self.load_dataframe(train_path)
+        self.target_column = self._resolve_target_column(self.df, target_column)
+        original_shape = self.df.shape
+
+        self._setup_protected_cols(previous_report)
         self.logger.log(self.name, "Previous Agent Summary", previous_report.get("summary", "No summary"))
 
         analysis = self._analyze_features()
@@ -530,40 +562,132 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             json_mode=True,
             max_tokens=Config.LLM_MAX_TOKENS_LARGE,
         )
-        actions_taken = self._execute_llm_decisions(llm_response)
 
-        self.df.to_csv(Config.ENGINEERED_DATA_PATH, index=False)
+        spec = FeatureSpec(target_column=self.target_column)
+        actions_taken = self._execute_llm_decisions(llm_response, spec=spec)
+        return self.df, spec, actions_taken, original_shape
+
+    def transform(self, df: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
+        """Apply a captured FeatureSpec to valid/oot. No LLM, no refit."""
+        return spec.apply(df, logger=self.logger, name=self.name)
+
+    def process_splits(
+        self,
+        train_path: str,
+        previous_report: Dict[str, Any],
+        target_column: str,
+        valid_path: Optional[str] = None,
+        oot_path: Optional[str] = None,
+    ) -> Tuple[Dict[str, Optional[str]], Dict[str, Any]]:
+        """Pre-split mode entry point. Fit on train, transform valid/oot one at a time.
+
+        Returns ({"train": path, "valid": path|None, "oot": path|None}, report).
+        """
+        import gc
+
+        train_df, spec, actions_taken, original_shape = self.fit_transform(
+            train_path, previous_report, target_column)
+
+        Path(Config.ENGINEERED_TRAIN_PATH).parent.mkdir(exist_ok=True)
+        train_df.to_parquet(Config.ENGINEERED_TRAIN_PATH, compression="snappy", index=False)
+        self.logger.log(self.name, "Train saved",
+            f"shape={train_df.shape} | path={Config.ENGINEERED_TRAIN_PATH}")
+        train_final_shape = train_df.shape
+        train_columns = list(train_df.columns)
+        del train_df, self.df
+        self.df = None
+        gc.collect()
+
+        out_paths: Dict[str, Optional[str]] = {
+            "train": Config.ENGINEERED_TRAIN_PATH, "valid": None, "oot": None,
+        }
+        for tag, in_path, out_path in [
+            ("valid", valid_path, Config.ENGINEERED_VALID_PATH),
+            ("oot",   oot_path,   Config.ENGINEERED_OOT_PATH),
+        ]:
+            if in_path is None:
+                continue
+            self.logger.log(self.name, f"Transform {tag} start", f"path={in_path}")
+            df = self.load_dataframe(in_path)
+            orig = df.shape
+            df = self.transform(df, spec)
+            df.to_parquet(out_path, compression="snappy", index=False)
+            self.logger.log(self.name, f"Transform {tag} done",
+                f"shape {orig} -> {df.shape} | saved={out_path}")
+            out_paths[tag] = out_path
+            del df
+            gc.collect()
+
+        report = {
+            "agent": self.name,
+            "mode": "split",
+            "original_shape": list(original_shape),
+            "final_shape": list(train_final_shape),
+            "actions_taken": actions_taken,
+            "summary": self._generate_summary(actions_taken),
+            "final_features": train_columns,
+            "entity_id_col": previous_report.get("entity_id_col"),
+            "composite_key_cols": previous_report.get("composite_key_cols", []),
+            "target_column": self.target_column,
+            "out_paths": {k: v for k, v in out_paths.items() if v is not None},
+            "feature_spec": spec.to_dict(),
+        }
+        self.save_report(report, Config.FEATURE_ENGINEER_REPORT_PATH)
+        self.logger.log(self.name, "Process Complete",
+            f"train={train_final_shape} | valid={'y' if out_paths['valid'] else '-'} "
+            f"| oot={'y' if out_paths['oot'] else '-'}")
+        return out_paths, report
+
+    def process(
+        self,
+        df: pd.DataFrame,
+        previous_report: Dict[str, Any],
+        target_column: str,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Single-file mode. Used when no valid/oot was supplied to the pipeline."""
+        self.logger.log(self.name, "Process Start", f"Received clean data with shape {df.shape}")
+
+        self.df = df.copy()
+        self.target_column = self._resolve_target_column(self.df, target_column)
+        original_shape = self.df.shape
+
+        self._setup_protected_cols(previous_report)
+        self.logger.log(self.name, "Previous Agent Summary", previous_report.get("summary", "No summary"))
+
+        analysis = self._analyze_features()
+        llm_response = self.call_llm(
+            self._build_engineering_prompt(analysis, previous_report),
+            self._get_system_prompt(),
+            json_mode=True,
+            max_tokens=Config.LLM_MAX_TOKENS_LARGE,
+        )
+        spec = FeatureSpec(target_column=self.target_column)
+        actions_taken = self._execute_llm_decisions(llm_response, spec=spec)
+
+        self.df.to_parquet(Config.ENGINEERED_DATA_PATH, compression="snappy", index=False)
         self.logger.log(self.name, "Data Saved", f"Engineered data saved to {Config.ENGINEERED_DATA_PATH}")
 
         report = {
             "agent": self.name,
-            "original_shape": original_shape,
-            "final_shape": self.df.shape,
+            "mode": "single",
+            "original_shape": list(original_shape),
+            "final_shape": list(self.df.shape),
             "actions_taken": actions_taken,
             "summary": self._generate_summary(actions_taken),
             "final_features": list(self.df.columns),
-            # Forward key column info from DataCleaner for downstream agents
             "entity_id_col": previous_report.get("entity_id_col"),
             "composite_key_cols": previous_report.get("composite_key_cols", []),
             "target_column": self.target_column,
+            "feature_spec": spec.to_dict(),
         }
         self.save_report(report, Config.FEATURE_ENGINEER_REPORT_PATH)
-
-        if _SPLIT_MARKER in self.df.columns:
-            split_sizes = self.df[_SPLIT_MARKER].value_counts().to_dict()
-            self.logger.log(self.name, "Process Complete",
-                f"Shape: {original_shape} -> {self.df.shape} | splits: {split_sizes}")
-        else:
-            self.logger.log(self.name, "Process Complete", f"Shape: {original_shape} -> {self.df.shape}")
+        self.logger.log(self.name, "Process Complete", f"Shape: {original_shape} -> {self.df.shape}")
         return Config.ENGINEERED_DATA_PATH, report
 
     def _analyze_features(self) -> Dict[str, Any]:
-        # Stats for the LLM prompt are derived from TRAIN rows only in pre-split
-        # mode — valid/oot are intentionally excluded to avoid leakage in the
-        # feature-engineering decisions (which interactions to create, etc.).
-        train_view = self._train_view()
-        numeric_cols = train_view.select_dtypes(include=[np.number]).columns.tolist()
-        categorical_cols = train_view.select_dtypes(exclude=[np.number]).columns.tolist()
+        """Build stats for the LLM prompt from self.df. In split mode self.df IS train."""
+        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+        categorical_cols = self.df.select_dtypes(exclude=[np.number]).columns.tolist()
 
         exclude = self._protected_cols | {self.target_column}
         numeric_cols = [c for c in numeric_cols if c not in exclude]
@@ -575,7 +699,7 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             Config.FEATURE_META_MAX_NUMERIC_COLS,
         )
         for col in numeric_cols[:numeric_limit]:
-            s = train_view[col]
+            s = self.df[col]
             non_null = s.dropna()
             entry: Dict[str, Any] = {
                 "null_pct": round(float(s.isnull().mean() * 100), 2),
@@ -592,7 +716,7 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
 
         categorical_meta: Dict[str, Any] = {}
         for col in categorical_cols[:Config.FEATURE_META_MAX_CATEGORICAL_COLS]:
-            s = train_view[col]
+            s = self.df[col]
             top_vals = s.value_counts().head(5).to_dict()
             entry = {
                 "null_pct": round(float(s.isnull().mean() * 100), 2),
@@ -696,9 +820,21 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             TARGET_COLUMN=self.target_column,
         )
 
-    def _execute_llm_decisions(self, llm_response: str) -> List[str]:
+    def _execute_llm_decisions(self, llm_response: str, spec: Optional["FeatureSpec"] = None) -> List[str]:
+        """Apply LLM feature-engineering decisions AND populate `spec` for valid/oot replay.
+
+        Captures into spec:
+          - create_interaction → spec.interactions (new_col, expression, train_median fill)
+          - encode_categorical (label) → spec.label_encoders[col]
+          - encode_categorical (onehot) → spec.onehot_columns[col]
+          - encode_all_categorical → spec.label_encoders / spec.onehot_columns (batch)
+          - select_top_features → spec.selected_features
+          - correlation_analysis: logged only, no transform recorded
+        """
+        if spec is None:
+            spec = FeatureSpec(target_column=self.target_column)
         self.logger.log(self.name, "LLM Decision", "Parsing feature engineering decisions")
-        actions_taken = []
+        actions_taken: List[str] = []
 
         try:
             decisions = json.loads(self._extract_json(llm_response))
@@ -721,12 +857,19 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
                             self.logger.log(self.name, f"SKIP {action_type}",
                                 f"Expression references a protected column — skipped: {expression}")
                             continue
-                        self.df = self.execute_tool("create_interaction", df=self.df, new_col=new_col, expression=expression)
+                        self._last_interaction_fill = 0.0
+                        self.df = self.execute_tool("create_interaction", df=self.df,
+                                                    new_col=new_col, expression=expression)
+                        spec.interactions.append((new_col, expression, float(self._last_interaction_fill)))
                         actions_taken.append(f"Created feature '{new_col}': {reason}")
 
                     elif action_type == "encode_all_categorical":
                         method = action_spec.get("method", "label")
+                        self._batch_label_encoders = {}
+                        self._batch_onehot_cols = {}
                         self.df = self.execute_tool("encode_all_categorical", df=self.df, method=method)
+                        spec.label_encoders.update(self._batch_label_encoders)
+                        spec.onehot_columns.update(self._batch_onehot_cols)
                         actions_taken.append(f"Encoded all categorical columns with {method}: {reason}")
 
                     elif action_type == "encode_categorical":
@@ -736,7 +879,14 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
                                 f"'{column}' is a protected key column — skipped")
                             continue
                         method = action_spec.get("method", "label")
-                        self.df = self.execute_tool("encode_categorical", df=self.df, col=column, method=method)
+                        self._last_label_encoder = None
+                        self._last_onehot_cols = None
+                        self.df = self.execute_tool("encode_categorical", df=self.df,
+                                                    col=column, method=method)
+                        if method == "label" and self._last_label_encoder is not None:
+                            spec.label_encoders[column] = self._last_label_encoder
+                        elif method == "onehot" and self._last_onehot_cols is not None:
+                            spec.onehot_columns[column] = self._last_onehot_cols
                         actions_taken.append(f"Encoded '{column}' with {method}: {reason}")
 
                     elif action_type == "correlation_analysis":
@@ -752,13 +902,20 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
                             for col in self._protected_cols
                             if col in self.df.columns
                         }
-                        self.df = self.execute_tool("select_top_features", df=self.df, target=self.target_column, k=k)
+                        self._last_selected_features = None
+                        self.df = self.execute_tool("select_top_features", df=self.df,
+                                                    target=self.target_column, k=k)
                         # Re-add any protected cols that were removed by selection
+                        restored: List[str] = []
                         for col, series in protected_snapshot.items():
                             if col not in self.df.columns:
                                 self.df[col] = series.values
+                                restored.append(col)
                                 self.logger.log(self.name, "Protected Col Restored",
                                     f"Re-added '{col}' (composite key / entity ID) after feature selection")
+                        # Capture the FINAL column list (including restored protected cols)
+                        # so transform applies the same selection to valid/oot
+                        spec.selected_features = list(self.df.columns)
                         actions_taken.append(f"Selected top {k} features: {reason}")
 
                     else:
@@ -773,17 +930,20 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             self.logger.log(self.name, "ERROR", f"Failed to parse LLM response: {e}")
             self.logger.log(self.name, "Raw Response", llm_response[:500])
             actions_taken.append("ERROR: Could not parse LLM decisions, performed basic encoding")
-            self._fallback_engineering()
+            self._fallback_engineering(spec)
 
         return actions_taken
 
-    def _fallback_engineering(self):
+    def _fallback_engineering(self, spec: Optional["FeatureSpec"] = None):
         categorical_cols = self.df.select_dtypes(exclude=[np.number]).columns.tolist()
         skip = self._protected_cols | {self.target_column}
         for col in categorical_cols:
             if col in skip:
                 continue
+            self._last_label_encoder = None
             self.df = self._tool_encode_categorical(self.df, col, "label")
+            if spec is not None and self._last_label_encoder is not None:
+                spec.label_encoders[col] = self._last_label_encoder
             self.logger.log(self.name, "Fallback", f"Label encoded {col}")
 
     def _generate_summary(self, actions: List[str]) -> str:

@@ -1147,6 +1147,62 @@ if __name__ == "__main__":
         Path(Config.FINAL_MODEL_CODE_PATH).write_text(code, encoding="utf-8")
         self.logger.log(self.name, "Model Code Saved", Config.FINAL_MODEL_CODE_PATH)
 
+    # ── Split-mode entry point ────────────────────────────────────────────────
+
+    def process_splits(
+        self,
+        train_path: str,
+        previous_report: Dict[str, Any],
+        target_column: str,
+        valid_path: Optional[str] = None,
+        oot_path: Optional[str] = None,
+        date_col: Optional[str] = None,
+        id_col: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Load 3 pre-engineered partitions, add `_split_` marker, dispatch to `process`.
+
+        This is the only place in the pipeline where train + valid + oot live in
+        the same DataFrame — concat happens here because the downstream feature-
+        selection / training steps (FLAML / Optuna / CV / PSI / Stability) need
+        all three slices to compute their metrics.
+
+        The marker drives `_tool_split_data`'s pre-split branch to reconstruct
+        the user-supplied splits exactly as provided.
+        """
+        import gc
+
+        self.logger.log(self.name, "process_splits start",
+            f"train={train_path} | valid={valid_path} | oot={oot_path}")
+
+        frames: List[pd.DataFrame] = []
+        sizes: Dict[str, int] = {}
+        for tag, path in [("train", train_path), ("valid", valid_path), ("oot", oot_path)]:
+            if path is None:
+                continue
+            sub = self.load_dataframe(path)
+            sub[_SPLIT_MARKER] = tag
+            sizes[tag] = len(sub)
+            frames.append(sub)
+            self.logger.log(self.name, f"Loaded {tag}", f"shape={sub.shape} | path={path}")
+
+        if not frames:
+            raise ValueError("process_splits called with no input paths")
+
+        df = pd.concat(frames, ignore_index=True)
+        del frames
+        gc.collect()
+        self.logger.log(self.name, "Concat done",
+            f"combined shape={df.shape} | sizes={sizes}")
+
+        return self.process(
+            df=df,
+            previous_report=previous_report,
+            target_column=target_column,
+            date_col=date_col,
+            id_col=id_col,
+            oot_df=None,  # OOT comes through the marker — never via oot_df arg
+        )
+
     # ── Main process ──────────────────────────────────────────────────────────
 
     def process(

@@ -36,10 +36,11 @@ Examples:
       --col-desc data/HomeCredit_columns_description.csv \\
       --col-name-field Row --col-desc-field Description --col-group-field Table
 
-  # With pre-split OOT dataset (legacy — OOT bypasses Agents 1+2)
+  # Split mode (train + oot)
   python main.py data/train.parquet TARGET --oot data/oot.parquet
 
-  # Pre-split mode — train + valid + oot all preserved exactly
+  # Split mode — train + valid + oot all preserved exactly
+  # Each agent FITS on train, TRANSFORMS valid + oot (no concat)
   python main.py data/train.parquet TARGET \\
       --valid data/valid.parquet --oot data/oot.parquet \\
       --domain credit_risk --entity-id customer_id --keys customer_id,snap_dt
@@ -76,30 +77,33 @@ Examples:
     )
     parser.add_argument(
         "--valid", metavar="PATH", dest="valid_path", default=None,
-        help="Pre-split VALID dataset. When provided, switches to PRE-SPLIT MODE: "
-             "input_path (train) + this file + --oot are concatenated with a "
-             "`_split_` marker so Agents 1+2 apply identical cleaning + feature "
-             "engineering to every partition; Agent 3 then reconstructs the exact "
-             "user-defined train/valid/oot via the marker.",
+        help="Pre-split VALID dataset. When provided (with or without --oot), "
+             "switches to SPLIT MODE: Agent 1 FITS its cleaning pipeline on "
+             "train only, then REPLAYS the same transforms on valid (and oot). "
+             "Agent 2 follows the same fit-on-train / transform-on-valid pattern. "
+             "Agent 3 concatenates the 3 cleaned + engineered files and reconstructs "
+             "the exact user-defined train/valid/oot. Memory peak = size of the "
+             "largest single partition (not the sum).",
     )
     parser.add_argument(
         "--oot", metavar="PATH", dest="oot_path", default=None,
         help="Pre-split OOT dataset (.csv / .parquet / .feather / .xlsx). "
-             "Without --valid: legacy behaviour — pool input_path 80/20 + raw OOT (bypasses Agents 1+2). "
-             "With --valid: OOT joins the concat + marker flow.",
+             "Triggers SPLIT MODE (see --valid). Agent 1+2 transforms it "
+             "using the spec fitted on train.",
     )
     parser.add_argument(
         "--sample-ratio", metavar="RATIO", type=float, dest="train_sample_ratio", default=None,
         help="Stratified sample fraction (0 < ratio < 1) applied to TRAIN only "
-             "in pre-split mode (--valid or --oot set). Valid / OOT kept intact. "
+             "in split mode (--valid or --oot set). Valid / OOT kept intact. "
              "Useful for very wide datasets that OOM during cleaning. "
              "Example: --sample-ratio 0.3 keeps 30%% of train rows.",
     )
     parser.add_argument(
         "--no-prefilter", action="store_false", dest="prefilter", default=True,
         help="Disable column pre-filter (default: on). Pre-filter drops "
-             "constant / near-constant / mostly-null columns from train "
-             "before combining; the same filter applies to valid/oot. "
+             "constant / near-constant / mostly-null columns from TRAIN "
+             "before the LLM analysis; the same drops are captured in "
+             "CleaningSpec and replayed on valid/oot during transform. "
              "Thresholds: PREFILTER_MAX_NULL_RATIO / PREFILTER_MAX_DOMINANT_RATIO in Config.",
     )
     parser.add_argument(
@@ -163,9 +167,20 @@ def _print_metrics(final_metrics: dict) -> None:
 
 def _print_files() -> None:
     print("\nGenerated Files:")
+    # Show whichever per-mode set of intermediate files actually exists. In split mode
+    # there are 3 per stage (train/valid/oot). In single mode there's just one.
     files = [
-        (Config.CLEAN_DATA_PATH,                               "Cleaned dataset           — Agent 1"),
-        (Config.ENGINEERED_DATA_PATH,                          "Engineered features       — Agent 2"),
+        # Single-file mode artifacts (one DataFrame per stage)
+        (Config.CLEAN_DATA_PATH,                               "Cleaned dataset           — Agent 1 (single)"),
+        (Config.ENGINEERED_DATA_PATH,                          "Engineered features       — Agent 2 (single)"),
+        # Split-mode artifacts (per-partition)
+        (Config.CLEAN_TRAIN_PATH,                              "Cleaned train             — Agent 1 (split)"),
+        (Config.CLEAN_VALID_PATH,                              "Cleaned valid             — Agent 1 (split)"),
+        (Config.CLEAN_OOT_PATH,                                "Cleaned oot               — Agent 1 (split)"),
+        (Config.ENGINEERED_TRAIN_PATH,                         "Engineered train          — Agent 2 (split)"),
+        (Config.ENGINEERED_VALID_PATH,                         "Engineered valid          — Agent 2 (split)"),
+        (Config.ENGINEERED_OOT_PATH,                           "Engineered oot            — Agent 2 (split)"),
+        # Shared artifacts
         (Config.DATA_CLEANER_REPORT_PATH,                      "Data cleaner report       — Agent 1"),
         (Config.FEATURE_ENGINEER_REPORT_PATH,                  "Feature engineer report   — Agent 2"),
         (Config.MODEL_TRAINER_REPORT_PATH,                     "Model trainer report      — Agent 3"),
@@ -178,8 +193,9 @@ def _print_files() -> None:
         (Config.EXECUTION_LOG_PATH,                            "Agent execution log"),
     ]
     for filepath, description in files:
-        mark = "✓" if Path(filepath).exists() else "✗"
-        print(f"  {mark} {filepath:<47} {description}")
+        if not Path(filepath).exists():
+            continue   # only print files that were actually produced this run
+        print(f"  + {filepath:<55} {description}")
 
 
 def main() -> None:

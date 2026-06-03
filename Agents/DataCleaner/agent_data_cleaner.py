@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, List, Optional
 import json
 from Agents.BaseAgent.base_agent import BaseAgent, ToolRegistry
@@ -8,9 +9,55 @@ from logger import AgentLogger
 from config import Config
 
 
-# Marker column used in pre-split mode (set by AutoMLPipeline._build_combined_input).
-# Always protected from drop/encode/dtype-fix in every agent.
-_SPLIT_MARKER = "_split_"
+@dataclass
+class CleaningSpec:
+    """Deterministic transforms captured from TRAIN, replayed on VALID/OOT.
+
+    Row-only operations (drop_duplicates, deduplicate_by_key) are intentionally
+    excluded from the spec — they're train-only concerns. Valid/oot keep
+    their exact original row counts so evaluation metrics stay honest.
+    """
+    drops:        List[str]                       = field(default_factory=list)
+    dtype_fixes:  List[Tuple[str, str]]           = field(default_factory=list)
+    clip_bounds:  Dict[str, Tuple[float, float]]  = field(default_factory=dict)
+
+    def apply(self, df: pd.DataFrame, logger=None, name: str = "") -> pd.DataFrame:
+        """Replay every captured column transform on `df` in fit-time order."""
+        cols_to_drop = [c for c in self.drops if c in df.columns]
+        if cols_to_drop:
+            df = df.drop(columns=cols_to_drop)
+            if logger is not None:
+                logger.log(name, "Transform drops",
+                    f"Dropped {len(cols_to_drop)} cols (from spec.drops, total spec={len(self.drops)})")
+
+        for col, fix_type in self.dtype_fixes:
+            if col not in df.columns:
+                continue
+            try:
+                if fix_type == "cast_to_numeric":
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                elif fix_type == "cast_to_datetime":
+                    df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=False)
+                elif fix_type == "strip_whitespace" and df[col].dtype == object:
+                    df[col] = df[col].str.strip()
+                elif fix_type == "standardize_case" and df[col].dtype == object:
+                    df[col] = df[col].str.lower()
+            except Exception as e:
+                if logger is not None:
+                    logger.log(name, "Transform WARN",
+                        f"dtype_fix '{fix_type}' on '{col}' failed: {e}")
+
+        for col, (lower, upper) in self.clip_bounds.items():
+            if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].clip(lower=lower, upper=upper)
+        return df
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "drops": list(self.drops),
+            "dtype_fixes": [list(t) for t in self.dtype_fixes],
+            "clip_bounds": {c: list(b) for c, b in self.clip_bounds.items()},
+        }
 
 
 class DataCleanerAgent(BaseAgent):
@@ -29,6 +76,8 @@ class DataCleanerAgent(BaseAgent):
         self._entity_id_col: Optional[str] = entity_id_col
         self._composite_key_cols: List[str] = list(composite_key_cols) if composite_key_cols else []
         self._target_column: Optional[str] = target_column
+        # Set by _tool_clip_outliers so _execute_llm_decisions can record (lower, upper) in the spec.
+        self._last_clip_bounds: Optional[Tuple[float, float]] = None
         self._register_tools()
 
     def _register_tools(self):
@@ -237,29 +286,24 @@ class DataCleanerAgent(BaseAgent):
         return df
 
     def _tool_clip_outliers(self, df: pd.DataFrame, col: str, factor: float = 3.0) -> pd.DataFrame:
-        """Clip values to ±factor × IQR.
+        """Clip values to ±factor × IQR. Q1/Q3 computed on the df passed in.
 
-        FIT-on-train, TRANSFORM-on-all:
-          - When `_split_` marker exists, Q1/Q3 are computed on TRAIN rows
-            only so valid/oot do not leak into the clipping bounds. The
-            bounds are then applied to the FULL frame.
-          - Otherwise (no marker), Q1/Q3 are computed on the whole frame.
+        Bounds are stored on `self._last_clip_bounds` so the caller (typically
+        `_execute_llm_decisions`) can record them into a CleaningSpec and
+        replay the same clip on valid/oot via `CleaningSpec.apply`.
         """
         if col not in df.columns:
             raise ValueError(f"Column '{col}' not found")
         if not pd.api.types.is_numeric_dtype(df[col]):
             raise ValueError(f"Column '{col}' is not numeric")
 
-        if _SPLIT_MARKER in df.columns:
-            train_vals = df.loc[df[_SPLIT_MARKER] == "train", col]
-            if len(train_vals.dropna()) < 2:
-                train_vals = df[col]   # too few train rows — fall back to full
-        else:
-            train_vals = df[col]
-
-        q1, q3 = train_vals.quantile(0.25), train_vals.quantile(0.75)
+        series = df[col].dropna()
+        q1 = float(series.quantile(0.25))
+        q3 = float(series.quantile(0.75))
         iqr = q3 - q1
-        df[col] = df[col].clip(lower=q1 - factor * iqr, upper=q3 + factor * iqr)
+        lower, upper = q1 - factor * iqr, q3 + factor * iqr
+        df[col] = df[col].clip(lower=lower, upper=upper)
+        self._last_clip_bounds = (lower, upper)
         return df
 
     def _tool_check_pk_uniqueness(
@@ -446,17 +490,15 @@ class DataCleanerAgent(BaseAgent):
     _DATE_NAME_KEYWORDS = ("date", "dt", "time", "timestamp", "snap", "period", "month", "year", "week", "day")
 
     def _tool_check_column_formats(self, df: pd.DataFrame) -> str:
-        # Columns excluded from format checks — PK, composite keys, target, and the
-        # _split_ marker (when pre-split mode is active). Target is excluded because
-        # _execute_llm_decisions blocks fixes on it anyway; reporting format issues
-        # for target would waste LLM tokens on unfixable items.
+        # Columns excluded from format checks — PK, composite keys, target.
+        # Target is excluded because _execute_llm_decisions blocks fixes on it
+        # anyway; reporting format issues for target would waste LLM tokens on
+        # unfixable items.
         protected: set = set(self._composite_key_cols)
         if self._entity_id_col:
             protected.add(self._entity_id_col)
         if self._target_column:
             protected.add(self._target_column)
-        if _SPLIT_MARKER in df.columns:
-            protected.add(_SPLIT_MARKER)
 
         issues: Dict[str, list] = {}
         for col in df.columns:
@@ -563,84 +605,239 @@ class DataCleanerAgent(BaseAgent):
             )
         return df
 
-    def _train_view(self) -> pd.DataFrame:
-        """Return rows where marker == 'train' (pre-split mode) OR full df.
+    # ── Pre-filter helper ────────────────────────────────────────────────
+    # Used inside fit_transform to deterministically remove obviously useless
+    # cols from train BEFORE the LLM analysis. The same drops are recorded in
+    # CleaningSpec so valid/oot drop the same columns during transform.
+    def _scan_prefilter_drops(self, df: pd.DataFrame, protected: set) -> Tuple[List[str], Dict[str, int]]:
+        """Return (cols_to_drop, drop_stats_by_reason). Protected cols never dropped."""
+        n_total = len(df) if len(df) > 0 else 1
+        null_thr = Config.PREFILTER_MAX_NULL_RATIO
+        dom_thr  = Config.PREFILTER_MAX_DOMINANT_RATIO
+        drops: List[str] = []
+        n_dropped = {"null": 0, "constant": 0, "dominant": 0}
 
-        All decisions / statistics are computed on this view to avoid data
-        leakage from valid + oot. Actions are still applied to self.df
-        (full combined frame), so the transformation derived from train
-        propagates to valid + oot during writing.
+        for col in df.columns:
+            if col in protected:
+                continue
+            s = df[col]
+            null_ratio = s.isnull().sum() / n_total
+            if null_ratio > null_thr:
+                drops.append(col); n_dropped["null"] += 1; continue
+            non_null = s.dropna()
+            nunique = non_null.nunique()
+            if nunique <= 1:
+                drops.append(col); n_dropped["constant"] += 1; continue
+            if nunique <= 1000:
+                try:
+                    top_count = non_null.value_counts(dropna=True).iloc[0]
+                    if top_count / len(non_null) > dom_thr:
+                        drops.append(col); n_dropped["dominant"] += 1
+                except Exception:
+                    pass
+        return drops, n_dropped
+
+    def _stratified_sample_positions(self, df: pd.DataFrame, target_col: str,
+                                      ratio: float) -> np.ndarray:
+        """Return SORTED row positions for a stratified sample of `df`.
+
+        Computed in-place without materialising the sampled DataFrame, so the
+        caller can iloc one chunk at a time when writing to disk.
         """
-        if _SPLIT_MARKER in self.df.columns:
-            view = self.df[self.df[_SPLIT_MARKER] == "train"]
-            if len(view) > 0:
-                return view
-        return self.df
+        rs = Config.RANDOM_STATE
+        rng = np.random.default_rng(rs)
+        n_rows = len(df)
+        if target_col is None or target_col not in df.columns or df[target_col].nunique() < 2:
+            n = max(1, int(n_rows * ratio))
+            pos = rng.choice(n_rows, n, replace=False); pos.sort()
+            self.logger.log(self.name, "Sample positions",
+                f"random | total={len(pos)} (of {n_rows})")
+            return pos
+        target_arr = df[target_col].to_numpy()
+        chunks = []
+        summary = {}
+        for cls in np.unique(target_arr):
+            cls_pos = np.where(target_arr == cls)[0]
+            n_cls = max(1, int(len(cls_pos) * ratio))
+            chosen = rng.choice(cls_pos, n_cls, replace=False)
+            chunks.append(chosen)
+            summary[str(cls)] = (len(cls_pos), n_cls)
+        positions = np.concatenate(chunks); positions.sort()
+        self.logger.log(self.name, "Sample positions",
+            f"stratified | per-class={summary} | total={len(positions)}")
+        return positions
 
-    def process(self, input_path: str) -> Tuple[str, Dict[str, Any]]:
-        """Returns (path_to_clean_data, report_dict).
+    # ── FIT / TRANSFORM API ───────────────────────────────────────────────
 
-        Accepts any format supported by BaseAgent.load_dataframe:
-        .csv, .tsv, .parquet, .orc, .feather, .xlsx, .xls, .xlsm, .json
-        and remote paths (s3://, gs://, az://).
+    def fit_transform(
+        self,
+        train_path: str,
+        prefilter: bool = True,
+        train_sample_ratio: Optional[float] = None,
+    ) -> Tuple[pd.DataFrame, CleaningSpec, List[str], Tuple[int, int]]:
+        """Run pre-filter + LLM cleaning on TRAIN. Return cleaned df + replay spec.
 
-        Pre-split mode (combined input has `_split_` marker):
-            - All stats and LLM decisions derive from TRAIN portion only
-              (no leakage from valid/oot).
-            - Actions (drop_column / fix_dtype / clip_outliers / dedup) are
-              applied to the FULL combined frame so train + valid + oot
-              receive identical cleaning.
+        Returns:
+            (clean_train_df, CleaningSpec, actions_taken, original_shape)
+
+        The spec captures every column transform (drops, dtype fixes, clip bounds)
+        applied to train. Replay on valid/oot via `CleaningSpec.apply(df)`.
+
+        Row-only operations (drop_duplicates, deduplicate_by_key) are applied to
+        train but NOT recorded in the spec — those belong only to training data.
         """
-        self.logger.log(self.name, "Process Start", f"Loading data from {input_path}")
-
-        self.df = self.load_dataframe(input_path)
+        self.logger.log(self.name, "fit_transform start", f"Loading train from {train_path}")
+        self.df = self.load_dataframe(train_path)
         original_shape = self.df.shape
 
-        # Train-only view drives every analysis below; self.df is full combined
-        train_df = self._train_view()
-        if train_df is not self.df:
-            self.logger.log(self.name, "Train view",
-                f"Pre-split detected — analysing TRAIN only ({len(train_df)} of {len(self.df)} rows)")
+        # ── Optional stratified sampling (memory mitigation) ─────────────
+        if train_sample_ratio is not None and 0 < train_sample_ratio < 1:
+            self.logger.log(self.name, "Sample start",
+                f"ratio={train_sample_ratio:.2f} | input rows={len(self.df)}")
+            positions = self._stratified_sample_positions(
+                self.df, self._target_column, train_sample_ratio)
+            self.df = self.df.iloc[positions].reset_index(drop=True)
+            self.logger.log(self.name, "Sample done",
+                f"sampled rows={len(self.df)} (from {original_shape[0]})")
 
-        metadata = self.execute_tool("inspect_metadata", df=train_df)
-        label_stats = self._collect_label_stats(train_df)
-        pk_stats = self._collect_pk_stats(train_df)
-        format_stats = self.execute_tool("check_column_formats", df=train_df)
-        outlier_stats = self._collect_outlier_stats(train_df)
-        temporal_stats = self._collect_temporal_stats(train_df)
+        # ── Pre-filter (deterministic column drops) ──────────────────────
+        spec = CleaningSpec()
+        if prefilter:
+            protected = self._pk_protected_cols
+            prefilter_drops, drop_stats = self._scan_prefilter_drops(self.df, protected)
+            if prefilter_drops:
+                self.df = self.df.drop(columns=prefilter_drops)
+                spec.drops.extend(prefilter_drops)
+                self.logger.log(self.name, "Pre-filter",
+                    f"dropped {len(prefilter_drops)} cols (null>{Config.PREFILTER_MAX_NULL_RATIO:.0%}"
+                    f"={drop_stats['null']} | constant={drop_stats['constant']} | "
+                    f"dominant>{Config.PREFILTER_MAX_DOMINANT_RATIO:.0%}={drop_stats['dominant']}) "
+                    f"| remaining={self.df.shape[1]}")
+
+        # ── LLM analysis + decisions ─────────────────────────────────────
+        metadata = self.execute_tool("inspect_metadata", df=self.df)
+        label_stats = self._collect_label_stats()
+        pk_stats = self._collect_pk_stats()
+        format_stats = self.execute_tool("check_column_formats", df=self.df)
+        outlier_stats = self._collect_outlier_stats()
+        temporal_stats = self._collect_temporal_stats()
 
         llm_response = self.call_llm(
-            self._build_analysis_prompt(metadata, format_stats, outlier_stats, label_stats, temporal_stats, pk_stats),
+            self._build_analysis_prompt(metadata, format_stats, outlier_stats,
+                                        label_stats, temporal_stats, pk_stats),
             self._get_system_prompt(),
             json_mode=True,
             max_tokens=Config.LLM_MAX_TOKENS_LARGE,
         )
-        actions_taken = self._execute_llm_decisions(llm_response)
+        actions_taken = self._execute_llm_decisions(llm_response, spec=spec)
+        return self.df, spec, actions_taken, original_shape
+
+    def transform(self, df: pd.DataFrame, spec: CleaningSpec) -> pd.DataFrame:
+        """Apply a captured CleaningSpec to valid/oot. No LLM, no row drops."""
+        return spec.apply(df, logger=self.logger, name=self.name)
+
+    def process_splits(
+        self,
+        train_path: str,
+        valid_path: Optional[str] = None,
+        oot_path: Optional[str] = None,
+        prefilter: bool = True,
+        train_sample_ratio: Optional[float] = None,
+    ) -> Tuple[Dict[str, Optional[str]], Dict[str, Any]]:
+        """Pre-split mode entry point. Fit on train, transform valid/oot one at a time.
+
+        Returns ({"train": path, "valid": path|None, "oot": path|None}, report).
+
+        Memory profile: only ONE partition lives in pandas at any moment.
+        Train is cleaned + saved, then released before valid is loaded.
+        """
+        import gc
+
+        # ── Fit on train ─────────────────────────────────────────────────
+        train_df, spec, actions_taken, original_shape = self.fit_transform(
+            train_path, prefilter=prefilter, train_sample_ratio=train_sample_ratio)
+
+        Path(Config.CLEAN_TRAIN_PATH).parent.mkdir(exist_ok=True)
+        train_df.to_parquet(Config.CLEAN_TRAIN_PATH, compression="snappy", index=False)
+        self.logger.log(self.name, "Train saved",
+            f"shape={train_df.shape} | path={Config.CLEAN_TRAIN_PATH}")
+        train_final_shape = train_df.shape
+        train_columns = list(train_df.columns)
+        del train_df, self.df
+        self.df = None
+        gc.collect()
+
+        # ── Transform valid + oot independently ──────────────────────────
+        out_paths: Dict[str, Optional[str]] = {
+            "train": Config.CLEAN_TRAIN_PATH, "valid": None, "oot": None,
+        }
+        for tag, in_path, out_path in [
+            ("valid", valid_path, Config.CLEAN_VALID_PATH),
+            ("oot",   oot_path,   Config.CLEAN_OOT_PATH),
+        ]:
+            if in_path is None:
+                continue
+            self.logger.log(self.name, f"Transform {tag} start", f"path={in_path}")
+            df = self.load_dataframe(in_path)
+            orig = df.shape
+            df = self.transform(df, spec)
+            df.to_parquet(out_path, compression="snappy", index=False)
+            self.logger.log(self.name, f"Transform {tag} done",
+                f"shape {orig} -> {df.shape} | saved={out_path}")
+            out_paths[tag] = out_path
+            del df
+            gc.collect()
+
+        # ── Report ───────────────────────────────────────────────────────
+        report = {
+            "agent": self.name,
+            "mode": "split",
+            "original_shape": list(original_shape),
+            "final_shape": list(train_final_shape),
+            "actions_taken": actions_taken,
+            "summary": self._generate_summary(actions_taken),
+            "columns_remaining": train_columns,
+            "entity_id_col": self._entity_id_col,
+            "composite_key_cols": self._composite_key_cols,
+            "target_column": self._target_column,
+            "out_paths": {k: v for k, v in out_paths.items() if v is not None},
+            "cleaning_spec": spec.to_dict(),
+        }
+        self.save_report(report, Config.DATA_CLEANER_REPORT_PATH)
+        self.logger.log(self.name, "Process Complete",
+            f"train={train_final_shape} | valid={'y' if out_paths['valid'] else '-'} "
+            f"| oot={'y' if out_paths['oot'] else '-'}")
+        return out_paths, report
+
+    def process(self, input_path: str) -> Tuple[str, Dict[str, Any]]:
+        """Single-file mode: load + clean + save one combined file.
+
+        Used when no valid_path / oot_path was supplied to the pipeline.
+        Agent 3 will then perform an auto-split (temporal OOT or 60/20/20).
+        """
+        self.logger.log(self.name, "Process Start", f"Loading data from {input_path}")
+        clean_df, spec, actions_taken, original_shape = self.fit_transform(
+            input_path, prefilter=True, train_sample_ratio=None)
 
         Path(Config.CLEAN_DATA_PATH).parent.mkdir(exist_ok=True)
-        self.df.to_csv(Config.CLEAN_DATA_PATH, index=False)
+        clean_df.to_parquet(Config.CLEAN_DATA_PATH, compression="snappy", index=False)
         self.logger.log(self.name, "Data Saved", f"Cleaned data saved to {Config.CLEAN_DATA_PATH}")
 
         report = {
             "agent": self.name,
-            "original_shape": original_shape,
-            "final_shape": self.df.shape,
+            "mode": "single",
+            "original_shape": list(original_shape),
+            "final_shape": list(clean_df.shape),
             "actions_taken": actions_taken,
             "summary": self._generate_summary(actions_taken),
-            "columns_remaining": list(self.df.columns),
+            "columns_remaining": list(clean_df.columns),
             "entity_id_col": self._entity_id_col,
             "composite_key_cols": self._composite_key_cols,
             "target_column": self._target_column,
+            "cleaning_spec": spec.to_dict(),
         }
         self.save_report(report, Config.DATA_CLEANER_REPORT_PATH)
-
-        # If pre-split mode, report train-only sizes too for transparency
-        if _SPLIT_MARKER in self.df.columns:
-            split_sizes = self.df[_SPLIT_MARKER].value_counts().to_dict()
-            self.logger.log(self.name, "Process Complete",
-                f"Shape: {original_shape} -> {self.df.shape} | splits: {split_sizes}")
-        else:
-            self.logger.log(self.name, "Process Complete", f"Shape: {original_shape} -> {self.df.shape}")
+        self.logger.log(self.name, "Process Complete", f"Shape: {original_shape} -> {clean_df.shape}")
         return Config.CLEAN_DATA_PATH, report
 
     def _collect_outlier_stats(self, df: Optional[pd.DataFrame] = None) -> str:
@@ -918,9 +1115,21 @@ class DataCleanerAgent(BaseAgent):
             OPTIONAL_SECTIONS=optional_sections,
         )
 
-    def _execute_llm_decisions(self, llm_response: str) -> List[str]:
+    def _execute_llm_decisions(self, llm_response: str, spec: Optional["CleaningSpec"] = None) -> List[str]:
+        """Apply LLM decisions to self.df AND record transferable transforms in `spec`.
+
+        `spec` captures everything that must be replayed on valid/oot:
+          - drop_column → spec.drops
+          - fix_column_dtype → spec.dtype_fixes
+          - clip_outliers → spec.clip_bounds (Q1/Q3 from train)
+
+        Row-only ops (drop_duplicates / deduplicate_by_key) are applied to train
+        but NOT recorded in the spec — those belong to the training set only.
+        """
+        if spec is None:
+            spec = CleaningSpec()
         self.logger.log(self.name, "LLM Decision", "Parsing decisions from LLM response")
-        actions_taken = []
+        actions_taken: List[str] = []
 
         try:
             decisions = json.loads(self._extract_json(llm_response))
@@ -939,11 +1148,6 @@ class DataCleanerAgent(BaseAgent):
                             self.logger.log(self.name, f"SKIP {action_type}",
                                 f"'{column}' is a PK/composite-key column — drop blocked")
                             continue
-                        # Hard guard: only allow drop when the column genuinely qualifies.
-                        # Legitimate reasons: (a) null_rate > threshold, OR
-                        #                     (b) constant (zero variance), OR
-                        #                     (c) all-unique surrogate ID (row index / txn key)
-                        # Everything else → block; feature selection belongs to Agent 2.
                         if column in self.df.columns:
                             null_rate = self.df[column].isnull().mean()
                             is_constant = self.df[column].dropna().nunique() <= 1
@@ -957,11 +1161,13 @@ class DataCleanerAgent(BaseAgent):
                                     f"not constant, not all-unique — drop blocked (reason from LLM: {reason})")
                                 continue
                         self.df = self.execute_tool("drop_column", df=self.df, col=column)
+                        spec.drops.append(column)
                         actions_taken.append(f"Dropped column '{column}': {reason}")
 
                     elif action_type == "drop_duplicates":
+                        # ROW op — applies to train only, not recorded in spec.
                         self.df = self.execute_tool("drop_duplicates", df=self.df)
-                        actions_taken.append(f"Dropped duplicate rows: {reason}")
+                        actions_taken.append(f"Dropped duplicate rows (TRAIN-only): {reason}")
 
                     elif action_type == "clip_outliers":
                         if column in self._pk_protected_cols:
@@ -969,10 +1175,14 @@ class DataCleanerAgent(BaseAgent):
                                 f"'{column}' is a PK/composite-key column — clip blocked")
                             continue
                         factor = float(action_spec.get("factor", 3.0))
+                        self._last_clip_bounds = None
                         self.df = self.execute_tool("clip_outliers", df=self.df, col=column, factor=factor)
+                        if self._last_clip_bounds is not None:
+                            spec.clip_bounds[column] = self._last_clip_bounds
                         actions_taken.append(f"Clipped outliers in '{column}' (factor={factor}): {reason}")
 
                     elif action_type == "deduplicate_by_key":
+                        # ROW op — applies to train only, not recorded in spec.
                         key_cols = action_spec.get("columns", [])
                         keep = action_spec.get("keep", "first")
                         if self._target_column and self._target_column in key_cols:
@@ -980,7 +1190,7 @@ class DataCleanerAgent(BaseAgent):
                                 f"Target column '{self._target_column}' must not be a dedup key — blocked")
                             continue
                         self.df = self.execute_tool("deduplicate_by_key", df=self.df, key_cols=key_cols, keep=keep)
-                        actions_taken.append(f"Deduplicated by key {key_cols} (keep={keep}): {reason}")
+                        actions_taken.append(f"Deduplicated by key {key_cols} (keep={keep}, TRAIN-only): {reason}")
 
                     elif action_type == "fix_column_dtype":
                         if column in self._pk_protected_cols:
@@ -989,6 +1199,7 @@ class DataCleanerAgent(BaseAgent):
                             continue
                         fix_type = action_spec.get("fix_type", "")
                         self.df = self.execute_tool("fix_column_dtype", df=self.df, col=column, fix_type=fix_type)
+                        spec.dtype_fixes.append((column, fix_type))
                         actions_taken.append(f"Fixed format of '{column}' ({fix_type}): {reason}")
 
                     else:
@@ -1003,30 +1214,29 @@ class DataCleanerAgent(BaseAgent):
             self.logger.log(self.name, "ERROR", f"Failed to parse LLM response as JSON: {e}")
             self.logger.log(self.name, "Raw Response", llm_response[:500])
             actions_taken.append("ERROR: Could not parse LLM decisions, performed basic cleaning")
-            self._fallback_cleaning()
+            self._fallback_cleaning(spec)
 
         return actions_taken
 
     @property
     def _pk_protected_cols(self) -> set:
-        """Set of columns that must never be dropped or coerced — entity ID, composite keys, target,
-        and the `_split_` marker (when pre-split mode is active)."""
+        """Set of columns that must never be dropped or coerced — entity ID, composite keys, target."""
         protected = set(self._composite_key_cols)
         if self._entity_id_col:
             protected.add(self._entity_id_col)
         if self._target_column:
             protected.add(self._target_column)
-        if self.df is not None and _SPLIT_MARKER in self.df.columns:
-            protected.add(_SPLIT_MARKER)
         return protected
 
-    def _fallback_cleaning(self):
+    def _fallback_cleaning(self, spec: Optional["CleaningSpec"] = None):
         protected = self._pk_protected_cols
         for col in list(self.df.columns):
             if col in protected:
                 continue
             if self.df[col].isnull().sum() / len(self.df) > Config.NULL_DROP_THRESHOLD:
                 self.df.drop(columns=[col], inplace=True)
+                if spec is not None:
+                    spec.drops.append(col)
                 self.logger.log(self.name, "Fallback", f"Dropped {col} (>{Config.NULL_DROP_THRESHOLD * 100:.0f}% missing)")
 
     def _generate_summary(self, actions: List[str]) -> str:

@@ -38,8 +38,16 @@ class Config:
 
     # ── Output Paths ─────────────────────────────────────────────────────────
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "outputs")
-    CLEAN_DATA_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_data.csv"
-    ENGINEERED_DATA_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_data.csv"
+    # Single-file mode (no valid/oot supplied)
+    CLEAN_DATA_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_data.parquet"
+    ENGINEERED_DATA_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_data.parquet"
+    # Split mode (valid_path or oot_path supplied) — each agent emits 1 file per partition
+    CLEAN_TRAIN_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_train.parquet"
+    CLEAN_VALID_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_valid.parquet"
+    CLEAN_OOT_PATH:   str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_oot.parquet"
+    ENGINEERED_TRAIN_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_train.parquet"
+    ENGINEERED_VALID_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_valid.parquet"
+    ENGINEERED_OOT_PATH:   str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_oot.parquet"
     FINAL_MODEL_CODE_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/final_model_code.py"
     FINAL_MODEL_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/final_model.pkl"
     FINAL_REPORT_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/final_report.md"
@@ -190,21 +198,17 @@ class Config:
     # Relative floor: keep at least this fraction of MAX_FINAL_FEATURES
     SHAP_PSI_MIN_FEATURES_RATIO: float = float(os.getenv("SHAP_PSI_MIN_FEATURES_RATIO", 0.10))
 
-    # ── Pre-split memory savers (column pre-filter + stratified sampling) ─────
-    # Applied in AutoMLPipeline._build_combined_input BEFORE Agent 1, to shrink
-    # very wide datasets that would otherwise OOM during concat / cleaning.
+    # ── Split-mode memory savers (column pre-filter + stratified sampling) ────
+    # Applied INSIDE Agent 1's fit_transform on the TRAIN partition only, to
+    # shrink very wide datasets that would otherwise OOM during cleaning.
+    # The same column drops + clip bounds are captured into CleaningSpec and
+    # replayed on valid / oot (zero leakage in the prefilter decisions).
     # Pre-filter drops columns with null ratio above this threshold.
     PREFILTER_MAX_NULL_RATIO: float = float(os.getenv("PREFILTER_MAX_NULL_RATIO", 0.95))
     # Pre-filter drops columns where one value dominates above this fraction
     # of non-null rows (catches near-constant cols). Cols with nunique > 1000
     # skip this check (high-cardinality => not near-constant).
     PREFILTER_MAX_DOMINANT_RATIO: float = float(os.getenv("PREFILTER_MAX_DOMINANT_RATIO", 0.99))
-
-    # Chunk size (rows) used when streaming a partition through
-    # pa.Table.from_pandas -> ParquetWriter. Bounds peak memory during the
-    # combined-input build to ~chunk_rows × n_cols × 8 bytes instead of the
-    # full DataFrame. Smaller chunk -> lower peak but more write calls.
-    CONCAT_CHUNK_ROWS: int = int(os.getenv("CONCAT_CHUNK_ROWS", 100_000))
 
     # ── Overfitting Detection ─────────────────────────────────────────────────
     # Relative gap (valid_auc - holdout_auc) / valid_auc above which overfitting
