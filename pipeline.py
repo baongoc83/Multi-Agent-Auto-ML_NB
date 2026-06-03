@@ -1,6 +1,7 @@
 from logger import AgentLogger
 from handoff import Handoff
 from pathlib import Path
+import numpy as np
 import pandas as pd
 from config import Config
 from Agents.BaseAgent.base_agent import BaseAgent
@@ -98,19 +99,61 @@ class AutoMLPipeline:
         target_col: str,
         ratio: float,
     ) -> "pd.DataFrame":
-        """Sample `ratio` fraction of rows stratified by target. Falls back to
-        random sample if target is absent or single-class.
+        """Sample `ratio` fraction of rows stratified by target — INDEX-based
+        to keep peak memory bounded.
+
+        pandas `df.groupby(target).apply(lambda g: g.sample(...))` first
+        materialises each group as a full sub-DataFrame, peaking at
+        ~2× memory and silently killing the kernel on 1M-row × 1000-col
+        datasets. This implementation instead:
+          1. Pulls target as a 1-D numpy array (cheap).
+          2. Computes per-class row positions then samples positions
+             (small integer arrays, MB-scale).
+          3. Does ONE final df.iloc[positions] copy of size ratio × N.
+
+        Peak overhead ≈ size of the SAMPLED result, not the whole frame.
         """
         rs = Config.RANDOM_STATE
+        rng = np.random.default_rng(rs)
+        n_rows = len(df)
+
+        self.logger.log("PIPELINE", "Pre-split sample starting",
+            f"input rows={n_rows} cols={df.shape[1]} target_ratio={ratio:.2f}")
+
+        # Fallback: random sample if no usable target
         if (target_col is None
                 or target_col not in df.columns
                 or df[target_col].nunique() < 2):
-            return df.sample(frac=ratio, random_state=rs).reset_index(drop=True)
-        sampled = (
-            df.groupby(target_col, group_keys=False, observed=True, sort=False)
-              .apply(lambda g: g.sample(frac=ratio, random_state=rs))
-        )
-        return sampled.reset_index(drop=True)
+            n_sample = max(1, int(n_rows * ratio))
+            positions = rng.choice(n_rows, n_sample, replace=False)
+            positions.sort()
+            result = df.iloc[positions].reset_index(drop=True)
+            self.logger.log("PIPELINE", "Pre-split sample done (random)",
+                f"output rows={len(result)}")
+            return result
+
+        # Stratified: per-class position indices
+        target_arr = df[target_col].to_numpy()
+        sampled_positions = []
+        class_summary = {}
+        for cls in np.unique(target_arr):
+            cls_pos = np.where(target_arr == cls)[0]
+            n_cls = max(1, int(len(cls_pos) * ratio))
+            chosen = rng.choice(cls_pos, n_cls, replace=False)
+            sampled_positions.append(chosen)
+            class_summary[str(cls)] = (len(cls_pos), n_cls)
+        positions = np.concatenate(sampled_positions)
+        positions.sort()
+        del target_arr, sampled_positions
+
+        self.logger.log("PIPELINE", "Pre-split sample indices",
+            f"per-class kept = {class_summary} | total to materialise={len(positions)}")
+
+        # One vectorized .iloc — pandas does a single take operation.
+        result = df.iloc[positions].reset_index(drop=True)
+        self.logger.log("PIPELINE", "Pre-split sample done (stratified)",
+            f"output rows={len(result)} cols={result.shape[1]}")
+        return result
 
     @staticmethod
     def _normalize_numeric_types(table):
@@ -218,11 +261,18 @@ class AutoMLPipeline:
             cols_keep = list(train_df.columns)
 
         if train_sample_ratio is not None and 0 < train_sample_ratio < 1:
-            train_df = self._stratified_sample(train_df, target_column, train_sample_ratio)
+            # Two-step rebind frees the original 24 GB train_df immediately
+            # after the sampled copy is materialised, instead of waiting for
+            # natural GC. Critical when memory is tight.
+            sampled_df = self._stratified_sample(train_df, target_column, train_sample_ratio)
+            del train_df
+            gc.collect()
+            train_df = sampled_df
+            del sampled_df
+            gc.collect()
             self.logger.log("PIPELINE", "Pre-split sample",
                 f"train sampled {n_train_raw} -> {len(train_df)} "
                 f"(ratio={train_sample_ratio:.2f}, stratified by {target_column!r})")
-            gc.collect()
 
         train_df[SPLIT_MARKER] = "train"
         n_train = len(train_df)
