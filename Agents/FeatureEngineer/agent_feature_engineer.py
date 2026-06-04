@@ -49,12 +49,15 @@ class FeatureSpec:
                         f"interaction '{new_col}' failed on transform set: {e} — filling with train median")
                 df[new_col] = fill_value
 
-        # 2. Label encoders — unseen categories map to __NA__ sentinel
+        # 2. Label encoders — unseen categories map to __NA__ sentinel.
+        # Vectorised via Series.where on an isin() mask — about 10x faster than
+        # the equivalent .apply(lambda) on big frames (matters for 1M+ rows).
         for col, le in self.label_encoders.items():
             if col not in df.columns:
                 continue
             known = set(le.classes_)
-            vals = df[col].astype(str).apply(lambda x: x if x in known else "__NA__")
+            vals = df[col].astype(str)
+            vals = vals.where(vals.isin(known), "__NA__")
             df[col] = le.transform(vals)
 
         # 3. One-hot — reindex against train's dummy column list
