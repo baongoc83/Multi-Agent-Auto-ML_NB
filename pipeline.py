@@ -1,10 +1,32 @@
 from logger import AgentLogger
 from handoff import Handoff
 from pathlib import Path
+from typing import Dict, List, Optional
 from config import Config
+from Agents.BaseAgent.base_agent import BaseAgent
 from Agents.DataCleaner.agent_data_cleaner import DataCleanerAgent
 from Agents.FeatureEngineer.agent_feature_engineer import FeatureEngineerAgent
 from Agents.TrainModel.agent_train_model import TrainModelAgent
+
+
+def _dtype_kind(dtype_str: str) -> str:
+    """Bucket a pyarrow / pandas dtype string into a coarse compatibility class.
+
+    Cross-class mismatch (e.g. numeric vs object) is a real problem — it usually
+    means one file stored a column as text and another as numeric, which will
+    silently corrupt downstream encoders. Within-class mismatch (int32 vs int64,
+    decimal vs float64) is normalised by Agent 1 / pandas itself.
+    """
+    d = dtype_str.lower()
+    if any(x in d for x in ("int", "float", "double", "decimal", "number")):
+        return "numeric"
+    if any(x in d for x in ("date", "time", "timestamp")):
+        return "datetime"
+    if "bool" in d:
+        return "bool"
+    if any(x in d for x in ("string", "object", "utf8", "binary")):
+        return "object"
+    return "other"
 
 
 class AutoMLPipeline:
@@ -38,6 +60,145 @@ class AutoMLPipeline:
         self.logger = AgentLogger()
         self.handoff = Handoff(self.logger)
         Path(Config.OUTPUT_DIR).mkdir(exist_ok=True)
+
+    # ── Schema validation (split mode) ──────────────────────────────────────
+
+    def _read_schema(self, path: str) -> Dict[str, str]:
+        """Return {column_name: dtype_string} for `path` without loading full data.
+
+        Parquet: pyarrow.parquet.read_schema → one disk seek, no row scan.
+        CSV/TSV: pd.read_csv with nrows=1000, encoding-fallback chain.
+        Other (Excel/Feather/ORC/JSON/S3): BaseAgent.load_dataframe fallback —
+            for those formats the schema-only optimisation is less critical
+            (Excel files are usually small; S3 parquet can route through
+            pyarrow.dataset).
+        """
+        from pathlib import PurePosixPath
+        # Recognise outer compression suffixes so train.csv.gz reads as csv
+        inner_suffix, _ = BaseAgent._split_compression(path)
+        suffix = inner_suffix or PurePosixPath(path).suffix.lower()
+
+        # Local parquet — read schema only
+        if suffix == ".parquet" and not path.startswith(BaseAgent._S3_SCHEMES):
+            import pyarrow.parquet as pq
+            schema = pq.read_schema(path)
+            return {f.name: str(f.type) for f in schema}
+
+        # Local CSV / TSV — sniff first 1000 rows for dtype inference
+        if suffix in (".csv", ".tsv") and not path.startswith(BaseAgent._S3_SCHEMES):
+            import pandas as pd
+            sep = "\t" if suffix == ".tsv" else ","
+            for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+                try:
+                    head_df = pd.read_csv(path, sep=sep, nrows=1000, encoding=enc)
+                    return {c: str(head_df[c].dtype) for c in head_df.columns}
+                except UnicodeDecodeError:
+                    continue
+            head_df = pd.read_csv(path, sep=sep, nrows=1000, encoding="latin-1")
+            return {c: str(head_df[c].dtype) for c in head_df.columns}
+
+        # Fallback — small / remote formats: full load is acceptable for a
+        # schema check, which only touches the first row of metadata anyway.
+        df = BaseAgent.load_dataframe(path)
+        return {c: str(df[c].dtype) for c in df.columns}
+
+    def _validate_split_schema(
+        self,
+        train_path: str,
+        valid_path: Optional[str],
+        oot_path: Optional[str],
+        target_column: str,
+        entity_id_col: Optional[str],
+        composite_key_cols: Optional[List[str]],
+    ) -> None:
+        """Fail-fast schema check across train/valid/oot.
+
+        Hard errors (raise ValueError) — these break downstream agents:
+          - target_column missing in any partition
+          - entity_id_col / composite_key_cols missing in any partition
+
+        Warnings (logged, do not raise) — handled gracefully later but worth
+        surfacing to the user:
+          - train has cols missing in valid/oot → spec replay skips them silently
+          - valid/oot have extra cols → dropped during feature selection
+          - dtype "kind" mismatch on a shared column (numeric vs object, etc.)
+            → likely silent NaN / encoding errors during Agent 2 transform
+        """
+        schemas: Dict[str, Dict[str, str]] = {"train": self._read_schema(train_path)}
+        if valid_path is not None:
+            schemas["valid"] = self._read_schema(valid_path)
+        if oot_path is not None:
+            schemas["oot"] = self._read_schema(oot_path)
+
+        sizes_msg = " | ".join(f"{p}={len(s)} cols" for p, s in schemas.items())
+        self.logger.log("PIPELINE", "Schema scan", sizes_msg)
+
+        # ── 1. HARD: required columns must exist in every partition ───────
+        required: List[tuple] = []
+        if target_column:
+            required.append(("target", target_column))
+        if entity_id_col:
+            required.append(("entity_id", entity_id_col))
+        for c in (composite_key_cols or []):
+            required.append(("composite_key", c))
+
+        missing_errors: List[str] = []
+        for tag, col in required:
+            for part, schema in schemas.items():
+                if col not in schema:
+                    missing_errors.append(f"{tag} column '{col}' missing in {part} ({part}_path)")
+        if missing_errors:
+            raise ValueError(
+                "Schema validation FAILED — required columns missing:\n  - "
+                + "\n  - ".join(missing_errors)
+                + "\nCheck that train, valid and oot all use the same column names "
+                "for target / entity_id / composite_key. Pass --keys=<cols> if your "
+                "composite key columns differ from the entity id alone."
+            )
+
+        # ── 2. SOFT: column-set overlap between train and valid/oot ───────
+        train_cols = set(schemas["train"].keys())
+        for part in ("valid", "oot"):
+            if part not in schemas:
+                continue
+            part_cols = set(schemas[part].keys())
+            missing_in_part = train_cols - part_cols
+            extra_in_part   = part_cols - train_cols
+            if missing_in_part:
+                examples = sorted(missing_in_part)[:5]
+                self.logger.log("PIPELINE", "Schema WARN",
+                    f"{part} is missing {len(missing_in_part)} cols present in train. "
+                    f"These cols will be dropped by spec replay (silent). "
+                    f"Examples: {examples}")
+            if extra_in_part:
+                examples = sorted(extra_in_part)[:5]
+                self.logger.log("PIPELINE", "Schema info",
+                    f"{part} has {len(extra_in_part)} extra cols not in train "
+                    f"(will be dropped during feature selection). "
+                    f"Examples: {examples}")
+
+        # ── 3. SOFT: dtype-kind compatibility for shared columns ──────────
+        dtype_warnings: List[str] = []
+        for part in ("valid", "oot"):
+            if part not in schemas:
+                continue
+            shared = train_cols & set(schemas[part].keys())
+            for col in shared:
+                t_kind = _dtype_kind(schemas["train"][col])
+                p_kind = _dtype_kind(schemas[part][col])
+                if t_kind != p_kind:
+                    dtype_warnings.append(
+                        f"'{col}': train={schemas['train'][col]} ({t_kind}) "
+                        f"vs {part}={schemas[part][col]} ({p_kind})"
+                    )
+        if dtype_warnings:
+            self.logger.log("PIPELINE", "Schema WARN",
+                f"{len(dtype_warnings)} cols have dtype-kind mismatch across partitions "
+                f"— may cause silent NaN / encoding errors during transform. "
+                f"Examples: {dtype_warnings[:5]}")
+
+        self.logger.log("PIPELINE", "Schema OK",
+            f"all {len(required)} required cols present across {len(schemas)} partition(s)")
 
     def run(
         self,
@@ -115,6 +276,17 @@ class AutoMLPipeline:
         domain: str,
         model_type: str,
     ):
+        # ── Stage 0: schema validation (fail-fast before any agent runs) ─
+        self.logger.log("PIPELINE", "Stage 0", "Validating schema across train / valid / oot")
+        self._validate_split_schema(
+            train_path=train_path,
+            valid_path=valid_path,
+            oot_path=oot_path,
+            target_column=target_column,
+            entity_id_col=entity_id_col,
+            composite_key_cols=composite_key_cols,
+        )
+
         # ── Stage 1: DataCleaner ────────────────────────────────────────
         self.logger.log("PIPELINE", "Stage 1", "Initializing Data Cleaner Agent (split mode)")
         agent1 = DataCleanerAgent(

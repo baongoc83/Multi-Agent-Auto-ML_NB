@@ -362,10 +362,125 @@ def test_split_with_savers() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TEST 4 — schema validation: missing target raises ValueError before Agent 1
+# ─────────────────────────────────────────────────────────────────────────────
+def test_schema_missing_target() -> None:
+    section("TEST 4 — schema validation: missing target in valid")
+    reset_outputs()
+
+    train = gen_data(400, seed=10)
+    valid = gen_data(100, seed=11).drop(columns=["label"])
+    train.to_csv("outputs/_train.csv", index=False)
+    valid.to_csv("outputs/_valid.csv", index=False)
+
+    pipe = AutoMLPipeline()
+    raised = False
+    try:
+        pipe.run(
+            input_path="outputs/_train.csv",
+            valid_path="outputs/_valid.csv",
+            target_column="label",
+            entity_id_col="customer_id",
+            composite_key_cols=["customer_id", "snap_dt"],
+        )
+    except ValueError as e:
+        raised = True
+        msg = str(e)
+        assert "Schema validation FAILED" in msg, f"wrong error wording: {msg}"
+        assert "target column 'label' missing in valid" in msg, f"wrong detail: {msg}"
+        print(f"  Got expected error: {msg.splitlines()[0]}")
+
+    assert raised, "pipeline should have raised ValueError for missing target"
+    # Agent 1 must NOT have run (no clean_train.parquet produced)
+    assert not Path(Config.CLEAN_TRAIN_PATH).exists(), \
+        "Agent 1 ran despite schema failure — validation should be fail-fast"
+    print("  [PASS] schema validation aborts before Agent 1 starts")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST 5 — schema validation: dtype-kind mismatch is a warning, not an error
+#          + missing entity_id is also a hard error
+# ─────────────────────────────────────────────────────────────────────────────
+def test_schema_validation_unit() -> None:
+    section("TEST 5 — schema validation helpers (unit-level)")
+    reset_outputs()
+
+    train = gen_data(400, seed=12)
+    valid = gen_data(100, seed=13)
+    oot = gen_data(100, seed=14)
+    # 5a: numeric in train, object in valid — must WARN not RAISE
+    # Use explicit non-numeric prefix so pandas csv re-inference reads as object
+    valid["num_signal_1"] = valid["num_signal_1"].apply(lambda x: f"v_{x:.3f}")
+    # 5b: extra col in valid (ignored, just info log)
+    valid["extra_col_in_valid"] = 1
+    # 5c: missing col in oot (warn, replay will skip it silently)
+    oot = oot.drop(columns=["num_noise"])
+
+    train.to_csv("outputs/_train.csv", index=False)
+    valid.to_csv("outputs/_valid.csv", index=False)
+    oot.to_csv("outputs/_oot.csv", index=False)
+
+    pipe = AutoMLPipeline()
+    # Should NOT raise
+    pipe._validate_split_schema(
+        train_path="outputs/_train.csv",
+        valid_path="outputs/_valid.csv",
+        oot_path="outputs/_oot.csv",
+        target_column="label",
+        entity_id_col="customer_id",
+        composite_key_cols=["customer_id", "snap_dt"],
+    )
+    print("  [OK 5a] dtype-kind mismatch + extra col + missing col are warnings only")
+
+    # 5d: missing entity_id in valid → must RAISE
+    valid_bad_entity = valid.drop(columns=["customer_id"])
+    valid_bad_entity.to_csv("outputs/_valid.csv", index=False)
+    raised = False
+    try:
+        pipe._validate_split_schema(
+            train_path="outputs/_train.csv",
+            valid_path="outputs/_valid.csv",
+            oot_path="outputs/_oot.csv",
+            target_column="label",
+            entity_id_col="customer_id",
+            composite_key_cols=["customer_id", "snap_dt"],
+        )
+    except ValueError as e:
+        raised = True
+        msg = str(e)
+        assert "entity_id column 'customer_id' missing in valid" in msg, f"wrong detail: {msg}"
+    assert raised, "missing entity_id must raise ValueError"
+    print("  [OK 5d] missing entity_id raises ValueError")
+
+    # 5e: missing composite_key snap_dt in oot → must RAISE
+    oot_bad_ck = oot.drop(columns=["snap_dt"])
+    oot_bad_ck.to_csv("outputs/_oot.csv", index=False)
+    # Restore valid to good state
+    valid.to_csv("outputs/_valid.csv", index=False)
+    raised = False
+    try:
+        pipe._validate_split_schema(
+            train_path="outputs/_train.csv",
+            valid_path="outputs/_valid.csv",
+            oot_path="outputs/_oot.csv",
+            target_column="label",
+            entity_id_col="customer_id",
+            composite_key_cols=["customer_id", "snap_dt"],
+        )
+    except ValueError as e:
+        raised = True
+        assert "composite_key column 'snap_dt' missing in oot" in str(e)
+    assert raised, "missing composite_key must raise ValueError"
+    print("  [OK 5e] missing composite_key raises ValueError")
+    print("  [PASS] schema validation helpers handle warning + error cases correctly")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     failures: list[str] = []
-    for fn in (test_single_file, test_split_mode, test_split_with_savers):
+    for fn in (test_single_file, test_split_mode, test_split_with_savers,
+              test_schema_missing_target, test_schema_validation_unit):
         try:
             fn()
         except AssertionError as e:
@@ -383,5 +498,5 @@ if __name__ == "__main__":
         for f in failures:
             print(f"    - {f}")
         sys.exit(1)
-    print("  All 3 end-to-end tests PASS")
+    print("  All 5 end-to-end tests PASS")
     print()
