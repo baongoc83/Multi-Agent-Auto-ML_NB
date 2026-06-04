@@ -107,6 +107,13 @@ Examples:
              "Thresholds: PREFILTER_MAX_NULL_RATIO / PREFILTER_MAX_DOMINANT_RATIO in Config.",
     )
     parser.add_argument(
+        "--no-drift-check", action="store_false", dest="check_distribution", default=True,
+        help="Skip the Stage-0 PSI drift check between train / valid / oot (default: on). "
+             "The check samples DRIFT_SAMPLE_N rows per partition and flags columns "
+             "with PSI > DRIFT_PSI_THRESHOLD as drifting. Disable if you've already "
+             "validated drift externally or want to re-run faster.",
+    )
+    parser.add_argument(
         "--col-desc", metavar="PATH", dest="col_descriptions_path", default=None,
         help="Column descriptions file (.csv / .json / .parquet / .xlsx). "
              "Passed to Agent 2 to guide interaction feature creation.",
@@ -242,6 +249,8 @@ def main() -> None:
         print(f"Sample ratio : {args.train_sample_ratio}  (stratified, train only)")
     if not args.prefilter:
         print(f"Prefilter    : DISABLED")
+    if not args.check_distribution:
+        print(f"Drift check  : DISABLED")
     if args.col_descriptions_path:
         print(f"Col desc     : {args.col_descriptions_path}")
         if col_desc_kwargs:
@@ -272,6 +281,7 @@ def main() -> None:
             oot_path=args.oot_path,
             train_sample_ratio=args.train_sample_ratio,
             prefilter=args.prefilter,
+            check_distribution=args.check_distribution,
             domain=args.domain,
             model_type=args.model_type,
         )

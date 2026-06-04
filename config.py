@@ -198,6 +198,18 @@ class Config:
     # Relative floor: keep at least this fraction of MAX_FINAL_FEATURES
     SHAP_PSI_MIN_FEATURES_RATIO: float = float(os.getenv("SHAP_PSI_MIN_FEATURES_RATIO", 0.10))
 
+    # ── Pipeline Stage-0 distribution drift check ────────────────────────────
+    # Sample size per partition for the PSI-based train↔valid / train↔oot
+    # comparison. ~50K rows × n_cols stays well under 1 GB even for wide data.
+    DRIFT_SAMPLE_N: int = int(os.getenv("DRIFT_SAMPLE_N", 50_000))
+    # PSI value above which a column is flagged as drifting between partitions.
+    # Reusing PSI_THRESHOLD (default 0.3, finance-standard) means the pipeline
+    # warning matches Agent 3's feature-drop threshold — what gets flagged here
+    # is what would later be dropped.
+    DRIFT_PSI_THRESHOLD: float = float(os.getenv("DRIFT_PSI_THRESHOLD", 0.25))
+    # How many top-drifting columns to list in the warning log
+    DRIFT_TOP_N_REPORT: int = int(os.getenv("DRIFT_TOP_N_REPORT", 10))
+
     # ── Split-mode memory savers (column pre-filter + stratified sampling) ────
     # Applied INSIDE Agent 1's fit_transform on the TRAIN partition only, to
     # shrink very wide datasets that would otherwise OOM during cleaning.

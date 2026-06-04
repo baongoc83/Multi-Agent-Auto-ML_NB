@@ -200,6 +200,177 @@ class AutoMLPipeline:
         self.logger.log("PIPELINE", "Schema OK",
             f"all {len(required)} required cols present across {len(schemas)} partition(s)")
 
+    # ── Distribution drift check (split mode) ───────────────────────────────
+
+    @staticmethod
+    def _calc_psi(expected, actual, bins: int = 10) -> float:
+        """Population Stability Index between two numeric series.
+
+        PSI = sum((actual% - expected%) * ln(actual% / expected%)) over `bins`
+        quantile buckets fit to `expected`. The infinity guards (-inf / +inf
+        boundary cuts; eps floor on counts) mirror Agent 3's implementation
+        so the two stages report the same metric.
+        """
+        import numpy as np
+        import pandas as pd
+        eps = 1e-8
+        try:
+            cuts = pd.qcut(expected, q=bins, duplicates="drop", retbins=True)[1]
+            cuts[0], cuts[-1] = -np.inf, np.inf
+            e_pct = pd.cut(expected, bins=cuts).value_counts(normalize=True).sort_index() + eps
+            a_pct = pd.cut(actual,   bins=cuts).value_counts(normalize=True).sort_index() + eps
+            e_pct, a_pct = e_pct.align(a_pct, fill_value=eps)
+            return float(((a_pct - e_pct) * np.log(a_pct / e_pct)).sum())
+        except Exception:
+            return 0.0
+
+    def _load_sample(self, path: str, n: int):
+        """Load the first ~n rows of `path` for distribution comparison.
+
+        First-N-rows sampling (vs random sample) is intentional: it costs
+        one sequential read and avoids loading the full file. The trade-off
+        is that PSI may be biased if the file is sorted by date — but for a
+        rough "is distribution very different?" warning that bias is
+        acceptable. Agent 3's PSI step runs on full data later.
+        """
+        import pandas as pd
+        from pathlib import PurePosixPath
+        inner_suffix, _ = BaseAgent._split_compression(path)
+        suffix = inner_suffix or PurePosixPath(path).suffix.lower()
+
+        if suffix == ".parquet" and not path.startswith(BaseAgent._S3_SCHEMES):
+            import pyarrow.parquet as pq
+            pf = pq.ParquetFile(path)
+            if pf.metadata.num_rows <= n:
+                return pf.read().to_pandas()
+            # iter_batches lets us stop after we've read enough rows
+            chunks, rows = [], 0
+            for batch in pf.iter_batches(batch_size=min(n, 20_000)):
+                chunks.append(batch.to_pandas())
+                rows += len(chunks[-1])
+                if rows >= n:
+                    break
+            df = pd.concat(chunks, ignore_index=True)
+            return df.iloc[:n] if len(df) > n else df
+
+        if suffix in (".csv", ".tsv") and not path.startswith(BaseAgent._S3_SCHEMES):
+            sep = "\t" if suffix == ".tsv" else ","
+            for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+                try:
+                    return pd.read_csv(path, sep=sep, nrows=n, encoding=enc)
+                except UnicodeDecodeError:
+                    continue
+            return pd.read_csv(path, sep=sep, nrows=n, encoding="latin-1")
+
+        # Other formats (Excel, Feather, ORC, JSON, S3) — full load. These are
+        # usually small or pyarrow-streamed under the hood.
+        df = BaseAgent.load_dataframe(path)
+        if len(df) > n:
+            return df.sample(n, random_state=Config.RANDOM_STATE).reset_index(drop=True)
+        return df
+
+    def _compare_distributions(
+        self,
+        train_path: str,
+        valid_path: Optional[str],
+        oot_path: Optional[str],
+        target_column: str,
+        entity_id_col: Optional[str],
+        composite_key_cols: Optional[List[str]],
+    ) -> None:
+        """PSI-based drift check on a sample of numeric features.
+
+        Skips: target, entity_id, composite keys, date-named cols.
+        Per-partition behaviour: train↔valid and train↔oot are scored
+        independently — drift in valid does not contaminate the oot stats.
+
+        Only LOGS warnings — never raises. Distribution drift is rarely a
+        reason to abort the pipeline (the user may want to model the shift)
+        but they should know it's there before burning compute.
+        """
+        import numpy as np
+        sample_n = Config.DRIFT_SAMPLE_N
+        threshold = Config.DRIFT_PSI_THRESHOLD
+        top_n = Config.DRIFT_TOP_N_REPORT
+
+        self.logger.log("PIPELINE", "Distribution check start",
+            f"sample={sample_n} rows/partition | PSI threshold={threshold:.2f}")
+
+        train_sample = self._load_sample(train_path, sample_n)
+        samples = {"train": train_sample}
+        if valid_path is not None:
+            samples["valid"] = self._load_sample(valid_path, sample_n)
+        if oot_path is not None:
+            samples["oot"] = self._load_sample(oot_path, sample_n)
+
+        # Cols to skip — keys and the target carry no useful drift signal
+        skip = set()
+        if target_column:
+            skip.add(target_column)
+        if entity_id_col:
+            skip.add(entity_id_col)
+        for c in (composite_key_cols or []):
+            skip.add(c)
+
+        # Date-named columns — drift is expected (recency bias) and not
+        # actionable here; Agent 3's temporal split handles it explicitly.
+        _DATE_KW = ("date", "time", "timestamp", "dt", "snap", "period", "month", "year", "week", "day")
+        date_like = [
+            c for c in train_sample.columns
+            if any(kw in c.lower() for kw in _DATE_KW)
+        ]
+        skip.update(date_like)
+
+        numeric_cols = [
+            c for c in train_sample.select_dtypes(include=[np.number]).columns
+            if c not in skip
+        ]
+        if not numeric_cols:
+            self.logger.log("PIPELINE", "Distribution check",
+                "No numeric feature cols to compare — skipped")
+            return
+
+        # Score each non-train partition against train
+        for part in ("valid", "oot"):
+            if part not in samples:
+                continue
+            scores: Dict[str, float] = {}
+            for col in numeric_cols:
+                if col not in samples[part].columns:
+                    continue
+                tr = train_sample[col].dropna()
+                ot = samples[part][col].dropna()
+                # Need enough rows and >1 unique value in train for binning
+                if len(tr) < 100 or len(ot) < 100 or tr.nunique() < 2:
+                    continue
+                psi = self._calc_psi(tr, ot)
+                # PSI can return inf when expected has zero mass in a bin
+                if np.isnan(psi) or np.isinf(psi):
+                    continue
+                scores[col] = round(psi, 4)
+
+            if not scores:
+                self.logger.log("PIPELINE", f"Distribution train↔{part}",
+                    "No usable numeric cols to compare")
+                continue
+
+            sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+            high_drift = [(c, s) for c, s in sorted_scores if s > threshold]
+            max_col, max_psi = sorted_scores[0]
+
+            self.logger.log("PIPELINE", f"Distribution train↔{part}",
+                f"checked {len(scores)} numeric cols | "
+                f"max PSI={max_psi:.3f} on '{max_col}' | "
+                f"≥{threshold:.2f} count={len(high_drift)}")
+            if high_drift:
+                topk = high_drift[:top_n]
+                top_str = ", ".join(f"{c}={s:.2f}" for c, s in topk)
+                more = f" (+{len(high_drift) - len(topk)} more)" if len(high_drift) > len(topk) else ""
+                self.logger.log("PIPELINE", f"Distribution WARN train↔{part}",
+                    f"{len(high_drift)} cols with PSI > {threshold:.2f} between train and {part}. "
+                    f"Top {len(topk)}: {top_str}{more}. "
+                    "Agent 3's PSI step will likely drop these features.")
+
     def run(
         self,
         input_path: str,
@@ -212,6 +383,7 @@ class AutoMLPipeline:
         oot_path: str = None,
         train_sample_ratio: float = None,
         prefilter: bool = True,
+        check_distribution: bool = True,
         domain: str = "generic",
         model_type: str = "binary_classification",
     ):
@@ -226,6 +398,9 @@ class AutoMLPipeline:
                                 Useful for very wide datasets that OOM during cleaning.
             prefilter:          Drop near-constant / mostly-null cols from train before LLM analysis.
                                 Same drops captured in CleaningSpec for replay on valid/oot.
+            check_distribution: Run Stage-0 PSI drift check (default on). Set False to skip
+                                — useful when intermediate files are already known stable
+                                (e.g. re-runs with the same input data).
             domain:             Feature engineering domain (credit_risk | propensity | fraud | generic).
             model_type:         ML problem type (binary_classification | regression | multiclass).
         """
@@ -249,6 +424,7 @@ class AutoMLPipeline:
                 col_descriptions_kwargs=col_descriptions_kwargs,
                 entity_id_col=entity_id_col, composite_key_cols=composite_key_cols,
                 train_sample_ratio=train_sample_ratio, prefilter=prefilter,
+                check_distribution=check_distribution,
                 domain=domain, model_type=model_type,
             )
         return self._run_single_mode(
@@ -273,11 +449,12 @@ class AutoMLPipeline:
         composite_key_cols: list,
         train_sample_ratio: float,
         prefilter: bool,
+        check_distribution: bool,
         domain: str,
         model_type: str,
     ):
-        # ── Stage 0: schema validation (fail-fast before any agent runs) ─
-        self.logger.log("PIPELINE", "Stage 0", "Validating schema across train / valid / oot")
+        # ── Stage 0a: schema validation (fail-fast before any agent runs) ─
+        self.logger.log("PIPELINE", "Stage 0a", "Validating schema across train / valid / oot")
         self._validate_split_schema(
             train_path=train_path,
             valid_path=valid_path,
@@ -286,6 +463,23 @@ class AutoMLPipeline:
             entity_id_col=entity_id_col,
             composite_key_cols=composite_key_cols,
         )
+
+        # ── Stage 0b: distribution drift check (warning only) ────────────
+        if check_distribution:
+            self.logger.log("PIPELINE", "Stage 0b", "Checking distribution drift between partitions")
+            try:
+                self._compare_distributions(
+                    train_path=train_path,
+                    valid_path=valid_path,
+                    oot_path=oot_path,
+                    target_column=target_column,
+                    entity_id_col=entity_id_col,
+                    composite_key_cols=composite_key_cols,
+                )
+            except Exception as e:
+                # Drift check is advisory — never block the pipeline on its failure
+                self.logger.log("PIPELINE", "Distribution check ERROR",
+                    f"Drift check failed ({type(e).__name__}: {e}) — continuing anyway")
 
         # ── Stage 1: DataCleaner ────────────────────────────────────────
         self.logger.log("PIPELINE", "Stage 1", "Initializing Data Cleaner Agent (split mode)")

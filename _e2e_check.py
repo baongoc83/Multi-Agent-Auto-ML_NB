@@ -476,11 +476,70 @@ def test_schema_validation_unit() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TEST 6 — distribution drift: heavily shifted valid triggers WARN (unit)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_distribution_drift_warns() -> None:
+    section("TEST 6 — distribution drift detection (unit-level)")
+    reset_outputs()
+
+    # Train: standard distribution; Valid: heavy shift on num_signal_1 + _2
+    train = gen_data(2000, seed=20)
+    valid = gen_data(500, seed=21)
+    valid["num_signal_1"] = valid["num_signal_1"] + 5.0     # mean shift +5
+    valid["num_signal_2"] = valid["num_signal_2"] * 3.0     # scale x3
+    oot   = gen_data(500, seed=22)   # similar to train — should not trigger
+
+    train.to_csv("outputs/_train.csv", index=False)
+    valid.to_csv("outputs/_valid.csv", index=False)
+    oot.to_csv("outputs/_oot.csv", index=False)
+
+    pipe = AutoMLPipeline()
+
+    # Capture log via a wrapper around logger.log
+    captured = []
+    orig_log = pipe.logger.log
+    def _capture(agent, action, msg):
+        captured.append(f"{agent} | {action} | {msg}")
+        return orig_log(agent, action, msg)
+    pipe.logger.log = _capture
+
+    pipe._compare_distributions(
+        train_path="outputs/_train.csv",
+        valid_path="outputs/_valid.csv",
+        oot_path="outputs/_oot.csv",
+        target_column="label",
+        entity_id_col="customer_id",
+        composite_key_cols=["customer_id", "snap_dt"],
+    )
+
+    # ── 6a: WARN must fire on train↔valid (heavy shift) ───────────────────
+    warn_valid = [l for l in captured if "Distribution WARN train↔valid" in l]
+    assert warn_valid, f"expected drift WARN on valid (shifted features); got logs:\n  " + "\n  ".join(captured[-10:])
+    # Should call out at least one of the shifted columns
+    warn_text = " ".join(warn_valid)
+    assert "num_signal_1" in warn_text or "num_signal_2" in warn_text, \
+        f"shifted col not surfaced in WARN: {warn_valid}"
+    print(f"  [OK 6a] WARN fired for valid drift: {warn_valid[0].split('|')[-1].strip()[:120]}")
+
+    # ── 6b: train↔oot stays calm (similar distribution) ───────────────────
+    warn_oot = [l for l in captured if "Distribution WARN train↔oot" in l]
+    if warn_oot:
+        # Acceptable if 0-2 cols cross the threshold by chance; failures only if
+        # the warn cites num_signal cols (which weren't shifted in oot)
+        for w in warn_oot:
+            assert "num_signal_1" not in w and "num_signal_2" not in w, \
+                f"oot WARN cites un-shifted col — random check failed: {w}"
+    print(f"  [OK 6b] train↔oot drift WARN absent or benign ({len(warn_oot)} flagged)")
+    print("  [PASS] drift check warns on real shift, stays quiet on stable partitions")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     failures: list[str] = []
     for fn in (test_single_file, test_split_mode, test_split_with_savers,
-              test_schema_missing_target, test_schema_validation_unit):
+              test_schema_missing_target, test_schema_validation_unit,
+              test_distribution_drift_warns):
         try:
             fn()
         except AssertionError as e:
@@ -498,5 +557,5 @@ if __name__ == "__main__":
         for f in failures:
             print(f"    - {f}")
         sys.exit(1)
-    print("  All 5 end-to-end tests PASS")
+    print("  All 6 end-to-end tests PASS")
     print()
