@@ -12,13 +12,19 @@ Raw data  ─►  Agent 1: DataCleaner  ─►  Agent 2: FeatureEngineer  ─►
 
 ## Tính năng chính
 
-- **3 agent độc lập** giao tiếp qua object `Handoff` — mỗi agent có prompt, tool registry và logic riêng
-- **LLM fallback 3 lớp**: LiteLLM proxy → OpenAI direct → Claude direct (tự xử lý retry, rate-limit, kết nối)
-- **Routing model thông minh**: prompt ngắn → local model, prompt dài → cloud model (qua `MODEL_ROUTING_THRESHOLD`)
+- **2 chế độ chạy**:
+  - **Split mode** (khi có `--valid` hoặc `--oot`): mỗi agent FIT trên train, capture spec, REPLAY lên valid/oot — không bao giờ load cả 3 partition cùng lúc → peak RAM bằng partition lớn nhất
+  - **Single-file mode**: Agent 3 tự auto-split (temporal OOT hoặc 60/20/20)
+- **3 agent độc lập** với prompt, tool registry và logic riêng
+- **CleaningSpec / FeatureSpec dataclasses** capture mọi transform từ train, replay deterministic lên valid/oot — không re-run LLM, không leakage
+- **Stage 0 safety checks** (split mode): schema validation (fail-fast) + PSI distribution drift (advisory)
+- **LLM fallback 3 lớp** (legacy backend): LiteLLM proxy → OpenAI direct → Claude direct
+- **Gateway backend** cho mạng nội bộ — single source, gateway tự handle failover
 - **OOT temporal split tự động** từ cột date — tự cân bằng `OOT_MIN_RATIO` / `OOT_MAX_RATIO`
 - **Pipeline feature selection 5 tầng**: RFE → PSI drift → Stability Gini → SHAP+PSI iterative pruning → top-N cut
 - **Overfitting detection + LLM-guided retrain** khi gap valid/holdout vượt ngưỡng
 - **GPU auto-detect** cho LightGBM, XGBoost, CatBoost
+- **Smart Excel reader**: magic-byte detection cho file `.xls/.xlsx` bị đặt sai extension
 - **Sinh code inference standalone** (`outputs/final_model_code.py`) — chạy độc lập với pipeline
 
 ---
@@ -36,7 +42,7 @@ python -m venv .venv
 # 3. Cài dependencies
 pip install -r requirements.txt
 
-# 4. (Tuỳ chọn) cài LiteLLM nếu dùng proxy
+# 4. (Tuỳ chọn) cài LiteLLM nếu dùng legacy backend với proxy
 pip install litellm
 ```
 
@@ -146,6 +152,8 @@ python main.py data/train.csv TARGET
 Hỗ trợ định dạng: `.csv`, `.tsv`, `.parquet`, `.orc`, `.feather`, `.xlsx`, `.xls`, `.xlsm`, `.json`, và remote (`s3://`, `gs://`, `az://`).
 Hỗ trợ compression (file kết thúc bằng): `.gz`, `.bz2` (alias `.b2`), `.xz`, `.zst`, `.zip` — auto-detect và decompress (vd. `train.csv.gz`).
 
+Excel files tự động chọn engine từ **magic bytes**, không phải extension — file `.xls` rename thành `.xlsx` vẫn đọc được, và ngược lại.
+
 ### Credit risk (HomeCredit, KAGGLE)
 
 ```powershell
@@ -170,17 +178,20 @@ python main.py data/txns.parquet is_fraud `
     --domain fraud --entity-id account_id --keys account_id,txn_ts
 ```
 
-### Với split đã tách sẵn — pre-split mode
+### Với split đã tách sẵn — split mode
 
-Bạn có thể truyền **train / valid / oot** riêng biệt. Khi `--valid` hoặc `--oot` được set, pipeline tự động:
-1. Concat các file vào 1 combined dataset với cột marker `_split_`
-2. Agents 1+2 xử lý đồng nhất (clean + feature engineering) trên combined
-3. Agent 3 đọc marker để dựng lại **exact** splits user đã chia
+Bạn có thể truyền **train / valid / oot** riêng biệt. Khi `--valid` hoặc `--oot` được set, pipeline chuyển sang **split mode**:
 
-Nhờ vậy OOT/valid cũng được encode + interaction giống train → schema khớp 100% khi predict.
+1. **Stage 0a** — Schema validation: hard-fail nếu thiếu target / entity_id / composite_keys ở bất kỳ partition nào, log WARN cho dtype mismatch
+2. **Stage 0b** — Distribution drift check: sample 50K rows mỗi partition, tính PSI từng numeric feature, log WARN nếu drift > 0.25
+3. **Agent 1** FIT trên train → save `clean_train.parquet` + capture `CleaningSpec` → REPLAY spec lên valid/oot → save `clean_valid.parquet`, `clean_oot.parquet`
+4. **Agent 2** FIT trên `clean_train.parquet` → capture `FeatureSpec` (encoders + interactions + selected_features) → REPLAY lên `clean_valid/oot.parquet`
+5. **Agent 3** load 3 file engineered, gắn marker `_split_`, concat → run training pipeline → user-supplied splits được dựng lại exact
+
+Mỗi agent **chỉ load 1 partition trong RAM tại 1 thời điểm** → peak memory ≈ partition lớn nhất, không phải tổng 3 file. Đây là lý do split mode chạy được trên dataset 1M+ rows × 3000+ features mà concat-mode cũ OOM.
 
 ```powershell
-# Full pre-split: cả train, valid, oot riêng biệt
+# Full split: cả train, valid, oot riêng biệt
 python main.py data/train.parquet TARGET `
     --valid data/valid.parquet `
     --oot   data/oot.parquet `
@@ -191,21 +202,21 @@ python main.py data/train.parquet TARGET `
 python main.py data/train.parquet TARGET --valid data/valid.parquet
 
 # Chỉ có train + oot (không có valid)
-# → Pipeline tự auto-split 20% của train thành valid
+# → Agent 3 tự auto-split 20% của train thành valid
 python main.py data/train.parquet TARGET --oot data/oot.parquet
 ```
 
-### Behavior matrix — 8 scenarios
+### Behavior matrix — 5 scenarios
 
-| Input | Có date_col trong keys | Splits Agent 3 tạo |
+| Input | Mode | Splits Agent 3 tạo |
 |---|---|---|
-| `train + valid + oot` | * | train + valid + oot (exact theo marker) |
-| `train + valid` | * | train + valid (exact), no oot |
-| `train + oot` | * | train (80%) + valid (20% auto) + oot (exact) |
-| `train` only | Yes | train + valid_temporal + valid_random + oot (OOT temporal) |
-| `train` only | No  | train (60%) + valid (20%) + test (20%) |
+| `train + valid + oot` | split | train + valid + oot (exact, theo marker do Agent 3 gán) |
+| `train + valid` | split | train + valid (exact), no oot |
+| `train + oot` | split | train (80%) + valid (20% auto từ train) + oot (exact) |
+| `train` only (có date_col) | single | train + valid_temporal + valid_random + oot (OOT temporal) |
+| `train` only (no date_col) | single | train (60%) + valid (20%) + test (20%) |
 
-> Khi pre-split mode kích hoạt, date_col chỉ ảnh hưởng đến PSI drift + Stability check (cần date để tính monthly Gini), không ảnh hưởng đến split.
+> Trong split mode, row-only operations (`drop_duplicates`, `deduplicate_by_key`) **chỉ apply lên train** — valid/oot giữ nguyên row count để evaluation metric không bị bias.
 
 ### Tham số CLI quan trọng
 
@@ -213,21 +224,24 @@ python main.py data/train.parquet TARGET --oot data/oot.parquet
 |---|---|
 | `--domain` | `credit_risk \| propensity \| fraud \| generic` — định hướng feature engineering |
 | `--model-type` | `binary_classification \| regression \| multiclass` |
-| `--entity-id COL` | Cột entity ID (e.g. `customer_id`, `SK_ID_CURR`) — bảo vệ khỏi xoá / encode |
-| `--keys C1,C2` | Composite key cho dedup check + OOT temporal extraction (chỉ dùng khi auto-split) |
-| `--valid PATH` | Valid đã tách sẵn — kích hoạt pre-split mode, valid đi qua Agents 1+2 |
-| `--oot PATH` | OOT đã tách sẵn — kích hoạt pre-split mode, OOT đi qua Agents 1+2 |
-| `--sample-ratio R` | (Pre-split mode) Stratified sample TRAIN với tỉ lệ R, valid/oot giữ nguyên. VD `--sample-ratio 0.3` |
-| `--no-prefilter` | (Pre-split mode) Tắt auto-drop cột rác (null>95% / constant / dominant>99%). Mặc định: bật |
-| `--col-desc PATH` | File CSV/JSON mô tả cột — guide LLM tạo interaction có ý nghĩa |
+| `--entity-id COL` | Cột entity ID (e.g. `customer_id`, `SK_ID_CURR`) — bảo vệ khỏi drop / clip / encode |
+| `--keys C1,C2` | Composite key cho dedup check + OOT temporal extraction |
+| `--valid PATH` | Valid đã tách sẵn — kích hoạt split mode |
+| `--oot PATH` | OOT đã tách sẵn — kích hoạt split mode |
+| `--sample-ratio R` | (Split mode) Stratified sample TRAIN với tỉ lệ R, valid/oot giữ nguyên. VD `--sample-ratio 0.3` |
+| `--no-prefilter` | (Split mode) Tắt auto-drop cột rác trong Agent 1. Mặc định: bật |
+| `--no-drift-check` | (Split mode) Tắt Stage 0b PSI drift check. Mặc định: bật |
+| `--col-desc PATH` | File CSV/JSON/Parquet/Excel mô tả cột — guide LLM tạo interaction có ý nghĩa |
 
 ### Memory savers cho dataset lớn (1M+ rows × 1000+ features)
 
-Khi build combined input (pre-split mode), pipeline tự động:
-1. **Pre-filter cột** (default on): scan train, drop cột null>95% / constant / dominant>99% trước khi concat
-2. **Stream-write parquet** thay CSV: peak RAM ≈ 1 file lớn nhất, không phải tổng 3 file
+Trong **split mode**, Agent 1 tự động (default on):
 
-Nếu vẫn OOM (Agent 1+2 cần toàn bộ data trong RAM), thêm `--sample-ratio`:
+1. **Pre-filter cột**: scan train, drop cột null>95% / constant / dominant>99%. Drop list được record trong `CleaningSpec.drops` → replay xuống valid/oot tự động
+2. **Parquet+snappy intermediate files**: nhỏ hơn CSV ~10× → load lại Agent 2 nhanh hơn
+3. **Per-partition release**: Agent 1 xong train → `del + gc.collect()` → mới load valid
+
+Nếu vẫn OOM (1M rows × 3000+ features cần >24 GB RAM cho riêng train), thêm `--sample-ratio`:
 
 ```powershell
 # Dataset 1M train x 3500 features → sample 30% train, valid/oot giữ nguyên
@@ -246,22 +260,24 @@ Sampling chỉ áp dụng **train**, stratified theo target → giữ class bala
 ```
 multi-agent-auto-ml-v1.1/
 ├── main.py                          # CLI entry point
-├── pipeline.py                      # AutoMLPipeline — orchestrator
-├── handoff.py                       # State holder giữa các agent
+├── pipeline.py                      # AutoMLPipeline — orchestrator + Stage 0a/0b
+├── handoff.py                       # State holder cho single-file mode
 ├── logger.py                        # AgentLogger — log + markdown report
 ├── config.py                        # Toàn bộ config + LLM client factory
+├── config_gateway.py                # GatewayConfig override khi LLM_BACKEND=gateway
 ├── config.yaml                      # LiteLLM proxy config
 ├── start_litellm.ps1                # Helper khởi động proxy
 ├── requirements.txt
+├── _e2e_check.py                    # 6-test end-to-end smoke suite (mock LLM)
 │
 ├── Agents/
 │   ├── BaseAgent/
-│   │   └── base_agent.py            # Base class + LLM call + load_dataframe
+│   │   └── base_agent.py            # LLM call + load_dataframe + smart Excel reader
 │   ├── DataCleaner/
-│   │   ├── agent_data_cleaner.py    # Agent 1
+│   │   ├── agent_data_cleaner.py    # Agent 1 + CleaningSpec
 │   │   └── prompts/                 # system.txt, user.txt
 │   ├── FeatureEngineer/
-│   │   ├── agent_feature_engineer.py # Agent 2
+│   │   ├── agent_feature_engineer.py # Agent 2 + FeatureSpec
 │   │   └── prompts/
 │   └── TrainModel/
 │       ├── agent_train_model.py     # Agent 3 (FLAML → Optuna → ...)
@@ -272,6 +288,8 @@ multi-agent-auto-ml-v1.1/
 │   └── HomeCredit_columns_description.csv
 │
 ├── docs/
+│   ├── architecture.md              # Visual walkthrough + mermaid diagrams
+│   ├── awareness-pattern.md         # Agentic pattern reference
 │   └── config_params.md             # Reference đầy đủ mọi config param
 │
 ├── outputs/                         # Tất cả output của pipeline (auto-tạo)
@@ -285,18 +303,36 @@ multi-agent-auto-ml-v1.1/
 
 ## Output
 
-Sau khi chạy xong, `outputs/` chứa:
+Sau khi chạy xong, `outputs/` chứa **các file phụ thuộc mode**:
+
+### Single-file mode (no `--valid` / `--oot`)
 
 | File | Mô tả |
 |---|---|
-| `clean_data.csv` | Dataset sau Agent 1 |
-| `engineered_data.csv` | Dataset sau Agent 2 |
+| `clean_data.parquet` | Dataset sau Agent 1 |
+| `engineered_data.parquet` | Dataset sau Agent 2 |
+
+### Split mode (`--valid` hoặc `--oot` được set)
+
+| File | Mô tả |
+|---|---|
+| `clean_train.parquet` | Train sau Agent 1 (fit + drop_duplicates) |
+| `clean_valid.parquet` | Valid sau Agent 1 (replay CleaningSpec, no row drop) |
+| `clean_oot.parquet` | OOT sau Agent 1 (replay CleaningSpec, no row drop) |
+| `engineered_train.parquet` | Train sau Agent 2 |
+| `engineered_valid.parquet` | Valid sau Agent 2 (replay FeatureSpec) |
+| `engineered_oot.parquet` | OOT sau Agent 2 (replay FeatureSpec) |
+
+### Shared (cả 2 mode)
+
+| File | Mô tả |
+|---|---|
 | `final_model.pkl` | Model + encoders + feature list (joblib) |
 | `final_model_code.py` | Code inference standalone |
-| `data_cleaner_report.json` | JSON report Agent 1 |
-| `feature_engineer_report.json` | JSON report Agent 2 |
+| `data_cleaner_report.json` | JSON report Agent 1 — bao gồm `cleaning_spec` để inspect |
+| `feature_engineer_report.json` | JSON report Agent 2 — bao gồm `feature_spec` để inspect |
 | `model_trainer_report.json` | JSON report Agent 3 |
-| `psi_report.csv` | PSI drift của từng feature |
+| `psi_report.csv` | PSI drift của từng feature (Agent 3 step 5) |
 | `stability_report.csv` | Mean / std Gini theo tháng |
 | `shap_psi_prune_log.csv` | Log từng step pruning |
 | `final_report.md` | Markdown report toàn pipeline |
@@ -317,16 +353,34 @@ preds  = predict(df, threshold=0.5)
 
 ---
 
+## End-to-end smoke test
+
+Project có sẵn `_e2e_check.py` — 6 test với mock LLM, chạy nhanh để verify toàn bộ flow không gãy:
+
+```powershell
+python _e2e_check.py
+```
+
+Tests cover:
+1. SINGLE-FILE mode
+2. SPLIT mode (verify exact row count preserve + schema parity 3 files)
+3. SPLIT mode + sample_ratio + prefilter (junk col drops replay)
+4. Schema validation: missing target → raise trước Agent 1
+5. Schema validation: missing entity_id / composite_key → raise; dtype mismatch → warn only
+6. Distribution drift: WARN khi shift, không false positive trên stable partition
+
+---
+
 ## Test từng agent riêng
 
 ```powershell
 # Agent 1 — sẽ tự sinh sample data
 python tests/test_agent1.py
 
-# Agent 2 — cần outputs/clean_data.csv (chạy Agent 1 trước)
+# Agent 2 — cần outputs/clean_data.parquet (chạy Agent 1 trước)
 python tests/test_agent2.py
 
-# Agent 3 — cần outputs/engineered_data.csv (chạy Agent 2 trước)
+# Agent 3 — cần outputs/engineered_data.parquet (chạy Agent 2 trước)
 python tests/test_agent3.py
 ```
 
@@ -334,7 +388,9 @@ python tests/test_agent3.py
 
 ## Tài liệu chi tiết
 
-- [docs/config_params.md](docs/config_params.md) — Reference đầy đủ ~70 config param (override qua `.env`)
+- [docs/architecture.md](docs/architecture.md) — Visual walkthrough + mermaid diagrams cho từng agent
+- [docs/awareness-pattern.md](docs/awareness-pattern.md) — Agentic pattern reference (Plan-Execute + Awareness)
+- [docs/config_params.md](docs/config_params.md) — Reference đầy đủ ~75 config param (override qua `.env`)
 
 ---
 
@@ -358,4 +414,4 @@ Train data  ─►  FLAML        ─►  estimator + base hyperparams (AutoML)
 - Python 3.10+
 - Windows / macOS / Linux
 - GPU (tuỳ chọn) — auto-detect qua `nvidia-smi`
-- RAM khuyến nghị: ≥ 16 GB cho dataset 100k+ rows × 500+ cols
+- RAM khuyến nghị: ≥ 16 GB cho dataset 100k+ rows × 500+ cols; ≥ 32 GB cho 1M+ rows × 1000+ cols (hoặc dùng `--sample-ratio`)
