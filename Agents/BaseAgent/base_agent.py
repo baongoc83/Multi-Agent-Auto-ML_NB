@@ -401,6 +401,78 @@ class BaseAgent:
         inner = PurePosixPath(p.stem).suffix.lower()
         return inner, compression
 
+    # Excel magic-byte signatures — used by _read_excel_smart to route the
+    # file to the correct engine when the extension doesn't match the content.
+    _EXCEL_MAGIC_ZIP:  bytes = b"PK\x03\x04"                          # .xlsx / .xlsm (Open XML zip)
+    _EXCEL_MAGIC_OLE2: bytes = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"   # .xls (OLE2 compound)
+
+    @classmethod
+    def _read_excel_smart(cls, path: str, **kwargs) -> pd.DataFrame:
+        """pd.read_excel with the engine chosen from file magic bytes.
+
+        Pandas picks its Excel engine based purely on extension, which fails
+        when the file's real format doesn't match — the common case is a
+        true .xls (OLE2 binary) saved with a .xlsx extension, which yields
+        the cryptic ``Can't find workbook in OLE2 compound document`` error
+        because xlrd is asked to parse a non-existent workbook stream.
+
+        We sniff the first 8 bytes:
+          PK\\x03\\x04           → ZIP / Open XML  → openpyxl
+          D0 CF 11 E0 A1 B1 1A E1 → OLE2 compound  → xlrd
+
+        If detection is ambiguous we fall back to pandas' default. When the
+        chosen engine isn't installed we retry the other one and finally
+        raise a self-describing error that points at the missing dependency.
+        """
+        try:
+            with open(path, "rb") as f:
+                head = f.read(8)
+        except Exception:
+            # Path doesn't exist locally (S3, etc.) — defer to pandas
+            return pd.read_excel(path, **kwargs)
+
+        if head.startswith(cls._EXCEL_MAGIC_ZIP):
+            engine_order = ("openpyxl", "xlrd")
+            detected = "ZIP (Open XML / .xlsx)"
+        elif head.startswith(cls._EXCEL_MAGIC_OLE2):
+            engine_order = ("xlrd", "openpyxl")
+            detected = "OLE2 (.xls binary)"
+        else:
+            # Magic doesn't match either Excel container. Don't bother trying
+            # an engine — pandas would raise an opaque "Excel file format
+            # cannot be determined" error. Tell the user what's actually wrong.
+            raise RuntimeError(
+                f"File '{path}' has an Excel extension but its content is not a valid "
+                f"Excel file (first 4 bytes: {head[:4].hex()!r}). "
+                "Expected ZIP signature '504b0304' (.xlsx/.xlsm) or OLE2 signature "
+                "'d0cf11e0' (.xls). The file may be corrupted, encrypted, or a "
+                "different format (CSV / HTML / JSON) saved with an .xlsx extension."
+            )
+
+        last_exc: Optional[Exception] = None
+        for engine in engine_order:
+            try:
+                return pd.read_excel(path, engine=engine, **kwargs)
+            except ImportError as e:
+                # engine module not installed → try the next one
+                last_exc = e
+                continue
+            except Exception as e:
+                # The format is right but the file failed for another reason
+                # (corrupt, encrypted, wrong workbook stream). No engine swap
+                # will fix that, so re-raise with helpful context.
+                raise RuntimeError(
+                    f"Could not read Excel file '{path}' with engine='{engine}'. "
+                    f"Detected format: {detected}. Underlying error: {e}. "
+                    "If the file is password-protected, decrypt it first. "
+                    "If you renamed an .xls file to .xlsx (or vice-versa), restore the original extension."
+                ) from e
+        raise RuntimeError(
+            f"Could not read Excel file '{path}' — detected format: {detected} "
+            f"but neither '{engine_order[0]}' nor '{engine_order[1]}' is installed. "
+            f"Run: pip install openpyxl xlrd"
+        ) from last_exc
+
     @classmethod
     def load_dataframe(cls, path: str) -> pd.DataFrame:
         """Load a DataFrame from a local or remote path.
@@ -432,7 +504,7 @@ class BaseAgent:
             if suffix in (".feather", ".ftr"):
                 return pd.read_feather(path)
             if suffix in (".xls", ".xlsx", ".xlsm"):
-                return pd.read_excel(path)
+                return cls._read_excel_smart(path)
 
         read_kwargs: Dict[str, Any] = {}
         if compression is not None:

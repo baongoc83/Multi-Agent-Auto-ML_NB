@@ -212,7 +212,11 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
                     raise UnicodeDecodeError("csv", b"", 0, 1,
                         f"Could not decode '{path}' with utf-8 / cp1252 / latin-1")
             elif suffix in (".xls", ".xlsx", ".xlsm"):
-                df_desc = pd.read_excel(path)
+                # _read_excel_smart sniffs file magic so a mislabelled .xls /
+                # .xlsx pair is still readable. Surfaces a clearer error when
+                # the file is encrypted/corrupt or when openpyxl/xlrd is
+                # missing from the environment.
+                df_desc = self._read_excel_smart(path)
             elif suffix == ".parquet":
                 df_desc = pd.read_parquet(path)
             else:

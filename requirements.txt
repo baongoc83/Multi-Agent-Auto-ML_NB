@@ -3,6 +3,12 @@ numpy==2.3.3
 pandas==2.3.3
 pyarrow>=14.0.0   # parquet/feather/orc + S3FileSystem with custom credentials
 
+# Excel engines — BaseAgent._read_excel_smart auto-routes by file magic:
+#   .xlsx / .xlsm (ZIP)  → openpyxl
+#   .xls (OLE2 binary)   → xlrd
+openpyxl>=3.1.0
+xlrd>=2.0.1
+
 # ML / model training
 scikit-learn==1.7.2
 lightgbm==4.6.0
