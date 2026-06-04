@@ -9,6 +9,20 @@ from logger import AgentLogger
 from config import Config
 
 
+def _safe_str_map(series: pd.Series, fn) -> pd.Series:
+    """Apply a string method elementwise, leaving non-strings (NaN, None,
+    numbers, dicts, ...) untouched.
+
+    pandas .str accessor refuses to run on an object-dtype Series that
+    contains ANY non-string value — it raises
+    ``AttributeError: Can only use .str accessor with string values!``
+    even if only one cell out of a million is a stray int. This wrapper
+    side-steps that by calling `fn` only on real strings, which is what
+    we actually want for whitespace / case fixes anyway.
+    """
+    return series.map(lambda x: fn(x) if isinstance(x, str) else x)
+
+
 @dataclass
 class CleaningSpec:
     """Deterministic transforms captured from TRAIN, replayed on VALID/OOT.
@@ -39,9 +53,9 @@ class CleaningSpec:
                 elif fix_type == "cast_to_datetime":
                     df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=False)
                 elif fix_type == "strip_whitespace" and df[col].dtype == object:
-                    df[col] = df[col].str.strip()
+                    df[col] = _safe_str_map(df[col], str.strip)
                 elif fix_type == "standardize_case" and df[col].dtype == object:
-                    df[col] = df[col].str.lower()
+                    df[col] = _safe_str_map(df[col], str.lower)
             except Exception as e:
                 if logger is not None:
                     logger.log(name, "Transform WARN",
@@ -544,7 +558,10 @@ class DataCleanerAgent(BaseAgent):
                                 "suggested_action": "cast_to_datetime",
                             })
 
-                # Whitespace and case checks apply to all non-date object columns
+                # Whitespace and case checks apply to all non-date object columns.
+                # str_series is always all-string (via astype(str)) so .str is
+                # safe on it. The raw `series` may have mixed types — never
+                # touch `series.str.*` here.
                 if not looks_like_date_col:
                     str_series = series.dropna().astype(str)
                     if str_series.str.contains(r"^\s|\s$").any():
@@ -554,13 +571,13 @@ class DataCleanerAgent(BaseAgent):
                             "suggested_action": "strip_whitespace",
                         })
                     if series.nunique() < Config.HIGH_CARDINALITY_THRESHOLD:
-                        lower_nunique = series.str.lower().nunique()
-                        if lower_nunique < series.nunique():
+                        lower_nunique = str_series.str.lower().nunique()
+                        if lower_nunique < str_series.nunique():
                             col_issues.append({
                                 "issue": "mixed_case_values",
                                 "detail": (
                                     f"Case-folding reduces unique values "
-                                    f"{series.nunique()} → {lower_nunique}"
+                                    f"{str_series.nunique()} -> {lower_nunique}"
                                 ),
                                 "suggested_action": "standardize_case",
                             })
@@ -593,11 +610,14 @@ class DataCleanerAgent(BaseAgent):
         elif fix_type == "strip_whitespace":
             if df[col].dtype != object:
                 raise ValueError(f"strip_whitespace requires object dtype, got '{df[col].dtype}' for '{col}'")
-            df[col] = df[col].str.strip()  # .str accessor preserves NaN natively
+            # _safe_str_map skips non-string cells (NaN, None, stray ints), avoiding
+            # the .str accessor's "Can only use .str accessor with string values"
+            # crash on mixed-type object columns.
+            df[col] = _safe_str_map(df[col], str.strip)
         elif fix_type == "standardize_case":
             if df[col].dtype != object:
                 raise ValueError(f"standardize_case requires object dtype, got '{df[col].dtype}' for '{col}'")
-            df[col] = df[col].str.lower()  # .str accessor preserves NaN natively
+            df[col] = _safe_str_map(df[col], str.lower)
         else:
             raise ValueError(
                 f"Unknown fix_type '{fix_type}'. "
