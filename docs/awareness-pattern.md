@@ -52,7 +52,7 @@ Agent của project này thể hiện **12 lớp awareness**, từ low-level (da
 | 6 | **Guard / Constraint-awareness** | Hard-coded checks sau LLM decision, override nếu sai | Block `drop_column` nếu null_rate < threshold AND not constant AND not all-unique |
 | 7 | **Cost-awareness** | Routing model theo prompt length | `MODEL_ROUTING_THRESHOLD` → local/cloud model |
 | 8 | **Failure-awareness** | Backend-dependent + exponential retry. Legacy = 3-tier app fallback; Gateway = single source (gateway tự handle failover) | Legacy: LiteLLM → OpenAI direct → Claude direct. Gateway: ANTHROPIC_BASE_URL only |
-| 9 | **Resource-awareness** | Dynamic time budget + GPU auto-detect + sampling | `_compute_time_budget(n_rows, n_cols)`, `FLAML_MAX_ROWS` |
+| 9 | **Resource-awareness** | Dynamic time budget + GPU auto-detect + sampling + dtype downcast + joblib temp redirect | `_compute_time_budget(n_rows, n_cols)`, `FLAML_MAX_ROWS`, `_fit_prepare_X` (smallest-fit int/float32), `JOBLIB_TEMP_FOLDER` auto-set tại `config.py` |
 | 10 | **Temporal-awareness** | OOT split theo date, valid_temporal cho Optuna tránh leak | `_tool_split_data` với date_col |
 | 11 | **Drift-awareness** | PSI filter train vs OOT | `_tool_run_psi_filter` |
 | 12 | **Stability + Overfit-awareness** | Monthly Gini std + so sánh valid vs holdout gap, tự retrain | `_tool_run_stability_check`, `_check_overfitting` → `_get_antioverfitting_params` |

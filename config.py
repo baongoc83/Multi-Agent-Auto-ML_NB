@@ -1,8 +1,21 @@
 import os
+import shutil
+import tempfile
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Redirect joblib's memory-map staging dir off /dev/shm — that filesystem is tiny
+# (default 64 MB inside Docker) and silently truncates the .pkl files joblib hands
+# to workers, surfacing as "BrokenProcessPool / FileNotFoundError" mid-CV. The
+# system tempdir is disk-backed and effectively unbounded.
+# Must be set BEFORE any sklearn / joblib / FLAML import — kept here because
+# config.py is the first module every entry point imports. Respects user override
+# via .env (setdefault leaves an existing value alone).
+os.environ.setdefault("JOBLIB_TEMP_FOLDER", tempfile.gettempdir())
 
 
 class Config:
@@ -37,24 +50,134 @@ class Config:
     MODEL_ROUTING_THRESHOLD: int = int(os.getenv("MODEL_ROUTING_THRESHOLD", 6000))
 
     # ── Output Paths ─────────────────────────────────────────────────────────
+    # Output layout (set by init_run() at pipeline construction):
+    #   OUTPUT_DIR/<YYYY-MM-DD>/run_<NN>/         ← RUN_DIR (persisted)
+    #     ├── agent_execution.log
+    #     ├── data_cleaner_report.json
+    #     ├── feature_engineer_report.json
+    #     ├── model_trainer_report.json
+    #     ├── final_report.md
+    #     ├── final_model.pkl + final_model_code.py
+    #     ├── psi_report.csv + stability_report.csv + shap_psi_prune_log.csv
+    #     └── pipeline_process_<agent>.py            ← per-agent replay scripts
+    #   <system tempdir>/automl_pipeline_<rand>/   ← TMP_DIR (cleaned at end)
+    #     └── clean_*.parquet + engineered_*.parquet (intermediate handoffs)
+    #
+    # Set KEEP_INTERMEDIATES=true to redirect TMP_DIR → RUN_DIR (debugging, tests).
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "outputs")
-    # Single-file mode (no valid/oot supplied)
-    CLEAN_DATA_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_data.parquet"
-    ENGINEERED_DATA_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_data.parquet"
-    # Split mode (valid_path or oot_path supplied) — each agent emits 1 file per partition
-    CLEAN_TRAIN_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_train.parquet"
-    CLEAN_VALID_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_valid.parquet"
-    CLEAN_OOT_PATH:   str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/clean_oot.parquet"
-    ENGINEERED_TRAIN_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_train.parquet"
-    ENGINEERED_VALID_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_valid.parquet"
-    ENGINEERED_OOT_PATH:   str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/engineered_oot.parquet"
-    FINAL_MODEL_CODE_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/final_model_code.py"
-    FINAL_MODEL_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/final_model.pkl"
-    FINAL_REPORT_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/final_report.md"
-    EXECUTION_LOG_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/agent_execution.log"
-    DATA_CLEANER_REPORT_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/data_cleaner_report.json"
-    FEATURE_ENGINEER_REPORT_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/feature_engineer_report.json"
-    MODEL_TRAINER_REPORT_PATH: str = f"{os.getenv('OUTPUT_DIR', 'outputs')}/model_trainer_report.json"
+    KEEP_INTERMEDIATES: bool = os.getenv("KEEP_INTERMEDIATES", "false").lower() == "true"
+
+    # Populated by init_run() — defaults so import-time access does not crash.
+    RUN_DIR: str = OUTPUT_DIR
+    TMP_DIR: str = OUTPUT_DIR
+
+    # Persisted artifacts (RUN_DIR)
+    FINAL_MODEL_CODE_PATH: str = f"{OUTPUT_DIR}/final_model_code.py"
+    FINAL_MODEL_PATH: str = f"{OUTPUT_DIR}/final_model.pkl"
+    FINAL_REPORT_PATH: str = f"{OUTPUT_DIR}/final_report.md"
+    EXECUTION_LOG_PATH: str = f"{OUTPUT_DIR}/agent_execution.log"
+    DATA_CLEANER_REPORT_PATH: str = f"{OUTPUT_DIR}/data_cleaner_report.json"
+    FEATURE_ENGINEER_REPORT_PATH: str = f"{OUTPUT_DIR}/feature_engineer_report.json"
+    MODEL_TRAINER_REPORT_PATH: str = f"{OUTPUT_DIR}/model_trainer_report.json"
+    PSI_REPORT_PATH: str = f"{OUTPUT_DIR}/psi_report.csv"
+    STABILITY_REPORT_PATH: str = f"{OUTPUT_DIR}/stability_report.csv"
+    SHAP_PSI_PRUNE_LOG_PATH: str = f"{OUTPUT_DIR}/shap_psi_prune_log.csv"
+    # Per-agent replay scripts (new — let user re-run each agent's transforms on
+    # fresh input without re-doing the LLM analysis).
+    PIPELINE_PROCESS_DC_PATH: str = f"{OUTPUT_DIR}/pipeline_process_data_cleaner.py"
+    PIPELINE_PROCESS_FE_PATH: str = f"{OUTPUT_DIR}/pipeline_process_feature_engineer.py"
+    PIPELINE_PROCESS_FE_SPEC_PATH: str = f"{OUTPUT_DIR}/feature_spec.pkl"
+    PIPELINE_PROCESS_TM_PATH: str = f"{OUTPUT_DIR}/pipeline_process_train_model.py"
+
+    # Intermediate handoff files (TMP_DIR by default — deleted after run)
+    CLEAN_DATA_PATH: str = f"{OUTPUT_DIR}/clean_data.parquet"
+    ENGINEERED_DATA_PATH: str = f"{OUTPUT_DIR}/engineered_data.parquet"
+    CLEAN_TRAIN_PATH: str = f"{OUTPUT_DIR}/clean_train.parquet"
+    CLEAN_VALID_PATH: str = f"{OUTPUT_DIR}/clean_valid.parquet"
+    CLEAN_OOT_PATH:   str = f"{OUTPUT_DIR}/clean_oot.parquet"
+    ENGINEERED_TRAIN_PATH: str = f"{OUTPUT_DIR}/engineered_train.parquet"
+    ENGINEERED_VALID_PATH: str = f"{OUTPUT_DIR}/engineered_valid.parquet"
+    ENGINEERED_OOT_PATH:   str = f"{OUTPUT_DIR}/engineered_oot.parquet"
+
+    @classmethod
+    def init_run(cls) -> str:
+        """Allocate today's next run dir + tempdir for intermediate files.
+
+        Folder layout (counter resets when day rolls over because new YYYY-MM-DD
+        starts with no run_* siblings):
+            outputs/2026-06-07/run_01/...
+            outputs/2026-06-07/run_02/...
+            outputs/2026-06-08/run_01/...   ← new day → counter resets
+
+        Updates every path attribute in-place so existing
+        `Config.FINAL_MODEL_PATH` etc. references pick up the new run dir
+        without changing callsites.
+
+        Returns the absolute RUN_DIR path.
+        """
+        base = Path(cls.OUTPUT_DIR) / datetime.now().strftime("%Y-%m-%d")
+        base.mkdir(parents=True, exist_ok=True)
+        existing = [d for d in base.iterdir() if d.is_dir() and d.name.startswith("run_")]
+        # max+1 (not len+1) so a deleted middle run does not cause collisions
+        used_nums = []
+        for d in existing:
+            try:
+                used_nums.append(int(d.name.split("_", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+        next_n = (max(used_nums) + 1) if used_nums else 1
+        run_dir = base / f"run_{next_n:02d}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        cls.RUN_DIR = str(run_dir)
+
+        if cls.KEEP_INTERMEDIATES:
+            cls.TMP_DIR = cls.RUN_DIR
+        else:
+            cls.TMP_DIR = tempfile.mkdtemp(prefix="automl_pipeline_")
+
+        # Persisted artifacts → RUN_DIR
+        rd = cls.RUN_DIR
+        cls.FINAL_MODEL_CODE_PATH         = f"{rd}/final_model_code.py"
+        cls.FINAL_MODEL_PATH              = f"{rd}/final_model.pkl"
+        cls.FINAL_REPORT_PATH             = f"{rd}/final_report.md"
+        cls.EXECUTION_LOG_PATH            = f"{rd}/agent_execution.log"
+        cls.DATA_CLEANER_REPORT_PATH      = f"{rd}/data_cleaner_report.json"
+        cls.FEATURE_ENGINEER_REPORT_PATH  = f"{rd}/feature_engineer_report.json"
+        cls.MODEL_TRAINER_REPORT_PATH     = f"{rd}/model_trainer_report.json"
+        cls.PSI_REPORT_PATH               = f"{rd}/psi_report.csv"
+        cls.STABILITY_REPORT_PATH         = f"{rd}/stability_report.csv"
+        cls.SHAP_PSI_PRUNE_LOG_PATH       = f"{rd}/shap_psi_prune_log.csv"
+        cls.PIPELINE_PROCESS_DC_PATH      = f"{rd}/pipeline_process_data_cleaner.py"
+        cls.PIPELINE_PROCESS_FE_PATH      = f"{rd}/pipeline_process_feature_engineer.py"
+        cls.PIPELINE_PROCESS_FE_SPEC_PATH = f"{rd}/feature_spec.pkl"
+        cls.PIPELINE_PROCESS_TM_PATH      = f"{rd}/pipeline_process_train_model.py"
+
+        # Intermediate handoff files → TMP_DIR
+        td = cls.TMP_DIR
+        cls.CLEAN_DATA_PATH        = f"{td}/clean_data.parquet"
+        cls.ENGINEERED_DATA_PATH   = f"{td}/engineered_data.parquet"
+        cls.CLEAN_TRAIN_PATH       = f"{td}/clean_train.parquet"
+        cls.CLEAN_VALID_PATH       = f"{td}/clean_valid.parquet"
+        cls.CLEAN_OOT_PATH         = f"{td}/clean_oot.parquet"
+        cls.ENGINEERED_TRAIN_PATH  = f"{td}/engineered_train.parquet"
+        cls.ENGINEERED_VALID_PATH  = f"{td}/engineered_valid.parquet"
+        cls.ENGINEERED_OOT_PATH    = f"{td}/engineered_oot.parquet"
+
+        return cls.RUN_DIR
+
+    @classmethod
+    def cleanup_run(cls) -> None:
+        """Remove the intermediate tempdir at the end of a pipeline run.
+
+        Safe to call multiple times. No-op when KEEP_INTERMEDIATES=true
+        (TMP_DIR == RUN_DIR — never delete the run dir).
+        """
+        if cls.KEEP_INTERMEDIATES:
+            return
+        tmp = cls.TMP_DIR
+        if not tmp or tmp == cls.RUN_DIR or not Path(tmp).exists():
+            return
+        shutil.rmtree(tmp, ignore_errors=True)
 
     # ── S3 / S3-compatible storage (MinIO, Wasabi, ...) ───────────────────────
     # Used by BaseAgent.load_dataframe when path starts with s3://

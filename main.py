@@ -173,36 +173,33 @@ def _print_metrics(final_metrics: dict) -> None:
 
 
 def _print_files() -> None:
-    print("\nGenerated Files:")
-    # Show whichever per-mode set of intermediate files actually exists. In split mode
-    # there are 3 per stage (train/valid/oot). In single mode there's just one.
+    print(f"\nRun directory: {Config.RUN_DIR}")
+    print("Generated files:")
     files = [
-        # Single-file mode artifacts (one DataFrame per stage)
-        (Config.CLEAN_DATA_PATH,                               "Cleaned dataset           — Agent 1 (single)"),
-        (Config.ENGINEERED_DATA_PATH,                          "Engineered features       — Agent 2 (single)"),
-        # Split-mode artifacts (per-partition)
-        (Config.CLEAN_TRAIN_PATH,                              "Cleaned train             — Agent 1 (split)"),
-        (Config.CLEAN_VALID_PATH,                              "Cleaned valid             — Agent 1 (split)"),
-        (Config.CLEAN_OOT_PATH,                                "Cleaned oot               — Agent 1 (split)"),
-        (Config.ENGINEERED_TRAIN_PATH,                         "Engineered train          — Agent 2 (split)"),
-        (Config.ENGINEERED_VALID_PATH,                         "Engineered valid          — Agent 2 (split)"),
-        (Config.ENGINEERED_OOT_PATH,                           "Engineered oot            — Agent 2 (split)"),
-        # Shared artifacts
-        (Config.DATA_CLEANER_REPORT_PATH,                      "Data cleaner report       — Agent 1"),
-        (Config.FEATURE_ENGINEER_REPORT_PATH,                  "Feature engineer report   — Agent 2"),
-        (Config.MODEL_TRAINER_REPORT_PATH,                     "Model trainer report      — Agent 3"),
-        (f"{Config.OUTPUT_DIR}/psi_report.csv",                "PSI drift report          — Agent 3"),
-        (f"{Config.OUTPUT_DIR}/stability_report.csv",          "Feature stability report  — Agent 3"),
-        (f"{Config.OUTPUT_DIR}/shap_psi_prune_log.csv",        "SHAP+PSI pruning log      — Agent 3"),
-        (Config.FINAL_MODEL_PATH,                              "Trained model artifact    — Agent 3"),
-        (Config.FINAL_MODEL_CODE_PATH,                         "Standalone inference code — Agent 3"),
-        (Config.FINAL_REPORT_PATH,                             "Full pipeline report"),
-        (Config.EXECUTION_LOG_PATH,                            "Agent execution log"),
+        # Reports + logs (always written)
+        (Config.DATA_CLEANER_REPORT_PATH,        "Data cleaner report         — Agent 1"),
+        (Config.FEATURE_ENGINEER_REPORT_PATH,    "Feature engineer report     — Agent 2"),
+        (Config.MODEL_TRAINER_REPORT_PATH,       "Model trainer report        — Agent 3"),
+        (Config.PSI_REPORT_PATH,                 "PSI drift report            — Agent 3"),
+        (Config.STABILITY_REPORT_PATH,           "Feature stability report    — Agent 3"),
+        (Config.SHAP_PSI_PRUNE_LOG_PATH,         "SHAP+PSI pruning log        — Agent 3"),
+        (Config.FINAL_REPORT_PATH,               "Full pipeline report"),
+        (Config.EXECUTION_LOG_PATH,              "Agent execution log"),
+        # Model deliverables
+        (Config.FINAL_MODEL_PATH,                "Trained model artifact      — Agent 3"),
+        (Config.FINAL_MODEL_CODE_PATH,           "Standalone inference code   — Agent 3"),
+        # Per-agent replay scripts (re-apply each agent's transforms on new data)
+        (Config.PIPELINE_PROCESS_DC_PATH,        "Replay script               — Agent 1"),
+        (Config.PIPELINE_PROCESS_FE_PATH,        "Replay script               — Agent 2"),
+        (Config.PIPELINE_PROCESS_FE_SPEC_PATH,   "Fitted FeatureSpec sidecar  — Agent 2"),
+        (Config.PIPELINE_PROCESS_TM_PATH,        "Replay script               — Agent 3"),
     ]
     for filepath, description in files:
         if not Path(filepath).exists():
-            continue   # only print files that were actually produced this run
-        print(f"  + {filepath:<55} {description}")
+            continue
+        print(f"  + {filepath:<70} {description}")
+    if Config.KEEP_INTERMEDIATES:
+        print(f"\n  [KEEP_INTERMEDIATES=true] clean_*.parquet / engineered_*.parquet kept in {Config.TMP_DIR}")
 
 
 def main() -> None:

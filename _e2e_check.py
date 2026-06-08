@@ -82,6 +82,13 @@ _ba.BaseAgent.call_llm = _mock_call_llm
 
 # Now safe to import the pipeline
 from config import Config            # noqa: E402
+
+# Keep clean_*.parquet / engineered_*.parquet inside RUN_DIR so the
+# intermediate-file assertions below can still read them. Production runs
+# default to KEEP_INTERMEDIATES=false → those files go to a tempdir that
+# is wiped at pipeline end.
+Config.KEEP_INTERMEDIATES = True
+
 from pipeline import AutoMLPipeline   # noqa: E402
 
 # Tight time budgets so the test finishes in a reasonable time

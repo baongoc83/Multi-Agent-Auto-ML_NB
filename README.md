@@ -235,16 +235,30 @@ python main.py data/train.parquet TARGET --oot data/oot.parquet
 
 ### Memory savers cho dataset lớn (1M+ rows × 1000+ features)
 
-Trong **split mode**, Agent 1 tự động (default on):
+Pipeline áp dụng **4 lớp tối ưu RAM mặc định bật**, đủ để chạy dataset 500k rows × 1500 cols dưới 8 GB:
 
-1. **Pre-filter cột**: scan train, drop cột null>95% / constant / dominant>99%. Drop list được record trong `CleaningSpec.drops` → replay xuống valid/oot tự động
-2. **Parquet+snappy intermediate files**: nhỏ hơn CSV ~10× → load lại Agent 2 nhanh hơn
-3. **Per-partition release**: Agent 1 xong train → `del + gc.collect()` → mới load valid
+1. **Agent 1 — Pre-filter cột**: scan train, drop cột null>95% / constant / dominant>99%. Drop list lưu trong `CleaningSpec.drops` → replay xuống valid/oot tự động
+2. **Agent 2 — Metadata-only dtype iter**: `select_top_features` đọc `df.dtypes` thay vì slice `df[feature_cols]` (slice trigger block consolidation tạo float64 matrix `(n_cols, n_rows)` → từng spike vài GB). Drop in-place thay slice ở cuối.
+3. **Agent 3 — dtype downcast tại fit**: `_fit_prepare_X` rewrite — bỏ `df.copy()` đầu function, build dict từng cột:
+   - Object/cat → smallest signed int (int8 nếu ≤127 cats, int16 nếu ≤32k, int32 nếu lớn hơn)
+   - Float64 → **float32** (50% RAM)
+   - Int64 → int32
+   - Bool → int8
+4. **Parquet+snappy intermediate files**: ~10× nhỏ hơn CSV, load Agent kế tiếp nhanh hơn
+5. **Per-partition release**: `del agent + gc.collect()` sau mỗi agent → peak RAM ≈ partition lớn nhất, không phải tổng 3 file
 
-Nếu vẫn OOM (1M rows × 3000+ features cần >24 GB RAM cho riêng train), thêm `--sample-ratio`:
+**Benchmark dtype downcast (50k × 1400 mixed cols)**: 1.82 GB → 190 MB (≈9.6×). Cho case thực 100k × 1455: ~1.08 GB int64 alloc → ~150-450 MB tùy tỉ lệ cat/num.
+
+**Joblib temp folder** — `JOBLIB_TEMP_FOLDER` được auto-set tại `config.py` về `tempfile.gettempdir()` ngay khi import (`/tmp` trên Linux, `%TEMP%` trên Windows). Tránh `BrokenProcessPool: FileNotFoundError: '/dev/shm/joblib_memmapping_folder_...'` khi `/dev/shm` nhỏ (Docker default 64 MB). Override qua `.env` nếu `/tmp` cũng nhỏ:
+
+```env
+JOBLIB_TEMP_FOLDER=/data/joblib_tmp
+```
+
+Nếu vẫn OOM (>3M rows × 3000+ features cần >24 GB RAM cho riêng train), thêm `--sample-ratio`:
 
 ```powershell
-# Dataset 1M train x 3500 features → sample 30% train, valid/oot giữ nguyên
+# Dataset 3M train x 3500 features → sample 30% train, valid/oot giữ nguyên
 python main.py data/train.parquet TARGET `
     --valid data/valid.parquet --oot data/oot.parquet `
     --sample-ratio 0.3 `
@@ -303,40 +317,79 @@ multi-agent-auto-ml-v1.1/
 
 ## Output
 
-Sau khi chạy xong, `outputs/` chứa **các file phụ thuộc mode**:
+### Layout — mỗi lần chạy 1 run dir, counter reset mỗi ngày
 
-### Single-file mode (no `--valid` / `--oot`)
+```
+outputs/
+└── 2026-06-08/                          ← thư mục theo ngày (UTC local)
+    ├── run_01/                          ← lần chạy 1 của hôm nay
+    │   ├── agent_execution.log
+    │   ├── data_cleaner_report.json
+    │   ├── feature_engineer_report.json
+    │   ├── model_trainer_report.json
+    │   ├── psi_report.csv
+    │   ├── stability_report.csv
+    │   ├── shap_psi_prune_log.csv
+    │   ├── final_report.md
+    │   ├── final_model.pkl
+    │   ├── final_model_code.py
+    │   ├── pipeline_process_data_cleaner.py        ← NEW: replay Agent 1
+    │   ├── pipeline_process_feature_engineer.py    ← NEW: replay Agent 2
+    │   ├── feature_spec.pkl                        ← NEW: sidecar cho Agent 2
+    │   └── pipeline_process_train_model.py         ← NEW: replay Agent 3
+    ├── run_02/                          ← lần chạy 2 của hôm nay
+    └── run_03/
+└── 2026-06-09/                          ← sang ngày mới → counter reset
+    └── run_01/
+```
+
+Counter `run_NN` đếm dựa trên `max(NN) + 1` của các thư mục `run_*` đã tồn tại trong `outputs/YYYY-MM-DD/`. Sang ngày mới, thư mục ngày mới rỗng → tự động bắt đầu lại từ `run_01`.
+
+### Files trong mỗi run
 
 | File | Mô tả |
 |---|---|
-| `clean_data.parquet` | Dataset sau Agent 1 |
-| `engineered_data.parquet` | Dataset sau Agent 2 |
-
-### Split mode (`--valid` hoặc `--oot` được set)
-
-| File | Mô tả |
-|---|---|
-| `clean_train.parquet` | Train sau Agent 1 (fit + drop_duplicates) |
-| `clean_valid.parquet` | Valid sau Agent 1 (replay CleaningSpec, no row drop) |
-| `clean_oot.parquet` | OOT sau Agent 1 (replay CleaningSpec, no row drop) |
-| `engineered_train.parquet` | Train sau Agent 2 |
-| `engineered_valid.parquet` | Valid sau Agent 2 (replay FeatureSpec) |
-| `engineered_oot.parquet` | OOT sau Agent 2 (replay FeatureSpec) |
-
-### Shared (cả 2 mode)
-
-| File | Mô tả |
-|---|---|
+| `agent_execution.log` | Execution log chi tiết (timestamp + agent + action) |
+| `data_cleaner_report.json` | JSON Agent 1 — bao gồm `cleaning_spec` |
+| `feature_engineer_report.json` | JSON Agent 2 — bao gồm `feature_spec` |
+| `model_trainer_report.json` | JSON Agent 3 — best model, params, metrics |
+| `psi_report.csv` | PSI drift train↔OOT từng feature |
+| `stability_report.csv` | Mean / std Gini theo tháng |
+| `shap_psi_prune_log.csv` | Log từng step SHAP+PSI pruning |
+| `final_report.md` | Markdown report tổng hợp |
 | `final_model.pkl` | Model + encoders + feature list (joblib) |
 | `final_model_code.py` | Code inference standalone |
-| `data_cleaner_report.json` | JSON report Agent 1 — bao gồm `cleaning_spec` để inspect |
-| `feature_engineer_report.json` | JSON report Agent 2 — bao gồm `feature_spec` để inspect |
-| `model_trainer_report.json` | JSON report Agent 3 |
-| `psi_report.csv` | PSI drift của từng feature (Agent 3 step 5) |
-| `stability_report.csv` | Mean / std Gini theo tháng |
-| `shap_psi_prune_log.csv` | Log từng step pruning |
-| `final_report.md` | Markdown report toàn pipeline |
-| `agent_execution.log` | Execution log chi tiết |
+| `pipeline_process_data_cleaner.py` | Script replay Agent 1 trên data mới — embed `CleaningSpec` (drops + dtype_fixes + clip_bounds) inline, no agent/LLM dependency |
+| `pipeline_process_feature_engineer.py` + `feature_spec.pkl` | Script replay Agent 2 — load `feature_spec.pkl` sidecar (chứa fitted LabelEncoders) + apply interactions / encoders / one-hot / selected_features |
+| `pipeline_process_train_model.py` | Script replay Agent 3 — content giống `final_model_code.py` (inference dùng artifact đã train) |
+
+### Intermediate files KHÔNG còn lưu mặc định
+
+`clean_*.parquet` + `engineered_*.parquet` (handoff giữa các agent) được ghi vào **system tempdir** (`tempfile.mkdtemp()`) và **xoá khi pipeline kết thúc** (kể cả raise). Không chiếm chỗ đĩa.
+
+Nếu cần inspect intermediate (debugging, kiểm tra split mode), set:
+
+```env
+KEEP_INTERMEDIATES=true
+```
+
+→ intermediate files ghi thẳng vào `run_NN/` cùng với các artifact khác.
+
+### Sử dụng replay script
+
+```powershell
+# Apply lại Agent 1 transforms (drops + dtype fixes + clip) lên data mới
+python outputs/2026-06-08/run_01/pipeline_process_data_cleaner.py `
+    new_data.csv  cleaned.parquet
+
+# Apply Agent 2 transforms (encoders + interactions + select)
+# Đặt cả 2 file pipeline_process_feature_engineer.py + feature_spec.pkl cùng folder
+python outputs/2026-06-08/run_01/pipeline_process_feature_engineer.py `
+    cleaned.parquet  engineered.parquet
+
+# Inference qua Agent 3 — final_model.pkl đặt cùng folder
+python outputs/2026-06-08/run_01/pipeline_process_train_model.py
+```
 
 ### Sử dụng model đã train
 
@@ -414,4 +467,8 @@ Train data  ─►  FLAML        ─►  estimator + base hyperparams (AutoML)
 - Python 3.10+
 - Windows / macOS / Linux
 - GPU (tuỳ chọn) — auto-detect qua `nvidia-smi`
-- RAM khuyến nghị: ≥ 16 GB cho dataset 100k+ rows × 500+ cols; ≥ 32 GB cho 1M+ rows × 1000+ cols (hoặc dùng `--sample-ratio`)
+- RAM khuyến nghị (sau dtype-downcast tại Agent 3):
+  - ≥ 8 GB cho dataset 100k rows × 500 cols
+  - ≥ 16 GB cho 500k rows × 1500 cols (đã verify trên sample_data_x3)
+  - ≥ 32 GB cho 3M+ rows × 1500+ cols (hoặc dùng `--sample-ratio`)
+- Trên Linux/Docker: ưu tiên `/tmp` >= 4 GB free (xem `JOBLIB_TEMP_FOLDER` ở section memory savers)

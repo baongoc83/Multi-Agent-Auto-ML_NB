@@ -77,9 +77,9 @@ def main():
     # df.to_csv(test_data_path, index=False)
     
     Path("outputs").mkdir(exist_ok=True)
-    # input_csv = "outputs/sample_data.csv"
-    # test_data_path = "data/home-credit-default-risk/application_train_processed.csv"
-    test_data_path = "outputs/test_employee_data.csv"
+    # test_data_path = "D:/Ngoc/AI Project/Test_1st_version/multi-agent-auto-ml-v2/outputs/sample_data.csv"
+    test_data_path = r"D:\Ngoc\AI Project\Test_1st_version\multi-agent-auto-ml-v2\data\home-credit-default-risk\application_train_processed.csv"
+    # test_data_path = "outputs/test_employee_data.csv"
     
     print(f"Test dataset sample: {test_data_path}")
     # print(f"  - Shape: {df.shape}")
@@ -103,6 +103,20 @@ def main():
         # input_path là toàn bộ dataset; pipeline tự split:
         #   - Có date_col → train + valid_temporal + valid_random + oot (OOT temporal)
         #   - Không date_col → train (60%) + valid (20%) + test (20%)
+        # final_metrics = pipeline.run(
+        #     input_path=test_data_path,
+        #     target_column="label",
+        #     col_descriptions_path="D:/Ngoc/AI Project/Test_1st_version/multi-agent-auto-ml-v2/data/col_descriptions.json",
+        #     # col_descriptions_kwargs=dict(
+        #     #     col_name_field="Row",
+        #     #     col_desc_field="Description",
+        #     #     col_group_field="Table",
+        #     # ),
+        #     entity_id_col="customer_id",
+        #     composite_key_cols=["customer_id","snap_dt"],
+        #     domain="credit_risk",
+        #     model_type="binary_classification",
+        # )
         final_metrics = pipeline.run(
             input_path=test_data_path,
             target_column="TARGET",
@@ -198,24 +212,27 @@ def main():
                 print(f"  {k}: {v}")
 
         # ── Generated files ───────────────────────────────────────────────────
-        print("\nGenerated Files:")
+        print(f"\nRun directory: {Config.RUN_DIR}")
+        print("Generated Files:")
         files = [
-            ("outputs/clean_data.csv",                 "Cleaned dataset           — Agent 1"),
-            ("outputs/engineered_data.csv",            "Engineered features        — Agent 2"),
-            ("outputs/data_cleaner_report.json",       "Data cleaner report        — Agent 1"),
-            ("outputs/feature_engineer_report.json",   "Feature engineer report    — Agent 2"),
-            ("outputs/model_trainer_report.json",      "Model trainer report       — Agent 3"),
-            ("outputs/psi_report.csv",                 "PSI drift report           — Agent 3"),
-            ("outputs/stability_report.csv",           "Feature stability report   — Agent 3"),
-            ("outputs/shap_psi_prune_log.csv",         "SHAP+PSI pruning log       — Agent 3"),
-            ("outputs/final_model.pkl",                "Trained model artifact     — Agent 3"),
-            ("outputs/final_model_code.py",            "Standalone inference code  — Agent 3"),
-            ("outputs/final_report.md",                "Full pipeline report"),
-            ("outputs/agent_execution.log",            "Agent execution log"),
+            (Config.DATA_CLEANER_REPORT_PATH,        "Data cleaner report         — Agent 1"),
+            (Config.FEATURE_ENGINEER_REPORT_PATH,    "Feature engineer report     — Agent 2"),
+            (Config.MODEL_TRAINER_REPORT_PATH,       "Model trainer report        — Agent 3"),
+            (Config.PSI_REPORT_PATH,                 "PSI drift report            — Agent 3"),
+            (Config.STABILITY_REPORT_PATH,           "Feature stability report    — Agent 3"),
+            (Config.SHAP_PSI_PRUNE_LOG_PATH,         "SHAP+PSI pruning log        — Agent 3"),
+            (Config.FINAL_MODEL_PATH,                "Trained model artifact      — Agent 3"),
+            (Config.FINAL_MODEL_CODE_PATH,           "Standalone inference code   — Agent 3"),
+            (Config.FINAL_REPORT_PATH,               "Full pipeline report"),
+            (Config.EXECUTION_LOG_PATH,              "Agent execution log"),
+            (Config.PIPELINE_PROCESS_DC_PATH,        "Replay script               — Agent 1"),
+            (Config.PIPELINE_PROCESS_FE_PATH,        "Replay script               — Agent 2"),
+            (Config.PIPELINE_PROCESS_FE_SPEC_PATH,   "Fitted FeatureSpec sidecar  — Agent 2"),
+            (Config.PIPELINE_PROCESS_TM_PATH,        "Replay script               — Agent 3"),
         ]
         for filepath, description in files:
             mark = "✓" if Path(filepath).exists() else "✗"
-            print(f"  {mark} {filepath:<45} {description}")
+            print(f"  {mark} {filepath:<70} {description}")
 
         
     except Exception as e:

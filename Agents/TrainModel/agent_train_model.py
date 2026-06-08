@@ -19,6 +19,20 @@ from config import Config
 _SPLIT_MARKER = "_split_"
 
 
+def _smallest_int_dtype(n_classes: int) -> np.dtype:
+    """Smallest signed int dtype that fits LabelEncoder output range [0, n-1].
+
+    Used to keep encoded categorical columns at 1-4 bytes/row instead of int64's 8.
+    A 100k×1500 DataFrame at int8 is 150 MB; at int64 it's 1.2 GB — the difference
+    decides whether FLAML's internal X.copy() OOMs on Windows.
+    """
+    if n_classes <= 127:
+        return np.int8
+    if n_classes <= 32_767:
+        return np.int16
+    return np.int32
+
+
 class TrainModelAgent(BaseAgent):
     """
     Advanced model training agent: FLAML → Optuna → RFE → PSI → Stability → Final Model.
@@ -67,36 +81,65 @@ class TrainModelAgent(BaseAgent):
         return [c for c in df.columns if c not in exclude]
 
     def _fit_prepare_X(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Fit encoders on train data and transform. Call once on X_train."""
+        """Fit encoders on train data and transform. Call once on X_train.
+
+        Builds output column-by-column with smallest-fitting dtypes (int8/16/32 for
+        encoded categoricals, float32 for numerics) so the resulting DataFrame uses
+        ~4-8x less RAM than the naive float64/int64 default. Critical for FLAML
+        which calls X.copy() internally and can OOM on wide DataFrames.
+        """
         from sklearn.preprocessing import LabelEncoder
         self._cat_encoders = {}
-        out = df.copy()
-        for col in out.columns:
-            if out[col].dtype == object or hasattr(out[col].dtype, "categories"):
+        new_cols: Dict[str, np.ndarray] = {}
+        for col in df.columns:
+            s = df[col]
+            if s.dtype == object or hasattr(s.dtype, "categories"):
                 le = LabelEncoder()
-                series = out[col].fillna("__NA__").astype(str)
+                series = s.fillna("__NA__").astype(str)
                 # Always include "__NA__" so valid/OOT NaN values can be encoded
                 # even when train has no NaN for this column
-                le.fit(sorted(set(series.tolist()) | {"__NA__"}))
-                out[col] = le.transform(series)
+                le.fit(sorted(set(series) | {"__NA__"}))
+                dtype = _smallest_int_dtype(len(le.classes_))
+                new_cols[col] = le.transform(series).astype(dtype, copy=False)
                 self._cat_encoders[col] = le
+            elif pd.api.types.is_float_dtype(s):
+                new_cols[col] = s.fillna(-999).to_numpy(dtype=np.float32, copy=False)
+            elif pd.api.types.is_integer_dtype(s):
+                new_cols[col] = s.fillna(-999).to_numpy(dtype=np.int32, copy=False)
+            elif pd.api.types.is_bool_dtype(s):
+                new_cols[col] = s.to_numpy(dtype=np.int8, copy=False)
             else:
-                out[col] = out[col].fillna(-999)
-        return out
+                new_cols[col] = pd.to_numeric(s, errors="coerce") \
+                    .fillna(-999).to_numpy(dtype=np.float32, copy=False)
+        return pd.DataFrame(new_cols, index=df.index)
 
     def _transform_X(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Transform using encoders fitted on train. Use for valid/oot splits."""
-        out = df.copy()
-        for col in out.columns:
+        """Transform using encoders fitted on train. Use for valid/oot splits.
+
+        Mirrors the dtype choices made in _fit_prepare_X so X_train / X_valid / X_oot
+        share an identical schema (FLAML refuses validation data with dtype drift).
+        """
+        new_cols: Dict[str, np.ndarray] = {}
+        for col in df.columns:
+            s = df[col]
             if col in self._cat_encoders:
                 le = self._cat_encoders[col]
                 known = set(le.classes_)
-                vals = out[col].fillna("__NA__").astype(str)
+                vals = s.fillna("__NA__").astype(str)
                 # Unseen labels → "__NA__" (must exist in le.classes_ from fit)
-                out[col] = le.transform(vals.apply(lambda x: x if x in known else "__NA__"))
+                mapped = vals.where(vals.isin(known), "__NA__")
+                dtype = _smallest_int_dtype(len(le.classes_))
+                new_cols[col] = le.transform(mapped).astype(dtype, copy=False)
+            elif pd.api.types.is_float_dtype(s):
+                new_cols[col] = s.fillna(-999).to_numpy(dtype=np.float32, copy=False)
+            elif pd.api.types.is_integer_dtype(s):
+                new_cols[col] = s.fillna(-999).to_numpy(dtype=np.int32, copy=False)
+            elif pd.api.types.is_bool_dtype(s):
+                new_cols[col] = s.to_numpy(dtype=np.int8, copy=False)
             else:
-                out[col] = out[col].fillna(-999)
-        return out
+                new_cols[col] = pd.to_numeric(s, errors="coerce") \
+                    .fillna(-999).to_numpy(dtype=np.float32, copy=False)
+        return pd.DataFrame(new_cols, index=df.index)
 
     # ── Model class lookup ────────────────────────────────────────────────────
 
@@ -1147,6 +1190,13 @@ if __name__ == "__main__":
         Path(Config.FINAL_MODEL_CODE_PATH).write_text(code, encoding="utf-8")
         self.logger.log(self.name, "Model Code Saved", Config.FINAL_MODEL_CODE_PATH)
 
+        # Per-agent replay script — same content as final_model_code.py since
+        # Agent 3's "process" is encoded entirely in the trained artifact.
+        # Surfacing it under the pipeline_process_* naming keeps the trio of
+        # replay files visible together for users.
+        Path(Config.PIPELINE_PROCESS_TM_PATH).write_text(code, encoding="utf-8")
+        self.logger.log(self.name, "Process Script Saved", Config.PIPELINE_PROCESS_TM_PATH)
+
     # ── Split-mode entry point ────────────────────────────────────────────────
 
     def process_splits(
@@ -1426,13 +1476,13 @@ if __name__ == "__main__":
         }
         self.save_report(report, Config.MODEL_TRAINER_REPORT_PATH)
 
-        Path(Config.OUTPUT_DIR).mkdir(exist_ok=True)
+        Path(Config.RUN_DIR).mkdir(parents=True, exist_ok=True)
         if not psi_df.empty:
-            psi_df.to_csv(f"{Config.OUTPUT_DIR}/psi_report.csv", index=False)
+            psi_df.to_csv(Config.PSI_REPORT_PATH, index=False)
         if not stab_df.empty:
-            stab_df.to_csv(f"{Config.OUTPUT_DIR}/stability_report.csv", index=False)
+            stab_df.to_csv(Config.STABILITY_REPORT_PATH, index=False)
         if not prune_df.empty:
-            prune_df.to_csv(f"{Config.OUTPUT_DIR}/shap_psi_prune_log.csv", index=False)
+            prune_df.to_csv(Config.SHAP_PSI_PRUNE_LOG_PATH, index=False)
 
         self.logger.log(self.name, "Process Complete",
             f"best={best_estimator} | features={len(final_features)} | "

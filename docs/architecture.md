@@ -2,8 +2,7 @@
 
 Tài liệu mô tả trực quan từng phần của pipeline. Mọi sơ đồ dùng [Mermaid](https://mermaid.js.org/) và render trực tiếp trên GitHub.
 
-> **Architecture v1.1 — fit-on-train + transform-on-valid/oot.**
-> Concat-mode cũ (`combined_input.parquet` + `_split_` marker xuyên Agent 1+2) đã bỏ. Mỗi agent giờ FIT trên train, capture spec, REPLAY lên valid/oot riêng biệt → peak RAM ≈ partition lớn nhất.
+> **Architecture v1.1**
 
 ---
 
@@ -43,12 +42,25 @@ multi-agent-auto-ml-v1.1/
 │   ├── awareness-pattern.md             ◄── Agentic pattern reference
 │   └── config_params.md                 ◄── Reference ~75 config params
 │
-├── outputs/                             ◄── Auto-tạo, chứa toàn bộ output (parquet)
+├── outputs/                             ◄── Auto-tạo
+│   └── YYYY-MM-DD/                          ◄── 1 thư mục / ngày
+│       └── run_NN/                              ◄── 1 thư mục / lần chạy (counter reset mỗi ngày)
+│           ├── agent_execution.log
+│           ├── data_cleaner_report.json, feature_engineer_report.json, model_trainer_report.json
+│           ├── psi_report.csv, stability_report.csv, shap_psi_prune_log.csv
+│           ├── final_report.md
+│           ├── final_model.pkl, final_model_code.py
+│           ├── pipeline_process_data_cleaner.py        ◄── replay Agent 1 (embed CleaningSpec)
+│           ├── pipeline_process_feature_engineer.py    ◄── replay Agent 2
+│           ├── feature_spec.pkl                            ◄── sidecar (fitted LabelEncoders)
+│           └── pipeline_process_train_model.py         ◄── replay Agent 3 (= inference code)
 └── tests/
     ├── test_agent1.py
     ├── test_agent2.py
     └── test_agent3.py
 ```
+
+Intermediate `clean_*.parquet` / `engineered_*.parquet` (handoff giữa agents) **không lưu vào `run_NN/`** — ghi vào system tempdir và xoá sau khi pipeline kết thúc (try/finally). Set `KEEP_INTERMEDIATES=true` trong `.env` nếu muốn giữ để debug.
 
 ### Mối quan hệ giữa các module
 
@@ -359,16 +371,11 @@ Tránh được crash `AttributeError: Can only use .str accessor with string va
 
 ### Output
 
-**Split mode**: 3 files
-- `outputs/clean_train.parquet`
-- `outputs/clean_valid.parquet` (nếu valid_path set)
-- `outputs/clean_oot.parquet` (nếu oot_path set)
+Intermediate handoff files (`clean_*.parquet`) ghi vào **system tempdir** (`TMP_DIR`) và xoá sau khi pipeline kết thúc — không vào `run_NN/` (set `KEEP_INTERMEDIATES=true` để giữ).
 
-**Single-file mode**: 1 file
-- `outputs/clean_data.parquet`
-
-**Cả 2 mode**:
-- `outputs/data_cleaner_report.json` — chứa `entity_id_col`, `composite_key_cols`, `target_column`, `actions_taken`, `summary`, `cleaning_spec` (serialized)
+**Persisted vào `RUN_DIR` = `outputs/YYYY-MM-DD/run_NN/`** (cả 2 mode):
+- `data_cleaner_report.json` — chứa `entity_id_col`, `composite_key_cols`, `target_column`, `actions_taken`, `summary`, `cleaning_spec` (serialized)
+- `pipeline_process_data_cleaner.py` — script Python standalone replay `CleaningSpec` (drops + dtype_fixes + clip_bounds embed inline) trên data mới
 
 ---
 
@@ -489,16 +496,12 @@ Nếu LLM bỏ qua thứ tự (vd. select trước encode), các cột object s�
 
 ### Output
 
-**Split mode**: 3 files
-- `outputs/engineered_train.parquet`
-- `outputs/engineered_valid.parquet` (nếu valid_path set)
-- `outputs/engineered_oot.parquet` (nếu oot_path set)
+Intermediate `engineered_*.parquet` ghi vào `TMP_DIR` và xoá sau khi pipeline kết thúc (giống Agent 1).
 
-**Single-file mode**: 1 file
-- `outputs/engineered_data.parquet`
-
-**Cả 2 mode**:
-- `outputs/feature_engineer_report.json` — forward `entity_id_col`, `composite_key_cols`, `target_column`, `feature_spec` (serialized)
+**Persisted vào `RUN_DIR`** (cả 2 mode):
+- `feature_engineer_report.json` — forward `entity_id_col`, `composite_key_cols`, `target_column`, `feature_spec` (serialized)
+- `pipeline_process_feature_engineer.py` — script standalone replay FeatureSpec
+- `feature_spec.pkl` — sidecar chứa fitted `LabelEncoder` objects (không embed được inline)
 
 ---
 
@@ -727,16 +730,18 @@ flowchart TD
 | `_tool_shap_psi_prune` | Iterative SHAP+PSI prune |
 | `_tool_train_final_model` | Train final + eval đa split |
 
-### Output
+### Output (persisted vào `RUN_DIR` = `outputs/YYYY-MM-DD/run_NN/`)
 
 | File | Mô tả |
 |---|---|
-| `outputs/final_model.pkl` | model + cat_encoders + feature_cols + target |
-| `outputs/final_model_code.py` | Standalone inference code |
-| `outputs/model_trainer_report.json` | JSON report đầy đủ |
-| `outputs/psi_report.csv` | PSI score từng feature |
-| `outputs/stability_report.csv` | Mean + std Gini theo tháng |
-| `outputs/shap_psi_prune_log.csv` | Log từng step pruning |
+| `final_model.pkl` | model + cat_encoders + feature_cols + target |
+| `final_model_code.py` | Standalone inference code |
+| `pipeline_process_train_model.py` | Bản copy của `final_model_code.py` dưới naming `pipeline_process_*` cho consistent với Agent 1+2 |
+| `model_trainer_report.json` | JSON report đầy đủ |
+| `psi_report.csv` | PSI score từng feature |
+| `stability_report.csv` | Mean + std Gini theo tháng |
+| `shap_psi_prune_log.csv` | Log từng step pruning |
+| `final_report.md` + `agent_execution.log` | Markdown report tổng + execution log |
 
 ---
 
@@ -800,6 +805,27 @@ sequenceDiagram
 ```
 
 **Memory profile**: ở mỗi thời điểm chỉ có 1 partition trong RAM (Agent 1+2). Agent 3 concat 3 file → cần RAM cho toàn bộ data, nhưng đây là điểm bắt buộc vì FLAML/Optuna/CV cần tất cả slices để compute metrics.
+
+**Tối ưu RAM tại Agent 3** (`_fit_prepare_X`):
+
+```mermaid
+flowchart LR
+    In[df slice<br/>float64 + object] --> Iter[Iter từng cột<br/>không df.copy đầu]
+    Iter --> Cat{Object<br/>or category?}
+    Cat -->|yes| LE[LabelEncoder.fit_transform<br/>+ astype int dtype]
+    Cat -->|no| Float{is_float_dtype?}
+    Float -->|yes| F32[fillna -999<br/>+ to_numpy float32]
+    Float -->|no| Int[fillna -999<br/>+ to_numpy int32 / int8]
+    LE --> N1[smallest signed int<br/>int8 ≤127, int16 ≤32k, int32 lớn hơn]
+    N1 --> Dict[Build dict cột]
+    F32 --> Dict
+    Int --> Dict
+    Dict --> Out[pd.DataFrame from dict<br/>~4-8× nhỏ hơn input]
+```
+
+Benchmark (50k × 1400 mixed): 1.82 GB → 190 MB (≈9.6×). Cho case 100k × 1455 features hỗn hợp, alloc int64 matrix ban đầu 1.08 GB → ~150-450 MB sau downcast tùy tỉ lệ cat/num.
+
+**Joblib temp folder**: Khi FLAML / sklearn dùng `n_jobs>1`, joblib stage X_train ra `.pkl` cho worker memory-map. `config.py` auto-set `JOBLIB_TEMP_FOLDER=tempfile.gettempdir()` (Linux: `/tmp`, Windows: `%TEMP%`) ngay khi import — tránh `BrokenProcessPool: FileNotFoundError` trên Docker (`/dev/shm` mặc định 64 MB). User override qua `.env`.
 
 ---
 

@@ -57,9 +57,16 @@ class AutoMLPipeline:
     """
 
     def __init__(self):
+        # Allocate run dir BEFORE the logger is constructed — AgentLogger reads
+        # Config.EXECUTION_LOG_PATH at __init__ time, so init_run() must update
+        # the Config path attrs first or the log goes to the stale default.
+        Path(Config.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+        run_dir = Config.init_run()
         self.logger = AgentLogger()
         self.handoff = Handoff(self.logger)
-        Path(Config.OUTPUT_DIR).mkdir(exist_ok=True)
+        self.logger.log("PIPELINE", "Run dir",
+            f"persisted → {run_dir} | intermediates → "
+            f"{'(same dir, KEEP_INTERMEDIATES=true)' if Config.KEEP_INTERMEDIATES else Config.TMP_DIR}")
 
     # ── Schema validation (split mode) ──────────────────────────────────────
 
@@ -416,24 +423,30 @@ class AutoMLPipeline:
             f"Input: {input_path} | Target: {target_column} | Domain: {domain} | "
             f"Model: {model_type} | Mode: {mode_label}")
 
-        if split_mode:
-            return self._run_split_mode(
-                train_path=input_path, valid_path=valid_path, oot_path=oot_path,
-                target_column=target_column,
+        try:
+            if split_mode:
+                return self._run_split_mode(
+                    train_path=input_path, valid_path=valid_path, oot_path=oot_path,
+                    target_column=target_column,
+                    col_descriptions_path=col_descriptions_path,
+                    col_descriptions_kwargs=col_descriptions_kwargs,
+                    entity_id_col=entity_id_col, composite_key_cols=composite_key_cols,
+                    train_sample_ratio=train_sample_ratio, prefilter=prefilter,
+                    check_distribution=check_distribution,
+                    domain=domain, model_type=model_type,
+                )
+            return self._run_single_mode(
+                input_path=input_path, target_column=target_column,
                 col_descriptions_path=col_descriptions_path,
                 col_descriptions_kwargs=col_descriptions_kwargs,
                 entity_id_col=entity_id_col, composite_key_cols=composite_key_cols,
-                train_sample_ratio=train_sample_ratio, prefilter=prefilter,
-                check_distribution=check_distribution,
                 domain=domain, model_type=model_type,
             )
-        return self._run_single_mode(
-            input_path=input_path, target_column=target_column,
-            col_descriptions_path=col_descriptions_path,
-            col_descriptions_kwargs=col_descriptions_kwargs,
-            entity_id_col=entity_id_col, composite_key_cols=composite_key_cols,
-            domain=domain, model_type=model_type,
-        )
+        finally:
+            # Remove the intermediate tempdir even when the pipeline raises —
+            # /tmp/automl_pipeline_* gigabytes lying around defeat the point of
+            # writing them out of RUN_DIR in the first place.
+            Config.cleanup_run()
 
     # ── Mode 1: split (train + valid + oot) ─────────────────────────────────
 

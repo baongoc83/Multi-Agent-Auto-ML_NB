@@ -81,18 +81,44 @@ Thứ tự fallback: **LiteLLM proxy → OpenAI → Claude**
 
 ## Output Paths
 
+Mọi artifact persisted nằm dưới `outputs/<YYYY-MM-DD>/run_<NN>/` — run_NN counter reset mỗi ngày (xem section "Run directory layout" bên dưới).
+
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
-| `OUTPUT_DIR` | `outputs` | Thư mục gốc lưu tất cả kết quả |
-| `CLEAN_DATA_PATH` | `outputs/clean_data.csv` | File CSV sau khi Agent 1 (DataCleaner) xử lý xong |
-| `ENGINEERED_DATA_PATH` | `outputs/engineered_data.csv` | File CSV sau khi Agent 2 (FeatureEngineer) xử lý xong |
-| `FINAL_MODEL_CODE_PATH` | `outputs/final_model_code.py` | File Python chứa code model cuối cùng |
-| `FINAL_MODEL_PATH` | `outputs/final_model.pkl` | Artifact model đã train (joblib pickle) cùng encoders + feature list |
-| `FINAL_REPORT_PATH` | `outputs/final_report.md` | Báo cáo tổng hợp toàn pipeline dạng Markdown |
-| `EXECUTION_LOG_PATH` | `outputs/agent_execution.log` | Log toàn bộ quá trình chạy các agent |
-| `DATA_CLEANER_REPORT_PATH` | `outputs/data_cleaner_report.json` | JSON report của Agent 1 |
-| `FEATURE_ENGINEER_REPORT_PATH` | `outputs/feature_engineer_report.json` | JSON report của Agent 2 |
-| `MODEL_TRAINER_REPORT_PATH` | `outputs/model_trainer_report.json` | JSON report của Agent 3 |
+| `OUTPUT_DIR` | `outputs` | Thư mục gốc. Path day + run được `Config.init_run()` tạo runtime |
+| `KEEP_INTERMEDIATES` | `false` | Khi `true`, các file handoff `clean_*.parquet` / `engineered_*.parquet` cũng giữ trong `run_NN/` (cho debug/test). Mặc định ghi vào system tempdir và xoá khi pipeline kết thúc |
+
+Các path constants dưới đây **được Config.init_run() set lại runtime** trỏ vào `RUN_DIR`. Default value khi Config import là rỗng (chưa allocated run).
+
+| Constant | Tên file trong run_NN/ | Vai trò |
+|---|---|---|
+| `EXECUTION_LOG_PATH` | `agent_execution.log` | Execution log tổng hợp 3 agent |
+| `DATA_CLEANER_REPORT_PATH` | `data_cleaner_report.json` | Report Agent 1 + `cleaning_spec` |
+| `FEATURE_ENGINEER_REPORT_PATH` | `feature_engineer_report.json` | Report Agent 2 + `feature_spec` |
+| `MODEL_TRAINER_REPORT_PATH` | `model_trainer_report.json` | Report Agent 3 |
+| `PSI_REPORT_PATH` | `psi_report.csv` | PSI drift mỗi feature |
+| `STABILITY_REPORT_PATH` | `stability_report.csv` | Mean/std Gini theo tháng |
+| `SHAP_PSI_PRUNE_LOG_PATH` | `shap_psi_prune_log.csv` | Log iterative pruning |
+| `FINAL_REPORT_PATH` | `final_report.md` | Markdown report tổng pipeline |
+| `FINAL_MODEL_PATH` | `final_model.pkl` | Trained model + encoders (joblib) |
+| `FINAL_MODEL_CODE_PATH` | `final_model_code.py` | Inference code standalone |
+| `PIPELINE_PROCESS_DC_PATH` | `pipeline_process_data_cleaner.py` | Script replay Agent 1 |
+| `PIPELINE_PROCESS_FE_PATH` | `pipeline_process_feature_engineer.py` | Script replay Agent 2 |
+| `PIPELINE_PROCESS_FE_SPEC_PATH` | `feature_spec.pkl` | Sidecar fitted FeatureSpec |
+| `PIPELINE_PROCESS_TM_PATH` | `pipeline_process_train_model.py` | Script replay Agent 3 (= inference code) |
+
+Intermediate handoff files (`CLEAN_DATA_PATH`, `ENGINEERED_DATA_PATH`, `CLEAN_TRAIN_PATH`, `CLEAN_VALID_PATH`, `CLEAN_OOT_PATH`, `ENGINEERED_TRAIN_PATH`, `ENGINEERED_VALID_PATH`, `ENGINEERED_OOT_PATH`) trỏ vào `TMP_DIR` (= `tempfile.mkdtemp()` mặc định) và **bị xoá sau khi pipeline kết thúc** (kể cả khi raise — try/finally).
+
+### Run directory layout
+
+```
+outputs/YYYY-MM-DD/
+├── run_01/   ← lần chạy 1 của ngày
+├── run_02/   ← lần chạy 2 của ngày
+└── run_NN/   ← max(NN)+1 dùng (không phải len+1 → tránh collision nếu xoá giữa)
+```
+
+Counter reset = sang ngày mới, thư mục `YYYY-MM-DD/` mới rỗng → `init_run()` bắt đầu lại từ `run_01`. Không cần config.
 
 ---
 
@@ -266,3 +292,41 @@ Loại bỏ feature có SHAP importance thấp + PSI drift cao theo từng bư�
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
 | `OVERFIT_THRESHOLD` | `0.12` | Gap tương đối `(valid_auc - holdout_auc) / valid_auc` > 12% → flag overfit và trigger LLM-guided retrain |
+
+---
+
+## Parallel Worker Staging (joblib)
+
+Joblib (sklearn/FLAML/Optuna nội bộ) cần serialize `X_train` ra file `.pkl` để worker process đọc memory-map. Path mặc định trên Linux là `/dev/shm` — tmpfs rất nhỏ (Docker default **64 MB**) → file bị truncate → `BrokenProcessPool: FileNotFoundError`.
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `JOBLIB_TEMP_FOLDER` | `tempfile.gettempdir()` | Thư mục stage `.pkl` cho joblib workers. Auto-set tại `config.py` import time (Linux: `/tmp`, Windows: `%TEMP%`). Override khi `/tmp` cũng nhỏ — point vào disk-backed path có vài GB free, ví dụ `/data/joblib_tmp` |
+
+**Khi nào cần override**:
+- Container Linux có `/tmp` mount tmpfs nhỏ
+- Dataset train > 5 GB sau dtype downcast
+- Thấy lỗi `BrokenProcessPool` mid-CV / mid-Optuna
+
+`setdefault` được dùng → user override trong `.env` luôn được respect.
+
+---
+
+## Memory Optimization Notes
+
+Pipeline áp 4 lớp tối ưu RAM mặc định (không có env knob — đã built-in):
+
+1. **Agent 1 prefilter** (`PREFILTER_MAX_NULL_RATIO`, `PREFILTER_MAX_DOMINANT_RATIO` ở section trên) — drop cột rác trước khi vào Agent 2
+2. **Agent 2 metadata-only dtype iter** — `select_top_features` đọc `df.dtypes` thay vì `df[feature_cols].select_dtypes()` (slice cũ trigger block consolidation → alloc float64 matrix `(n_cols, n_rows)` → spike vài GB)
+3. **Agent 3 dtype downcast tại fit** — `_fit_prepare_X` rewrite:
+   - Object/cat → smallest signed int (`int8` ≤127 cats, `int16` ≤32k, `int32` lớn hơn) — chọn theo `len(le.classes_)` tự động
+   - Float64 → `float32` (50% RAM)
+   - Int64 → `int32`
+   - Bool → `int8`
+4. **Per-partition release** — `del agent + gc.collect()` giữa các stage
+
+**Benchmark** (50k × 1400 mixed cols):
+- Trước downcast: 1.82 GB
+- Sau downcast: 190 MB (≈9.6×)
+
+Cộng dồn 3 lớp + `JOBLIB_TEMP_FOLDER` đủ chạy 500k × 1500 cols dưới 8 GB RAM trên Linux/Docker.
