@@ -66,6 +66,11 @@ class Config:
     # Set KEEP_INTERMEDIATES=true to redirect TMP_DIR → RUN_DIR (debugging, tests).
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "outputs")
     KEEP_INTERMEDIATES: bool = os.getenv("KEEP_INTERMEDIATES", "false").lower() == "true"
+    # Minimum free disk space (GB) on OUTPUT_DIR's filesystem at pipeline start.
+    # Pipeline raises if below this — prevents mid-run write failures on production
+    # batch jobs. Default 2 GB is enough for a typical run; bump for very wide
+    # datasets where engineered_*.parquet + final reports exceed that.
+    MIN_DISK_FREE_GB: float = float(os.getenv("MIN_DISK_FREE_GB", 2.0))
 
     # Populated by init_run() — defaults so import-time access does not crash.
     RUN_DIR: str = OUTPUT_DIR
@@ -82,6 +87,9 @@ class Config:
     PSI_REPORT_PATH: str = f"{OUTPUT_DIR}/psi_report.csv"
     STABILITY_REPORT_PATH: str = f"{OUTPUT_DIR}/stability_report.csv"
     SHAP_PSI_PRUNE_LOG_PATH: str = f"{OUTPUT_DIR}/shap_psi_prune_log.csv"
+    # Final-model SHAP importance visual + LLM-generated explanations for top features
+    SHAP_PLOT_PATH: str = f"{OUTPUT_DIR}/shap_summary.png"
+    SHAP_FEATURE_REPORT_PATH: str = f"{OUTPUT_DIR}/shap_feature_explanations.csv"
     # Per-agent replay scripts (new — let user re-run each agent's transforms on
     # fresh input without re-doing the LLM analysis).
     PIPELINE_PROCESS_DC_PATH: str = f"{OUTPUT_DIR}/pipeline_process_data_cleaner.py"
@@ -125,9 +133,25 @@ class Config:
                 used_nums.append(int(d.name.split("_", 1)[1]))
             except (IndexError, ValueError):
                 continue
-        next_n = (max(used_nums) + 1) if used_nums else 1
-        run_dir = base / f"run_{next_n:02d}"
-        run_dir.mkdir(parents=True, exist_ok=True)
+        candidate_n = (max(used_nums) + 1) if used_nums else 1
+        # Atomic claim via mkdir(exist_ok=False): if a parallel process picked the
+        # same number first we get FileExistsError and probe the next slot. Caps
+        # at 256 attempts to avoid pathological loops; in practice resolves on
+        # attempt 0 or 1 even under heavy concurrent batch automation.
+        run_dir = None
+        for offset in range(256):
+            candidate = base / f"run_{candidate_n + offset:02d}"
+            try:
+                candidate.mkdir(parents=True, exist_ok=False)
+                run_dir = candidate
+                break
+            except FileExistsError:
+                continue
+        if run_dir is None:
+            raise RuntimeError(
+                f"Could not allocate a fresh run_NN under {base} after 256 attempts "
+                "— filesystem race or stale dirs blocking allocation"
+            )
         cls.RUN_DIR = str(run_dir)
 
         if cls.KEEP_INTERMEDIATES:
@@ -147,6 +171,8 @@ class Config:
         cls.PSI_REPORT_PATH               = f"{rd}/psi_report.csv"
         cls.STABILITY_REPORT_PATH         = f"{rd}/stability_report.csv"
         cls.SHAP_PSI_PRUNE_LOG_PATH       = f"{rd}/shap_psi_prune_log.csv"
+        cls.SHAP_PLOT_PATH                = f"{rd}/shap_summary.png"
+        cls.SHAP_FEATURE_REPORT_PATH      = f"{rd}/shap_feature_explanations.csv"
         cls.PIPELINE_PROCESS_DC_PATH      = f"{rd}/pipeline_process_data_cleaner.py"
         cls.PIPELINE_PROCESS_FE_PATH      = f"{rd}/pipeline_process_feature_engineer.py"
         cls.PIPELINE_PROCESS_FE_SPEC_PATH = f"{rd}/feature_spec.pkl"
@@ -198,7 +224,7 @@ class Config:
 
     # ── Data Cleaning ─────────────────────────────────────────────────────────
     # Drop columns whose null ratio exceeds this threshold
-    NULL_DROP_THRESHOLD: float = float(os.getenv("NULL_DROP_THRESHOLD", 0.8))
+    NULL_DROP_THRESHOLD: float = float(os.getenv("NULL_DROP_THRESHOLD", 0.9))
     # Columns with more unique values than this skip value_counts display
     HIGH_CARDINALITY_THRESHOLD: int = int(os.getenv("HIGH_CARDINALITY_THRESHOLD", 50))
     # How many columns' stats to include in the analysis sample
@@ -216,7 +242,7 @@ class Config:
     # Duplicated application entities percentage above this triggers deduplicate_by_key
     APP_DUP_PCT_THRESHOLD: float = float(os.getenv("APP_DUP_PCT_THRESHOLD", 10.0))
     # Outlier percentage (IQR 3x) above this triggers a clip suggestion
-    OUTLIER_PCT_THRESHOLD: float = float(os.getenv("OUTLIER_PCT_THRESHOLD", 5.0))
+    OUTLIER_PCT_THRESHOLD: float = float(os.getenv("OUTLIER_PCT_THRESHOLD", 3.0))
     # Class imbalance ratio (max/min class count) above this is flagged
     IMBALANCE_RATIO_THRESHOLD: float = float(os.getenv("IMBALANCE_RATIO_THRESHOLD", 20.0))
     # Max numeric columns to run outlier detection on (for performance)
@@ -228,17 +254,17 @@ class Config:
     # Features with |correlation| below this are flagged for removal
     MIN_CORRELATION_THRESHOLD: float = float(os.getenv("MIN_CORRELATION_THRESHOLD", 0.001))
     # Ceiling for FeatureEngineerAgent.select_top_features (overridable via env var)
-    TOP_K_FEATURES_CAP: int = int(os.getenv("TOP_K_FEATURES_CAP", 350))
+    TOP_K_FEATURES_CAP: int = int(os.getenv("TOP_K_FEATURES_CAP", 800))
     # Fraction of engineerable features kept by select_top_features (0 < ratio <= 1)
     TOP_K_RATIO: float = float(os.getenv("TOP_K_RATIO", 0.70))
     # Fraction of numeric columns to include in LLM prompt metadata (0 < ratio <= 1)
     FEATURE_META_NUMERIC_RATIO: float = float(os.getenv("FEATURE_META_NUMERIC_RATIO", 0.6))
     # Absolute ceiling for numeric columns in LLM prompt (safety net for very wide datasets)
-    FEATURE_META_MAX_NUMERIC_COLS: int = int(os.getenv("FEATURE_META_MAX_NUMERIC_COLS", 200))
+    FEATURE_META_MAX_NUMERIC_COLS: int = int(os.getenv("FEATURE_META_MAX_NUMERIC_COLS", 300))
     # Max categorical columns to include full per-column metadata in the LLM prompt
-    FEATURE_META_MAX_CATEGORICAL_COLS: int = int(os.getenv("FEATURE_META_MAX_CATEGORICAL_COLS", 40))
+    FEATURE_META_MAX_CATEGORICAL_COLS: int = int(os.getenv("FEATURE_META_MAX_CATEGORICAL_COLS", 80))
     # Max description entries shown per group in the LLM prompt column-description block
-    MAX_DESC_PER_GROUP: int = int(os.getenv("MAX_DESC_PER_GROUP", 30))
+    MAX_DESC_PER_GROUP: int = int(os.getenv("MAX_DESC_PER_GROUP", 50))
 
     # ── Model Training ────────────────────────────────────────────────────────
     TRAIN_TEST_SPLIT_SIZE: float = float(os.getenv("TRAIN_TEST_SPLIT_SIZE", 0.2))
@@ -277,20 +303,20 @@ class Config:
     VALID_TEMPORAL_RATIO: float = float(os.getenv("VALID_TEMPORAL_RATIO", 0.20))
 
     # ── FLAML AutoML ──────────────────────────────────────────────────────────
-    FLAML_TIME_BUDGET: int = int(os.getenv("FLAML_TIME_BUDGET", 600))
+    FLAML_TIME_BUDGET: int = int(os.getenv("FLAML_TIME_BUDGET", 1200))
     FLAML_ESTIMATORS: str = os.getenv("FLAML_ESTIMATORS", "xgboost,lgbm,catboost,rf,extra_tree")
     FLAML_N_SPLITS: int = int(os.getenv("FLAML_N_SPLITS", 5))
     # Max training rows passed to FLAML — FLAML internally copies the DataFrame for block
     # consolidation which can OOM on large datasets. Sampling here keeps the copy small
     # while still giving FLAML enough signal to select the best estimator type.
-    FLAML_MAX_ROWS: int = int(os.getenv("FLAML_MAX_ROWS", 100_000))
+    FLAML_MAX_ROWS: int = int(os.getenv("FLAML_MAX_ROWS", 500_000))
 
     # ── Optuna ────────────────────────────────────────────────────────────────
     OPTUNA_N_TRIALS: int = int(os.getenv("OPTUNA_N_TRIALS", 50))
-    OPTUNA_TIMEOUT: int = int(os.getenv("OPTUNA_TIMEOUT", 600))
+    OPTUNA_TIMEOUT: int = int(os.getenv("OPTUNA_TIMEOUT", 1200))
 
     # ── RFE ───────────────────────────────────────────────────────────────────
-    RFE_TARGET_FEATURES: int = int(os.getenv("RFE_TARGET_FEATURES", 50))
+    RFE_TARGET_FEATURES: int = int(os.getenv("RFE_TARGET_FEATURES", 150))
     RFE_STEP: float = float(os.getenv("RFE_STEP", 0.05))
     RFE_CV_SPLITS: int = int(os.getenv("RFE_CV_SPLITS", 3))
     ENABLE_RFECV: bool = os.getenv("ENABLE_RFECV", "false").lower() == "true"
@@ -304,7 +330,7 @@ class Config:
     # ── Stability ─────────────────────────────────────────────────────────────
     STABILITY_MIN_MONTHS: int = int(os.getenv("STABILITY_MIN_MONTHS", 6))
     STABILITY_GINI_STD_THRESHOLD: float = float(os.getenv("STABILITY_GINI_STD_THRESHOLD", 0.15))
-    STABILITY_MIN_GINI: float = float(os.getenv("STABILITY_MIN_GINI", 0.02))
+    STABILITY_MIN_GINI: float = float(os.getenv("STABILITY_MIN_GINI", 0.01))
 
     # ── Final Feature Cut ─────────────────────────────────────────────────────
     MAX_FINAL_FEATURES: int = int(os.getenv("MAX_FINAL_FEATURES", 100))
@@ -321,10 +347,19 @@ class Config:
     # Relative floor: keep at least this fraction of MAX_FINAL_FEATURES
     SHAP_PSI_MIN_FEATURES_RATIO: float = float(os.getenv("SHAP_PSI_MIN_FEATURES_RATIO", 0.10))
 
+    # ── Final SHAP visual + LLM-generated explanations ────────────────────────
+    # Generate shap_summary.png + LLM explanation of top features after the
+    # final model is trained. Set to "false" to skip (saves SHAP compute time
+    # and one LLM call when running purely automated batches).
+    SHAP_FINAL_EXPLAIN_ENABLED: bool = os.getenv("SHAP_FINAL_EXPLAIN_ENABLED", "true").lower() == "true"
+    # How many top features to ask the LLM to explain. Plot shows up to 2x this
+    # so users can see the broader importance distribution.
+    SHAP_FINAL_EXPLAIN_TOP_N: int = int(os.getenv("SHAP_FINAL_EXPLAIN_TOP_N", 20))
+
     # ── Pipeline Stage-0 distribution drift check ────────────────────────────
     # Sample size per partition for the PSI-based train↔valid / train↔oot
     # comparison. ~50K rows × n_cols stays well under 1 GB even for wide data.
-    DRIFT_SAMPLE_N: int = int(os.getenv("DRIFT_SAMPLE_N", 50_000))
+    DRIFT_SAMPLE_N: int = int(os.getenv("DRIFT_SAMPLE_N", 100_000))
     # PSI value above which a column is flagged as drifting between partitions.
     # Reusing PSI_THRESHOLD (default 0.3, finance-standard) means the pipeline
     # warning matches Agent 3's feature-drop threshold — what gets flagged here
@@ -408,7 +443,13 @@ class Config:
         from openai import OpenAI
         if not cls.OPENAI_API_KEY:
             return None
-        return OpenAI(api_key=cls.OPENAI_API_KEY)
+        # Same defensive pattern as get_claude_client — explicit base_url stops
+        # any stray OPENAI_BASE_URL env var from rerouting the public-OpenAI
+        # fallback to a local/internal endpoint that may not be running.
+        return OpenAI(
+            api_key=cls.OPENAI_API_KEY,
+            base_url="https://api.openai.com/v1",
+        )
 
     @classmethod
     def get_claude_client(cls):
@@ -416,7 +457,16 @@ class Config:
             return None
         try:
             import anthropic
-            return anthropic.Anthropic(api_key=cls.ANTHROPIC_API_KEY)
+            # Explicit base_url overrides ANTHROPIC_BASE_URL env var. That env var
+            # is meant for LLM_BACKEND=gateway only — if it leaks into legacy mode
+            # (common when user copies .env.example which sets it to
+            # http://localhost:4000), the anthropic SDK routes calls to localhost
+            # instead of api.anthropic.com → WinError 10061 / Connection refused
+            # when no LiteLLM proxy is running.
+            return anthropic.Anthropic(
+                api_key=cls.ANTHROPIC_API_KEY,
+                base_url="https://api.anthropic.com",
+            )
         except ImportError:
             return None
 

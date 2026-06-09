@@ -49,7 +49,12 @@ class TrainModelAgent(BaseAgent):
       8. Final    : Train + evaluate on CV / valid-temporal / valid-random / OOT
     """
 
-    def __init__(self, logger: AgentLogger):
+    def __init__(
+        self,
+        logger: AgentLogger,
+        col_descriptions: Optional[Dict[str, str]] = None,
+        domain: str = "generic",
+    ):
         super().__init__(name="TrainModel", role="Advanced ML Pipeline Engineer", logger=logger)
         self.df: pd.DataFrame = None
         self.target_column: str = None
@@ -59,6 +64,10 @@ class TrainModelAgent(BaseAgent):
         self.feature_cols: List[str] = []
         self._cat_encoders: Dict[str, Any] = {}
         self.model: Any = None
+        # Forwarded from FeatureEngineer / Pipeline so the post-training SHAP
+        # explain step can ground the LLM's narrative in real column semantics.
+        self._col_descriptions: Dict[str, str] = col_descriptions or {}
+        self._domain: str = domain
 
     # ── Column auto-detection ─────────────────────────────────────────────────
 
@@ -1098,6 +1107,35 @@ class TrainModelAgent(BaseAgent):
 
     # ── Model persistence ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _collect_runtime_versions(estimator_class_name: str) -> Dict[str, str]:
+        """Snapshot the library versions used at training time.
+
+        Stored in the joblib artifact so the inference environment can warn
+        when it differs — a silent dtype/encoding change between sklearn
+        versions can give wrong predictions without any traceback.
+        """
+        import sys, sklearn, pandas, numpy, joblib as _joblib
+        from datetime import datetime
+        versions = {
+            "python":       sys.version.split()[0],
+            "sklearn":      sklearn.__version__,
+            "pandas":       pandas.__version__,
+            "numpy":        numpy.__version__,
+            "joblib":       _joblib.__version__,
+            "trained_at":   datetime.now().isoformat(timespec="seconds"),
+        }
+        name_lower = estimator_class_name.lower()
+        for lib, attr in (("lightgbm", "lgb"), ("xgboost", "xgb"),
+                          ("catboost", "cat")):
+            if lib in name_lower or attr in name_lower:
+                try:
+                    mod = __import__(lib)
+                    versions[lib] = getattr(mod, "__version__", "unknown")
+                except ImportError:
+                    pass
+        return versions
+
     def _save_model(self, feature_cols: List[str]) -> None:
         import joblib
         artifact = {
@@ -1106,10 +1144,12 @@ class TrainModelAgent(BaseAgent):
             "cat_encoders":   self._cat_encoders,
             "target_column":  self.target_column,
             "estimator_name": self.model.__class__.__name__,
+            "versions":       self._collect_runtime_versions(self.model.__class__.__name__),
         }
-        Path(Config.OUTPUT_DIR).mkdir(exist_ok=True)
+        Path(Config.RUN_DIR).mkdir(parents=True, exist_ok=True)
         joblib.dump(artifact, Config.FINAL_MODEL_PATH)
-        self.logger.log(self.name, "Model Saved", Config.FINAL_MODEL_PATH)
+        self.logger.log(self.name, "Model Saved",
+            f"{Config.FINAL_MODEL_PATH} | versions={artifact['versions']}")
 
     def _generate_model_code(self, estimator_name: str, best_params: Dict,
                               feature_cols: List[str]) -> None:
@@ -1126,6 +1166,8 @@ Features   : {len(feature_cols)}
 Target     : {self.target_column}
 """
 
+import sys
+import warnings
 import numpy as np
 import pandas as pd
 import joblib
@@ -1140,6 +1182,32 @@ feature_cols  = _artifact["feature_cols"]
 cat_encoders  = _artifact["cat_encoders"]
 target_column = _artifact["target_column"]
 
+# ── Version compatibility check ──────────────────────────────────────────────
+# Warn (do not raise) when the deployment env differs from the training env —
+# pickled sklearn / lightgbm objects can change semantics across versions and
+# silently produce wrong predictions. Loud warning gives ops a chance to pin.
+_TRAINED_VERSIONS = _artifact.get("versions", {{}})
+if _TRAINED_VERSIONS:
+    import sklearn as _sklearn_runtime
+    _CURRENT = {{
+        "python":  sys.version.split()[0],
+        "sklearn": _sklearn_runtime.__version__,
+        "pandas":  pd.__version__,
+        "numpy":   np.__version__,
+    }}
+    _mismatches = [
+        f"{{k}}: trained={{_TRAINED_VERSIONS[k]}}  runtime={{_CURRENT[k]}}"
+        for k in ("python", "sklearn", "pandas", "numpy")
+        if k in _TRAINED_VERSIONS and _TRAINED_VERSIONS[k] != _CURRENT[k]
+    ]
+    if _mismatches:
+        warnings.warn(
+            "final_model.pkl was trained with different library versions:\\n  "
+            + "\\n  ".join(_mismatches)
+            + "\\nPredictions may differ from training-time behavior. Pin requirements.txt to match.",
+            stacklevel=2,
+        )
+
 # ── Feature list (recorded at training time) ──────────────────────────────────
 FEATURES = {features_repr}
 
@@ -1152,7 +1220,12 @@ BEST_PARAMS = {params_repr}
 
 # ── Preprocessing ─────────────────────────────────────────────────────────────
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply the same encoding + imputation used during training."""
+    """Apply the same encoding + imputation used during training.
+
+    Categorical replay uses vectorized Series.where(isin) — about 10x faster
+    than the equivalent .apply(lambda) on big batches and matches what the
+    training-time _transform_X does, so behavior is consistent end-to-end.
+    """
     avail = [c for c in FEATURES if c in df.columns]
     out = df[avail].copy()
     for col in out.columns:
@@ -1160,7 +1233,8 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
             le    = cat_encoders[col]
             known = set(le.classes_)
             vals  = out[col].fillna("__NA__").astype(str)
-            out[col] = le.transform(vals.apply(lambda x: x if x in known else "__NA__"))
+            vals  = vals.where(vals.isin(known), "__NA__")
+            out[col] = le.transform(vals)
         else:
             out[col] = out[col].fillna(-999)
     return out
@@ -1196,6 +1270,157 @@ if __name__ == "__main__":
         # replay files visible together for users.
         Path(Config.PIPELINE_PROCESS_TM_PATH).write_text(code, encoding="utf-8")
         self.logger.log(self.name, "Process Script Saved", Config.PIPELINE_PROCESS_TM_PATH)
+
+    # ── Step 9: SHAP visual + LLM-explained top features ─────────────────────
+
+    def _tool_shap_final_explain(
+        self,
+        estimator_name: str,
+        feature_cols: List[str],
+        top_n: int = 20,
+    ) -> pd.DataFrame:
+        """Compute SHAP on the FINAL model, save a bar-plot of importances,
+        ask the LLM to explain the top N features, and persist a CSV the
+        final report can render.
+
+        Returns a DataFrame (empty if SHAP failed or shap is missing) with:
+            rank, feature, shap_importance, description, meaning, why_matters
+        """
+        if self.model is None:
+            self.logger.log(self.name, "SHAP Explain", "No final model → skip")
+            return pd.DataFrame()
+
+        train_df = self.splits.get("train", pd.DataFrame())
+        if len(train_df) == 0:
+            self.logger.log(self.name, "SHAP Explain", "Empty train split → skip")
+            return pd.DataFrame()
+
+        avail = [c for c in feature_cols if c in train_df.columns]
+        if not avail:
+            self.logger.log(self.name, "SHAP Explain", "No final features in train → skip")
+            return pd.DataFrame()
+
+        X_tr = self._transform_X(train_df[avail])
+
+        sample_n = min(Config.SHAP_SAMPLE_SIZE, len(X_tr))
+        rng = np.random.default_rng(Config.RANDOM_STATE)
+        idx = rng.choice(len(X_tr), sample_n, replace=False)
+        X_sample = X_tr.iloc[idx]
+
+        # ── 1. Compute SHAP values ────────────────────────────────────────────
+        importance: Optional[pd.Series] = None
+        importance_source = "shap"
+        try:
+            import shap
+            explainer = shap.TreeExplainer(self.model)
+            sv = explainer.shap_values(X_sample)
+            if isinstance(sv, list):
+                sv = sv[1]                          # binary classification → positive class
+            elif isinstance(sv, np.ndarray) and sv.ndim == 3:
+                sv = sv[:, :, 1]
+            importance = pd.Series(np.abs(sv).mean(axis=0), index=avail).sort_values(ascending=False)
+            self.logger.log(self.name, "SHAP Explain",
+                f"computed on {sample_n} train rows × {len(avail)} features")
+        except Exception as e:
+            self.logger.log(self.name, "SHAP Explain WARN",
+                f"shap.TreeExplainer failed ({e}) → falling back to model.feature_importances_")
+            imp = getattr(self.model, "feature_importances_", None)
+            if imp is None:
+                self.logger.log(self.name, "SHAP Explain", "No fallback importance available → skip")
+                return pd.DataFrame()
+            importance = pd.Series(imp, index=avail).sort_values(ascending=False)
+            importance_source = "feature_importances_"
+
+        # ── 2. Bar plot (top 2N features so the distribution context is visible) ─
+        plot_n = min(len(importance), max(top_n * 2, top_n))
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            top_plot = importance.head(plot_n).iloc[::-1]   # reverse → biggest on top
+            fig_h = max(5, len(top_plot) * 0.28)
+            fig, ax = plt.subplots(figsize=(10, fig_h))
+            ax.barh(top_plot.index, top_plot.values, color="#3498db")
+            ax.set_xlabel("Mean |SHAP value|" if importance_source == "shap" else "Feature importance")
+            ax.set_title(f"Top {plot_n} features — {estimator_name} (final model)")
+            ax.grid(axis="x", linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            Path(Config.SHAP_PLOT_PATH).parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(Config.SHAP_PLOT_PATH, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            self.logger.log(self.name, "SHAP Plot Saved", Config.SHAP_PLOT_PATH)
+        except Exception as e:
+            self.logger.log(self.name, "SHAP Plot WARN", f"matplotlib failed: {e}")
+
+        # ── 3. LLM-explain top N ──────────────────────────────────────────────
+        top_features = importance.head(top_n).index.tolist()
+        descriptions = self._col_descriptions or {}
+        top_with_desc = [
+            {
+                "feature": f,
+                "shap_importance": round(float(importance[f]), 6),
+                "description": descriptions.get(f, ""),
+            }
+            for f in top_features
+        ]
+
+        system = (
+            "You are an ML explainability expert. Given a list of features ranked by "
+            "SHAP importance from a trained model, explain each feature concisely. "
+            "Return ONLY a valid JSON object — no markdown fences, no extra text."
+        )
+        user = (
+            f"Domain : {self._domain}\n"
+            f"Estimator : {estimator_name}\n"
+            f"Target   : {self.target_column}\n\n"
+            f"Top {len(top_with_desc)} features by mean |SHAP value| (high = drives prediction more):\n"
+            f"{json.dumps(top_with_desc, indent=2, ensure_ascii=False)}\n\n"
+            'Return JSON in format:\n'
+            '{"explanations": [\n'
+            '    {"feature": "<name>", "meaning": "<1 sentence>", "why_matters": "<1-2 sentences>"},\n'
+            '    ...\n'
+            ']}\n'
+            "- meaning     : what the feature represents in plain language. "
+            "If a description is provided, refine and expand it; otherwise infer from name + domain.\n"
+            "- why_matters : why this feature drives predictions for the target in this domain.\n"
+            "Match the language of the descriptions when present (vd. Vietnamese descriptions → reply in Vietnamese)."
+        )
+
+        exp_map: Dict[str, Dict[str, str]] = {}
+        try:
+            raw = self.call_llm(user, system, json_mode=True, max_tokens=Config.LLM_MAX_TOKENS_LARGE)
+            parsed = json.loads(self._extract_json(raw))
+            for entry in parsed.get("explanations", []):
+                feat = entry.get("feature")
+                if feat:
+                    exp_map[feat] = {
+                        "meaning":     entry.get("meaning", ""),
+                        "why_matters": entry.get("why_matters", ""),
+                    }
+            self.logger.log(self.name, "SHAP LLM Explain",
+                f"received explanations for {len(exp_map)}/{len(top_features)} features")
+        except Exception as e:
+            self.logger.log(self.name, "SHAP LLM WARN",
+                f"LLM explain failed ({e}) — saving CSV without narratives")
+
+        # ── 4. Persist CSV ────────────────────────────────────────────────────
+        records = []
+        for rank, feat in enumerate(top_features, 1):
+            exp = exp_map.get(feat, {})
+            records.append({
+                "rank":            rank,
+                "feature":         feat,
+                "shap_importance": round(float(importance[feat]), 6),
+                "description":     descriptions.get(feat, ""),
+                "meaning":         exp.get("meaning", ""),
+                "why_matters":     exp.get("why_matters", ""),
+            })
+        report_df = pd.DataFrame(records)
+        Path(Config.SHAP_FEATURE_REPORT_PATH).parent.mkdir(parents=True, exist_ok=True)
+        report_df.to_csv(Config.SHAP_FEATURE_REPORT_PATH, index=False, encoding="utf-8")
+        self.logger.log(self.name, "SHAP Feature Report Saved", Config.SHAP_FEATURE_REPORT_PATH)
+        return report_df
 
     # ── Split-mode entry point ────────────────────────────────────────────────
 
@@ -1446,7 +1671,22 @@ if __name__ == "__main__":
         self._save_model(final_features)
         self._generate_model_code(best_estimator, best_params, final_features)
 
-        # ── 9. LLM summary ────────────────────────────────────────────────────
+        # ── 9. SHAP visual + LLM-explained top features ──────────────────────
+        # Runs on the *final* model so importances reflect what actually ships.
+        # Gracefully degrades: missing shap → feature_importances_; LLM failure
+        # → CSV without narrative columns. Toggle with SHAP_FINAL_EXPLAIN_ENABLED.
+        shap_explain_df = pd.DataFrame()
+        if Config.SHAP_FINAL_EXPLAIN_ENABLED:
+            try:
+                shap_explain_df = self._tool_shap_final_explain(
+                    best_estimator, final_features,
+                    top_n=Config.SHAP_FINAL_EXPLAIN_TOP_N,
+                )
+            except Exception as e:
+                self.logger.log(self.name, "SHAP Explain ERROR",
+                    f"final-model SHAP explain failed: {e} — continuing without it")
+
+        # ── 10. LLM summary ──────────────────────────────────────────────────
         summary = self._generate_llm_summary(
             best_estimator, best_params, metrics,
             len(feat_avail), len(rfe_features), len(psi_features),
@@ -1455,7 +1695,7 @@ if __name__ == "__main__":
             overfit_info=overfit_info,
         )
 
-        # ── 10. Save report ───────────────────────────────────────────────────
+        # ── 11. Save report ──────────────────────────────────────────────────
         report = {
             "agent": self.name,
             "best_estimator": best_estimator,
@@ -1469,6 +1709,10 @@ if __name__ == "__main__":
                 "n_final": len(final_features),
                 "final_features": final_features,
             },
+            "shap_top_features": (
+                shap_explain_df.to_dict(orient="records")
+                if not shap_explain_df.empty else []
+            ),
             "splits": {k: len(v) for k, v in self.splits.items()
                        if isinstance(v, pd.DataFrame)},
             "metrics": metrics,

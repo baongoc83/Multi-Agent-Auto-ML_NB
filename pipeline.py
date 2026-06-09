@@ -67,6 +67,34 @@ class AutoMLPipeline:
         self.logger.log("PIPELINE", "Run dir",
             f"persisted → {run_dir} | intermediates → "
             f"{'(same dir, KEEP_INTERMEDIATES=true)' if Config.KEEP_INTERMEDIATES else Config.TMP_DIR}")
+        self._check_disk_space()
+
+    def _check_disk_space(self) -> None:
+        """Fail fast if free space on OUTPUT_DIR's filesystem is below the
+        configured floor. Catches the "ran out of disk mid-CV" failure mode
+        before any compute is burned. The check is local to OUTPUT_DIR — TMP_DIR
+        usually lives on the same filesystem; if not, joblib will surface its
+        own error which is still better than a half-written final_model.pkl.
+        """
+        import shutil
+        try:
+            usage = shutil.disk_usage(Config.OUTPUT_DIR)
+        except OSError as e:
+            self.logger.log("PIPELINE", "Disk check WARN",
+                f"shutil.disk_usage({Config.OUTPUT_DIR}) failed: {e} — skipping pre-check")
+            return
+        free_gb = usage.free / (1024 ** 3)
+        total_gb = usage.total / (1024 ** 3)
+        floor = Config.MIN_DISK_FREE_GB
+        self.logger.log("PIPELINE", "Disk check",
+            f"OUTPUT_DIR={Config.OUTPUT_DIR}  free={free_gb:.1f} GB / total={total_gb:.1f} GB  "
+            f"(floor={floor:.1f} GB)")
+        if free_gb < floor:
+            raise RuntimeError(
+                f"Insufficient disk space on {Config.OUTPUT_DIR}: "
+                f"{free_gb:.1f} GB free < {floor:.1f} GB required.\n"
+                f"Free up space or lower MIN_DISK_FREE_GB in .env if you accept the risk."
+            )
 
     # ── Schema validation (split mode) ──────────────────────────────────────
 
@@ -520,6 +548,9 @@ class AutoMLPipeline:
             model_type=model_type,
             **(col_descriptions_kwargs or {}),
         )
+        # Capture the loaded descriptions before agent2 is released so Agent 3
+        # can reuse them for the SHAP-explain step without reloading.
+        col_descriptions_loaded = dict(agent2._col_descriptions) if agent2._col_descriptions else {}
         eng_paths, report2 = agent2.process_splits(
             train_path=clean_paths["train"],
             previous_report=report1,
@@ -531,7 +562,11 @@ class AutoMLPipeline:
 
         # ── Stage 3: TrainModel ─────────────────────────────────────────
         self.logger.log("PIPELINE", "Stage 3", "Initializing Train Model Agent (split mode)")
-        agent3 = TrainModelAgent(self.logger)
+        agent3 = TrainModelAgent(
+            self.logger,
+            col_descriptions=col_descriptions_loaded,
+            domain=domain,
+        )
         final_metrics, report3 = agent3.process_splits(
             train_path=eng_paths["train"],
             previous_report=report2,
@@ -577,6 +612,7 @@ class AutoMLPipeline:
             model_type=model_type,
             **(col_descriptions_kwargs or {}),
         )
+        col_descriptions_loaded = dict(agent2._col_descriptions) if agent2._col_descriptions else {}
         engineered_data_path, report2 = agent2.process(
             self.handoff.get_data(),
             self.handoff.get_report(),
@@ -586,7 +622,11 @@ class AutoMLPipeline:
         del agent2
 
         self.logger.log("PIPELINE", "Stage 3", "Initializing Train Model Agent (single-file mode)")
-        agent3 = TrainModelAgent(self.logger)
+        agent3 = TrainModelAgent(
+            self.logger,
+            col_descriptions=col_descriptions_loaded,
+            domain=domain,
+        )
         final_metrics, report3 = agent3.process(
             self.handoff.get_data(),
             self.handoff.get_report(),
@@ -608,8 +648,73 @@ class AutoMLPipeline:
         markdown += f"- Strategy: {report2.get('summary', 'N/A')}\n\n"
         markdown += "## Agent 3: Model Trainer\n"
         markdown += f"- Final Metrics: {metrics}\n\n"
+        markdown += self._render_shap_section(report3)
+        markdown += self._render_token_section()
 
         with open(Config.FINAL_REPORT_PATH, "w", encoding="utf-8") as f:
             f.write(markdown)
 
         print(f"Final Report saved to: {Config.FINAL_REPORT_PATH}")
+
+    def _render_token_section(self) -> str:
+        """LLM token attribution per-model + grand total. Helps users compare
+        token cost between pipeline runs and between LLM model tiers."""
+        usage = getattr(self.logger, "token_usage", {}) or {}
+        if not usage:
+            return ""
+        total = self.logger.token_summary()
+        out: List[str] = [
+            "## LLM token usage\n",
+            "| Model | Calls | Input | Output | Total |\n",
+            "|---|---:|---:|---:|---:|\n",
+        ]
+        for model, b in sorted(usage.items(), key=lambda kv: -kv[1].get("total", 0)):
+            out.append(
+                f"| `{model}` | {b.get('calls', 0)} | "
+                f"{b.get('input', 0):,} | {b.get('output', 0):,} | {b.get('total', 0):,} |\n"
+            )
+        out.append(
+            f"| **Total** | **{total['calls']}** | "
+            f"**{total['input']:,}** | **{total['output']:,}** | **{total['total']:,}** |\n\n"
+            "*Multiply by your provider's per-token price to get $ cost. "
+            "Token counts cover every LLM call in this run (Agent 1+2+3 decisions, "
+            "SHAP explain, overfit reg suggest).*\n\n"
+        )
+        return "".join(out)
+
+    def _render_shap_section(self, report3: Dict) -> str:
+        """Render the SHAP visual + top-N feature explanations into the
+        final-report markdown. Empty string when the SHAP step was disabled
+        or produced no records (so the report stays clean instead of showing
+        an "N/A" placeholder)."""
+        top = report3.get("shap_top_features", []) if isinstance(report3, dict) else []
+        if not top:
+            return ""
+
+        from pathlib import Path as _P
+        out: List[str] = ["## SHAP — Top features driving the final model\n"]
+
+        # Plot, if matplotlib succeeded earlier
+        plot_path = _P(Config.SHAP_PLOT_PATH)
+        if plot_path.exists():
+            # Use relative path so the markdown renders correctly when the run
+            # dir is moved/zipped.
+            out.append(f"![SHAP summary]({plot_path.name})\n")
+
+        out.append(
+            "| Rank | Feature | SHAP importance | Meaning | Why it matters |\n"
+            "|---:|---|---:|---|---|\n"
+        )
+        for rec in top:
+            feat   = rec.get("feature", "")
+            imp    = rec.get("shap_importance", 0.0)
+            mean_  = (rec.get("meaning") or rec.get("description") or "").replace("|", "\\|").replace("\n", " ")
+            why    = (rec.get("why_matters") or "").replace("|", "\\|").replace("\n", " ")
+            out.append(f"| {rec.get('rank', '')} | `{feat}` | {imp:.4f} | {mean_} | {why} |\n")
+
+        out.append(
+            f"\n*Full CSV: `{_P(Config.SHAP_FEATURE_REPORT_PATH).name}`. "
+            "SHAP computed on the FINAL model after overfitting handling — "
+            "values reflect what actually drives the deployed predictions.*\n\n"
+        )
+        return "".join(out)

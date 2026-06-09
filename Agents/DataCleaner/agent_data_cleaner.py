@@ -36,7 +36,14 @@ class CleaningSpec:
     clip_bounds:  Dict[str, Tuple[float, float]]  = field(default_factory=dict)
 
     def apply(self, df: pd.DataFrame, logger=None, name: str = "") -> pd.DataFrame:
-        """Replay every captured column transform on `df` in fit-time order."""
+        """Replay every captured column transform on `df` in fit-time order.
+
+        Always works on a copy so the caller's DataFrame is never mutated —
+        previously the drop path created a new frame but the dtype/clip path
+        mutated in-place, an inconsistency that could surprise callers who
+        do not reassign the return value.
+        """
+        df = df.copy()
         cols_to_drop = [c for c in self.drops if c in df.columns]
         if cols_to_drop:
             df = df.drop(columns=cols_to_drop)
@@ -1243,6 +1250,19 @@ if __name__ == "__main__":
             OPTIONAL_SECTIONS=optional_sections,
         )
 
+    # Canonical execution order for LLM actions on train. Mirrors the order
+    # CleaningSpec.apply() uses on valid/oot so train and replay see the same
+    # column-level sequence. Row-ops (drop_duplicates / deduplicate_by_key) run
+    # between dtype_fixes and clip so clip Q1/Q3 are computed on the dedup'd,
+    # type-corrected distribution — same intent as a typical hand-coded pipeline.
+    _ACTION_ORDER = {
+        "drop_column":         0,
+        "fix_column_dtype":    1,
+        "drop_duplicates":     2,
+        "deduplicate_by_key":  2,
+        "clip_outliers":       3,
+    }
+
     def _execute_llm_decisions(self, llm_response: str, spec: Optional["CleaningSpec"] = None) -> List[str]:
         """Apply LLM decisions to self.df AND record transferable transforms in `spec`.
 
@@ -1253,6 +1273,14 @@ if __name__ == "__main__":
 
         Row-only ops (drop_duplicates / deduplicate_by_key) are applied to train
         but NOT recorded in the spec — those belong to the training set only.
+
+        Actions are reordered to the canonical bucket order (drops → dtype_fixes
+        → row-ops → clips) before execution. Python's sort is stable, so the
+        LLM's relative ordering within each bucket is preserved. This guarantees
+        train and CleaningSpec.apply() execute the column-level transforms in
+        the same sequence — without this fix, an LLM that emits clip before
+        dtype_fix on the same column would silently diverge between train and
+        valid/oot.
         """
         if spec is None:
             spec = CleaningSpec()
@@ -1263,7 +1291,19 @@ if __name__ == "__main__":
             decisions = json.loads(self._extract_json(llm_response))
             self.logger.log(self.name, "LLM Reasoning", decisions.get("reasoning", "No reasoning provided"))
 
-            for action_spec in decisions.get("actions", []):
+            raw_actions = decisions.get("actions", [])
+            ordered_actions = sorted(
+                raw_actions,
+                key=lambda a: self._ACTION_ORDER.get(a.get("action", ""), 99),
+            )
+            # Only log reordering when the LLM order actually differed —
+            # otherwise this is noise.
+            if [a.get("action") for a in raw_actions] != [a.get("action") for a in ordered_actions]:
+                self.logger.log(self.name, "Action Reorder",
+                    f"Reordered {len(raw_actions)} actions to canonical bucket order "
+                    f"(drop → dtype_fix → row-op → clip) so train matches CleaningSpec.apply replay")
+
+            for action_spec in ordered_actions:
                 action_type = action_spec.get("action")
                 column = action_spec.get("column")
                 reason = action_spec.get("reason", "No reason provided")

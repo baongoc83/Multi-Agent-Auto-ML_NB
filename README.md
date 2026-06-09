@@ -330,7 +330,9 @@ outputs/
     │   ├── psi_report.csv
     │   ├── stability_report.csv
     │   ├── shap_psi_prune_log.csv
-    │   ├── final_report.md
+    │   ├── shap_summary.png                          ← NEW: bar plot top features final model
+    │   ├── shap_feature_explanations.csv             ← NEW: LLM-narrated top N features
+    │   ├── final_report.md                              (đã nhúng SHAP section + image)
     │   ├── final_model.pkl
     │   ├── final_model_code.py
     │   ├── pipeline_process_data_cleaner.py        ← NEW: replay Agent 1
@@ -356,7 +358,9 @@ Counter `run_NN` đếm dựa trên `max(NN) + 1` của các thư mục `run_*` 
 | `psi_report.csv` | PSI drift train↔OOT từng feature |
 | `stability_report.csv` | Mean / std Gini theo tháng |
 | `shap_psi_prune_log.csv` | Log từng step SHAP+PSI pruning |
-| `final_report.md` | Markdown report tổng hợp |
+| `shap_summary.png` | Bar plot top (`2 × TOP_N`) features của **final model** bằng mean \|SHAP\| |
+| `shap_feature_explanations.csv` | Rank + SHAP importance + `description` + LLM-narrated `meaning` / `why_matters` cho top `SHAP_FINAL_EXPLAIN_TOP_N` (default 20) features |
+| `final_report.md` | Markdown report tổng hợp — nhúng `shap_summary.png` + table top features |
 | `final_model.pkl` | Model + encoders + feature list (joblib) |
 | `final_model_code.py` | Code inference standalone |
 | `pipeline_process_data_cleaner.py` | Script replay Agent 1 trên data mới — embed `CleaningSpec` (drops + dtype_fixes + clip_bounds) inline, no agent/LLM dependency |
@@ -441,9 +445,17 @@ python tests/test_agent3.py
 
 ## Tài liệu chi tiết
 
+**Tổng quan & reference**
+
 - [docs/architecture.md](docs/architecture.md) — Visual walkthrough + mermaid diagrams cho từng agent
 - [docs/awareness-pattern.md](docs/awareness-pattern.md) — Agentic pattern reference (Plan-Execute + Awareness)
 - [docs/config_params.md](docs/config_params.md) — Reference đầy đủ ~75 config param (override qua `.env`)
+
+**Flow chi tiết từng agent** (step-by-step + mermaid + no-leakage rules + config knobs)
+
+- [docs/agent-1-data-cleaner.md](docs/agent-1-data-cleaner.md) — DataCleaner: prefilter → real-stats → LLM → canonical-ordered execute → spec replay
+- [docs/agent-2-feature-engineer.md](docs/agent-2-feature-engineer.md) — FeatureEngineer: domain-aware interactions, label/onehot encoders, top-K selection, FeatureSpec replay
+- [docs/agent-3-train-model.md](docs/agent-3-train-model.md) — TrainModel 11 bước: split → encode → FLAML → Optuna → RFE → PSI → Stability → SHAP+PSI prune → final train → overfit-aware retrain
 
 ---
 

@@ -91,12 +91,14 @@ class BaseAgent:
             self.logger.log(self.name, "LLM Tokens",
                 f"model={model} | prompt={usage.prompt_tokens} | "
                 f"completion={usage.completion_tokens} | total={usage.total_tokens}")
+            self.logger.record_tokens(model, usage.prompt_tokens, usage.completion_tokens)
         # Anthropic-style: input_tokens / output_tokens
         elif hasattr(usage, "input_tokens"):
             total = usage.input_tokens + usage.output_tokens
             self.logger.log(self.name, "LLM Tokens",
                 f"model={model} | input={usage.input_tokens} | "
                 f"output={usage.output_tokens} | total={total}")
+            self.logger.record_tokens(model, usage.input_tokens, usage.output_tokens)
 
     def _call_via_proxy(self, model: str, system_prompt: str, prompt: str,
                         json_mode: bool = False, max_tokens: Optional[int] = None) -> str:

@@ -287,6 +287,27 @@ Loại bỏ feature có SHAP importance thấp + PSI drift cao theo từng bư�
 
 ---
 
+## SHAP Final Visualization + LLM Explanation
+
+Sau khi final model train xong (kể cả sau overfit-retrain), Agent 3 compute SHAP trên final model + LLM explain top N features. Output: PNG bar plot + CSV với narrative.
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `SHAP_FINAL_EXPLAIN_ENABLED` | `true` | Bật/tắt toàn bộ step. Tắt khi chạy batch automation không cần narrative |
+| `SHAP_FINAL_EXPLAIN_TOP_N` | `20` | Số features LLM explain. Plot show 2× số này để thấy distribution context |
+
+**Output files**:
+- `shap_summary.png` — bar plot top (`2 × TOP_N`) features
+- `shap_feature_explanations.csv` — rank, feature, shap_importance, description, meaning, why_matters
+- Section nhúng vào `final_report.md`
+
+**Graceful degrade**:
+- `shap` chưa cài → fallback `model.feature_importances_`
+- `matplotlib` lỗi → skip PNG, vẫn save CSV
+- LLM lỗi → CSV không có `meaning`/`why_matters`, chỉ rank + importance
+
+---
+
 ## Overfitting Detection
 
 | Tham số | Mặc định | Mô tả |

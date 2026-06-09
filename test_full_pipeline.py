@@ -221,6 +221,8 @@ def main():
             (Config.PSI_REPORT_PATH,                 "PSI drift report            — Agent 3"),
             (Config.STABILITY_REPORT_PATH,           "Feature stability report    — Agent 3"),
             (Config.SHAP_PSI_PRUNE_LOG_PATH,         "SHAP+PSI pruning log        — Agent 3"),
+            (Config.SHAP_PLOT_PATH,                  "SHAP final importance plot  — Agent 3"),
+            (Config.SHAP_FEATURE_REPORT_PATH,        "SHAP top features + LLM    — Agent 3"),
             (Config.FINAL_MODEL_PATH,                "Trained model artifact      — Agent 3"),
             (Config.FINAL_MODEL_CODE_PATH,           "Standalone inference code   — Agent 3"),
             (Config.FINAL_REPORT_PATH,               "Full pipeline report"),
