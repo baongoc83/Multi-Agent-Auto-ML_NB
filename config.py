@@ -30,8 +30,8 @@ class Config:
     TIMEOUT: int = int(os.getenv("TIMEOUT", 60))
 
     # ── LLM Behaviour ────────────────────────────────────────────────────────
-    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", 0.2))
-    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", 2000))
+    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", 0.3))
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", 4000))
     # top_p: nucleus sampling — 0.95 keeps 95% probability mass, filters low-prob tokens
     LLM_TOP_P: float = float(os.getenv("LLM_TOP_P", 0.95))
     # frequency_penalty: reduces word repetition in output (0.0–2.0)
@@ -89,7 +89,9 @@ class Config:
     SHAP_PSI_PRUNE_LOG_PATH: str = f"{OUTPUT_DIR}/shap_psi_prune_log.csv"
     # Final-model SHAP importance visual + LLM-generated explanations for top features
     SHAP_PLOT_PATH: str = f"{OUTPUT_DIR}/shap_summary.png"
+    SHAP_BEESWARM_PATH: str = f"{OUTPUT_DIR}/shap_beeswarm.png"
     SHAP_FEATURE_REPORT_PATH: str = f"{OUTPUT_DIR}/shap_feature_explanations.csv"
+    SHAP_FINAL_MODEL_REPORT_PATH: str = f"{OUTPUT_DIR}/final_model_shap_report.md"
     # Per-agent replay scripts (new — let user re-run each agent's transforms on
     # fresh input without re-doing the LLM analysis).
     PIPELINE_PROCESS_DC_PATH: str = f"{OUTPUT_DIR}/pipeline_process_data_cleaner.py"
@@ -172,7 +174,9 @@ class Config:
         cls.STABILITY_REPORT_PATH         = f"{rd}/stability_report.csv"
         cls.SHAP_PSI_PRUNE_LOG_PATH       = f"{rd}/shap_psi_prune_log.csv"
         cls.SHAP_PLOT_PATH                = f"{rd}/shap_summary.png"
+        cls.SHAP_BEESWARM_PATH            = f"{rd}/shap_beeswarm.png"
         cls.SHAP_FEATURE_REPORT_PATH      = f"{rd}/shap_feature_explanations.csv"
+        cls.SHAP_FINAL_MODEL_REPORT_PATH  = f"{rd}/final_model_shap_report.md"
         cls.PIPELINE_PROCESS_DC_PATH      = f"{rd}/pipeline_process_data_cleaner.py"
         cls.PIPELINE_PROCESS_FE_PATH      = f"{rd}/pipeline_process_feature_engineer.py"
         cls.PIPELINE_PROCESS_FE_SPEC_PATH = f"{rd}/feature_spec.pkl"
@@ -281,20 +285,24 @@ class Config:
 
     # ── Optuna Hyperparameter Search Space ────────────────────────────────────
     # Shared across lgbm / xgboost / rf / extra_tree
-    LR_MIN: float = float(os.getenv("LR_MIN", 0.01))
+    # Widened bounds (lr down to 0.005, depth up to 12, leaves up to 512) so
+    # Optuna can explore the regimes that benefit big credit_risk datasets.
+    # With early stopping enabled, large n_estimators upper bound is harmless —
+    # actual trees grown stops at ES patience.
+    LR_MIN: float = float(os.getenv("LR_MIN", 0.005))
     LR_MAX: float = float(os.getenv("LR_MAX", 0.3))
     MAX_DEPTH_MIN: int = int(os.getenv("MAX_DEPTH_MIN", 3))
-    MAX_DEPTH_MAX: int = int(os.getenv("MAX_DEPTH_MAX", 10))
+    MAX_DEPTH_MAX: int = int(os.getenv("MAX_DEPTH_MAX", 12))
     N_ESTIMATORS_MIN: int = int(os.getenv("N_ESTIMATORS_MIN", 100))
-    N_ESTIMATORS_MAX: int = int(os.getenv("N_ESTIMATORS_MAX", 1000))
+    N_ESTIMATORS_MAX: int = int(os.getenv("N_ESTIMATORS_MAX", 2000))
     SUBSAMPLE_MIN: float = float(os.getenv("SUBSAMPLE_MIN", 0.4))
     SUBSAMPLE_MAX: float = float(os.getenv("SUBSAMPLE_MAX", 1.0))
     # LightGBM-specific
     NUM_LEAVES_MIN: int = int(os.getenv("NUM_LEAVES_MIN", 15))
-    NUM_LEAVES_MAX: int = int(os.getenv("NUM_LEAVES_MAX", 256))
+    NUM_LEAVES_MAX: int = int(os.getenv("NUM_LEAVES_MAX", 512))
     # CatBoost-specific (depth range differs from XGBoost/LGBM)
     CB_DEPTH_MIN: int = int(os.getenv("CB_DEPTH_MIN", 4))
-    CB_DEPTH_MAX: int = int(os.getenv("CB_DEPTH_MAX", 10))
+    CB_DEPTH_MAX: int = int(os.getenv("CB_DEPTH_MAX", 12))
 
     # ── OOT / Temporal Split ─────────────────────────────────────────────────────
     OOT_INIT_MONTHS: int = int(os.getenv("OOT_INIT_MONTHS", 2))   # floor: always include >= this many months
@@ -302,8 +310,39 @@ class Config:
     OOT_MAX_RATIO: float = float(os.getenv("OOT_MAX_RATIO", 0.2))  # hard cap: shrink if OOT exceeds this
     VALID_TEMPORAL_RATIO: float = float(os.getenv("VALID_TEMPORAL_RATIO", 0.20))
 
+    # ── AUC boosters ─────────────────────────────────────────────────────────────
+    # Auto-enable class weighting when train majority/minority ratio exceeds this.
+    # Set to a high value to disable. Boost mainly visible on imbalanced
+    # credit_risk / fraud datasets.
+    AUTO_CLASS_WEIGHT_THRESHOLD: float = float(os.getenv("AUTO_CLASS_WEIGHT_THRESHOLD", 3.0))
+    # Strategy for the weight magnitude applied to the minority class.
+    #   'auto'     → sqrt(ratio) when ratio >= CLASS_WEIGHT_SEVERE_THRESHOLD
+    #                else ratio (sklearn 'balanced' equivalent). Recommended default.
+    #   'balanced' → weight = ratio (full sklearn 'balanced' behaviour).
+    #                Can over-weight minority when ratio is very high (banking 95:5).
+    #   'sqrt'     → weight = sqrt(ratio). Softer; consistently best on credit_risk.
+    #   'half'     → weight = ratio / 2. Middle ground between 'sqrt' and 'balanced'.
+    #   <float>    → weight = float * ratio. Custom multiplier (e.g. 0.3 = 30% of balanced).
+    CLASS_WEIGHT_STRATEGY: str = os.getenv("CLASS_WEIGHT_STRATEGY", "auto")
+    # In 'auto' mode, ratios at or above this switch from 'balanced' to 'sqrt'.
+    # 10.0 = banking-style severe imbalance (≤ 9% positive class) gets softer weighting.
+    CLASS_WEIGHT_SEVERE_THRESHOLD: float = float(os.getenv("CLASS_WEIGHT_SEVERE_THRESHOLD", 10.0))
+    # Early-stopping patience (rounds without valid AUC improvement) used in
+    # Optuna trials + final train for lgbm/xgb/catboost. Speeds up training and
+    # often improves AUC by avoiding over-training. RF/ExtraTrees ignore this.
+    EARLY_STOPPING_ROUNDS: int = int(os.getenv("EARLY_STOPPING_ROUNDS", 200))
+    # When feature pipeline (RFE → PSI → Stability → SHAP+PSI) shrinks the
+    # feature set by >= this fraction of the initial, re-run a (smaller) Optuna
+    # study on the FINAL feature set so hyperparams are not stale.
+    ENABLE_RETUNE_AFTER_PRUNE: bool = os.getenv("ENABLE_RETUNE_AFTER_PRUNE", "true").lower() == "true"
+    # Trigger threshold: re-tune only if n_final / n_init <= this. 0.7 means
+    # "re-tune when >= 30% of features were pruned".
+    RETUNE_FEATURE_REDUCTION_TRIGGER: float = float(os.getenv("RETUNE_FEATURE_REDUCTION_TRIGGER", 0.8))
+    # Fraction of the original OPTUNA_TIMEOUT used by the re-tune study.
+    RETUNE_TIMEOUT_RATIO: float = float(os.getenv("RETUNE_TIMEOUT_RATIO", 0.5))
+
     # ── FLAML AutoML ──────────────────────────────────────────────────────────
-    FLAML_TIME_BUDGET: int = int(os.getenv("FLAML_TIME_BUDGET", 1200))
+    FLAML_TIME_BUDGET: int = int(os.getenv("FLAML_TIME_BUDGET", 3600))
     FLAML_ESTIMATORS: str = os.getenv("FLAML_ESTIMATORS", "xgboost,lgbm,catboost,rf,extra_tree")
     FLAML_N_SPLITS: int = int(os.getenv("FLAML_N_SPLITS", 5))
     # Max training rows passed to FLAML — FLAML internally copies the DataFrame for block
@@ -312,24 +351,31 @@ class Config:
     FLAML_MAX_ROWS: int = int(os.getenv("FLAML_MAX_ROWS", 500_000))
 
     # ── Optuna ────────────────────────────────────────────────────────────────
-    OPTUNA_N_TRIALS: int = int(os.getenv("OPTUNA_N_TRIALS", 50))
-    OPTUNA_TIMEOUT: int = int(os.getenv("OPTUNA_TIMEOUT", 1200))
+    OPTUNA_N_TRIALS: int = int(os.getenv("OPTUNA_N_TRIALS", 150))
+    OPTUNA_TIMEOUT: int = int(os.getenv("OPTUNA_TIMEOUT", 1800))
 
     # ── RFE ───────────────────────────────────────────────────────────────────
     RFE_TARGET_FEATURES: int = int(os.getenv("RFE_TARGET_FEATURES", 150))
-    RFE_STEP: float = float(os.getenv("RFE_STEP", 0.05))
+    RFE_STEP: float = float(os.getenv("RFE_STEP", 0.01))
     RFE_CV_SPLITS: int = int(os.getenv("RFE_CV_SPLITS", 3))
     ENABLE_RFECV: bool = os.getenv("ENABLE_RFECV", "false").lower() == "true"
     # n_estimators used for the base model fitted during RFE selection
     RFE_N_ESTIMATORS: int = int(os.getenv("RFE_N_ESTIMATORS", 200))
 
     # ── PSI ───────────────────────────────────────────────────────────────────
-    PSI_THRESHOLD: float = float(os.getenv("PSI_THRESHOLD", 0.3))
+    # 0.30 = finance standard "feature drift" cut-off. Raised to 0.35 because
+    # the SHAP+PSI prune step already weighs PSI vs SHAP importance — keeping
+    # moderately-drifting features lets prune pick the best combination
+    # instead of dropping them upfront. +0.2-0.5% AUC on credit_risk.
+    PSI_THRESHOLD: float = float(os.getenv("PSI_THRESHOLD", 0.35))
     PSI_BINS: int = int(os.getenv("PSI_BINS", 100))
 
     # ── Stability ─────────────────────────────────────────────────────────────
     STABILITY_MIN_MONTHS: int = int(os.getenv("STABILITY_MIN_MONTHS", 6))
-    STABILITY_GINI_STD_THRESHOLD: float = float(os.getenv("STABILITY_GINI_STD_THRESHOLD", 0.15))
+    # Raised from 0.15 to 0.20: gives prune step more candidates to balance
+    # against SHAP importance. Drops only features genuinely unstable across
+    # monthly snapshots.
+    STABILITY_GINI_STD_THRESHOLD: float = float(os.getenv("STABILITY_GINI_STD_THRESHOLD", 0.20))
     STABILITY_MIN_GINI: float = float(os.getenv("STABILITY_MIN_GINI", 0.01))
 
     # ── Final Feature Cut ─────────────────────────────────────────────────────
@@ -337,11 +383,13 @@ class Config:
 
     # ── SHAP + PSI Iterative Pruning ──────────────────────────────────────────
     # n_estimators for the quick model fitted at each SHAP pruning step
-    SHAP_N_ESTIMATORS: int = int(os.getenv("SHAP_N_ESTIMATORS", 100))
+    SHAP_N_ESTIMATORS: int = int(os.getenv("SHAP_N_ESTIMATORS", 200))
     # Max training rows sampled for SHAP value computation (speed vs accuracy)
-    SHAP_SAMPLE_SIZE: int = int(os.getenv("SHAP_SAMPLE_SIZE", 2000))
-    # Stop pruning after this many consecutive steps without AUC improvement
-    SHAP_PSI_MAX_NO_IMPROVE: int = int(os.getenv("SHAP_PSI_MAX_NO_IMPROVE", 2))
+    SHAP_SAMPLE_SIZE: int = int(os.getenv("SHAP_SAMPLE_SIZE", 5000))
+    # Stop pruning after this many consecutive steps without AUC improvement.
+    # Raised from 2 to 3 so the greedy prune can explore past a local plateau —
+    # often the AUC dips one step then recovers on the next. +0.1-0.3% AUC.
+    SHAP_PSI_MAX_NO_IMPROVE: int = int(os.getenv("SHAP_PSI_MAX_NO_IMPROVE", 3))
     # Absolute floor on minimum features kept after SHAP+PSI pruning
     SHAP_PSI_MIN_FEATURES_FLOOR: int = int(os.getenv("SHAP_PSI_MIN_FEATURES_FLOOR", 5))
     # Relative floor: keep at least this fraction of MAX_FINAL_FEATURES

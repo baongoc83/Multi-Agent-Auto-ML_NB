@@ -692,14 +692,24 @@ class AutoMLPipeline:
             return ""
 
         from pathlib import Path as _P
-        out: List[str] = ["## SHAP — Top features driving the final model\n"]
+        out: List[str] = ["## SHAP — Top features driving the final model\n\n"]
 
-        # Plot, if matplotlib succeeded earlier
-        plot_path = _P(Config.SHAP_PLOT_PATH)
-        if plot_path.exists():
-            # Use relative path so the markdown renders correctly when the run
-            # dir is moved/zipped.
-            out.append(f"![SHAP summary]({plot_path.name})\n")
+        # Bar plot (importance magnitude)
+        bar_path = _P(Config.SHAP_PLOT_PATH)
+        if bar_path.exists():
+            out.append("**Importance magnitude (bar):**\n\n")
+            out.append(f"![SHAP summary]({bar_path.name})\n\n")
+
+        # Beeswarm (impact direction + per-sample distribution)
+        beeswarm_path = _P(Config.SHAP_BEESWARM_PATH)
+        if beeswarm_path.exists():
+            out.append("**Impact on model output (beeswarm — direction + magnitude per sample):**\n\n")
+            out.append(f"![SHAP beeswarm]({beeswarm_path.name})\n\n")
+            out.append(
+                "_Dot = sample. X = SHAP value (right → pushes prediction up). "
+                "Color = feature value (red = high, blue = low). "
+                "Cluster red-right = high value drives positive class._\n\n"
+            )
 
         out.append(
             "| Rank | Feature | SHAP importance | Meaning | Why it matters |\n"
@@ -713,7 +723,8 @@ class AutoMLPipeline:
             out.append(f"| {rec.get('rank', '')} | `{feat}` | {imp:.4f} | {mean_} | {why} |\n")
 
         out.append(
-            f"\n*Full CSV: `{_P(Config.SHAP_FEATURE_REPORT_PATH).name}`. "
+            f"\n*Full bundle: `{_P(Config.SHAP_FINAL_MODEL_REPORT_PATH).name}` "
+            f"(dedicated SHAP report) + `{_P(Config.SHAP_FEATURE_REPORT_PATH).name}` (CSV). "
             "SHAP computed on the FINAL model after overfitting handling — "
             "values reflect what actually drives the deployed predictions.*\n\n"
         )

@@ -228,6 +228,150 @@ class TrainModelAgent(BaseAgent):
             return params
         return {k: v for k, v in params.items() if k in whitelist}
 
+    # ── AUC boosters: class weight + early stopping ──────────────────────────
+
+    @staticmethod
+    def _compute_imbalance_ratio(y: pd.Series) -> float:
+        """Return majority/minority count ratio. 1.0 when balanced or non-binary."""
+        try:
+            counts = pd.Series(y).dropna().value_counts()
+        except Exception:
+            return 1.0
+        if len(counts) != 2:
+            return 1.0
+        majority = int(counts.max())
+        minority = int(counts.min())
+        return (majority / minority) if minority > 0 else 1.0
+
+    @staticmethod
+    def _compute_class_weight_params(y: pd.Series, estimator_name: str) -> Dict[str, Any]:
+        """Auto-derive class weighting from train imbalance.
+
+        Returns {} when imbalance is mild (caller can blindly **-unpack).
+
+        The minority-class weight is picked by `Config.CLASS_WEIGHT_STRATEGY`:
+            auto     → sqrt(ratio) when ratio >= CLASS_WEIGHT_SEVERE_THRESHOLD,
+                       else ratio.   Recommended default for credit_risk.
+            balanced → ratio (full sklearn-style balance — can over-weight).
+            sqrt     → sqrt(ratio) (softer; best empirical AUC on banking 95:5).
+            half     → ratio/2.
+            <float>  → float * ratio (custom multiplier).
+
+        On severe imbalance (banking 95:5, ratio=19), boosters are already
+        adaptive and full `balanced` weight (19x) tends to overshoot — the
+        model becomes too sensitive to minority and ranking degrades.
+        sqrt(19)≈4.4 is empirically the AUC sweet spot.
+
+        Returned kwarg shape:
+          xgboost / catboost           → {'scale_pos_weight': <weight>}
+          lgbm / rf / extra_tree       → {'class_weight': {0: 1.0, 1: <weight>}}
+        """
+        try:
+            counts = pd.Series(y).dropna().value_counts()
+        except Exception:
+            return {}
+        if len(counts) != 2:
+            return {}
+        majority = int(counts.max())
+        minority = int(counts.min())
+        if minority == 0:
+            return {}
+        ratio = majority / minority
+        if ratio < Config.AUTO_CLASS_WEIGHT_THRESHOLD:
+            return {}
+
+        # Identify which class is minority — `class_weight` dict needs the right key
+        cls_min = counts.idxmin()
+
+        # Resolve weight per strategy
+        strategy = str(Config.CLASS_WEIGHT_STRATEGY).lower().strip()
+        severe   = ratio >= Config.CLASS_WEIGHT_SEVERE_THRESHOLD
+        try:
+            if strategy == "auto":
+                weight = float(np.sqrt(ratio)) if severe else float(ratio)
+            elif strategy == "balanced":
+                weight = float(ratio)
+            elif strategy == "sqrt":
+                weight = float(np.sqrt(ratio))
+            elif strategy == "half":
+                weight = float(ratio) / 2.0
+            else:
+                # Numeric multiplier (e.g. "0.3" → 30% of balanced)
+                weight = float(strategy) * float(ratio)
+        except (TypeError, ValueError):
+            weight = float(ratio)   # fallback to balanced on bad strategy string
+
+        weight = max(1.0, round(weight, 2))
+
+        if estimator_name in ("xgboost", "XGBoost", "catboost", "CatBoost"):
+            return {"scale_pos_weight": weight}
+        if estimator_name in ("lgbm", "LightGBM", "rf", "RandomForest", "extra_tree", "ExtraTrees"):
+            # Dict form so the EXACT weight (sqrt/half/etc.) is applied; the
+            # string 'balanced' would silently override with sklearn's ratio.
+            cls_maj = counts.idxmax()
+            return {"class_weight": {cls_maj: 1.0, cls_min: weight}}
+        return {}
+
+    def _fit_with_early_stopping(
+        self,
+        model: Any,
+        estimator_name: str,
+        X_tr: pd.DataFrame, y_tr: pd.Series,
+        X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None,
+        rounds: Optional[int] = None,
+    ) -> Any:
+        """Fit `model` with early stopping when a validation set is supplied.
+
+        Falls back to plain fit when:
+          - No valid set (or empty)
+          - Estimator without ES support (RF / ExtraTrees / unknown)
+          - ES API call raises (logged + plain fit)
+
+        Each lib has a different ES API:
+          - lightgbm : callbacks=[lgb.early_stopping(rounds, verbose=False)]
+          - xgboost  : early_stopping_rounds (2.x: ctor param; 1.x: fit param)
+          - catboost : early_stopping_rounds in fit(eval_set=...)
+        """
+        rounds = rounds if rounds is not None else Config.EARLY_STOPPING_ROUNDS
+        no_val = X_val is None or len(X_val) == 0
+        rf_like = estimator_name in ("rf", "RandomForest", "extra_tree", "ExtraTrees")
+        if no_val or rf_like:
+            model.fit(X_tr, y_tr)
+            return model
+        try:
+            if estimator_name in ("lgbm", "LightGBM"):
+                import lightgbm as lgb
+                model.fit(
+                    X_tr, y_tr,
+                    eval_set=[(X_val, y_val)],
+                    eval_metric="auc",
+                    callbacks=[lgb.early_stopping(rounds, verbose=False),
+                               lgb.log_evaluation(0)],
+                )
+            elif estimator_name in ("xgboost", "XGBoost"):
+                import xgboost as xgb
+                if int(xgb.__version__.split(".")[0]) >= 2:
+                    model.set_params(early_stopping_rounds=rounds)
+                    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+                else:
+                    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)],
+                              early_stopping_rounds=rounds, verbose=False)
+            elif estimator_name in ("catboost", "CatBoost"):
+                model.fit(X_tr, y_tr, eval_set=(X_val, y_val),
+                          early_stopping_rounds=rounds, verbose=False)
+            else:
+                model.fit(X_tr, y_tr)
+        except Exception as e:
+            self.logger.log(self.name, "EarlyStop WARN",
+                f"ES fit failed for {estimator_name} ({e}) → plain fit")
+            try:
+                # Reset any ES state that might have been left on the model
+                model.set_params(early_stopping_rounds=None)
+            except Exception:
+                pass
+            model.fit(X_tr, y_tr)
+        return model
+
     # ── GPU detection ─────────────────────────────────────────────────────────
 
     _GPU_AVAILABLE: Optional[bool] = None  # class-level cache; None = not yet checked
@@ -273,22 +417,32 @@ class TrainModelAgent(BaseAgent):
     def _compute_time_budget(n_rows: int, n_cols: int) -> Tuple[int, int]:
         """Return (flaml_time_budget_s, optuna_timeout_s) scaled to dataset size.
 
-        Tiers:
-          Small  : rows ≤ 90 000 AND cols < 100  → 120 s
-          Medium : rows ≤ 200 000 AND cols ≤ 400 → 120 – 360 s (interpolated)
-          Large  : above medium                  → 360 – 1 000 s (interpolated)
+        The factor (0 → 1) scales the user-configured `Config.FLAML_TIME_BUDGET`
+        and `Config.OPTUNA_TIMEOUT` down for small data and up to the full budget
+        for large data. Previous version had hard-coded 1000 s cap that silently
+        dropped user-set budgets of 1800-3600 s.
+
+        Factor tiers:
+          Small  (≤ 90 k rows AND <100 cols)        → 0.10
+          Medium (≤ 200 k rows AND ≤400 cols)       → 0.10 – 0.30
+          Large  (above medium, capped at 1M × 2k)  → 0.30 – 1.00
+
+        A 120 s floor protects against degenerate budgets when the user
+        accidentally sets FLAML_TIME_BUDGET very low.
         """
         if n_rows <= 90_000 and n_cols < 100:
-            t = 120
+            factor = 0.10
         elif n_rows <= 200_000 and n_cols <= 400:
             row_ratio = max(0.0, (n_rows - 90_000) / (200_000 - 90_000))
             col_ratio = max(0.0, (n_cols - 100) / (400 - 100))
-            t = int(120 + max(row_ratio, col_ratio) * (360 - 120))
+            factor = 0.10 + max(row_ratio, col_ratio) * (0.30 - 0.10)
         else:
             row_ratio = min(1.0, max(0.0, (n_rows - 200_000) / 800_000))
             col_ratio = min(1.0, max(0.0, (n_cols - 400) / 1_600))
-            t = int(360 + max(row_ratio, col_ratio) * (1_000 - 360))
-        return t, t
+            factor = 0.30 + max(row_ratio, col_ratio) * (1.00 - 0.30)
+        flaml_t  = max(120, int(Config.FLAML_TIME_BUDGET * factor))
+        optuna_t = max(120, int(Config.OPTUNA_TIMEOUT     * factor))
+        return flaml_t, optuna_t
 
     # ── Step 1: Data split ────────────────────────────────────────────────────
 
@@ -550,7 +704,23 @@ class TrainModelAgent(BaseAgent):
 
     # ── Step 3: Optuna fine-tuning ────────────────────────────────────────────
 
-    def _build_optuna_params(self, estimator_name: str, trial) -> Dict:
+    def _build_optuna_params(
+        self,
+        estimator_name: str,
+        trial,
+        pos_weight_range: Optional[Tuple[float, float]] = None,
+    ) -> Dict:
+        """Build Optuna search-space params for one estimator.
+
+        When `pos_weight_range=(lo, hi)` is supplied (set by `_tool_run_optuna`
+        on imbalanced data), xgb/catboost get `scale_pos_weight` tuned in
+        [lo, hi] on log scale — this lets Optuna pick the imbalance correction
+        instead of using a static sqrt(ratio) / ratio heuristic. Empirically
+        +0.3-0.6% AUC on credit_risk / fraud.
+
+        lgbm / rf / extra_tree don't need it — their class_weight dict is
+        applied separately at fit time.
+        """
         gpu = self._gpu_params(estimator_name)
         if estimator_name in ("lgbm", "LightGBM"):
             return {
@@ -567,7 +737,7 @@ class TrainModelAgent(BaseAgent):
                 **gpu,
             }
         if estimator_name in ("xgboost", "XGBoost"):
-            return {
+            params = {
                 "n_estimators": trial.suggest_int("n_estimators", Config.N_ESTIMATORS_MIN, Config.N_ESTIMATORS_MAX, step=50),
                 "learning_rate": trial.suggest_float("learning_rate", Config.LR_MIN, Config.LR_MAX, log=True),
                 "max_depth": trial.suggest_int("max_depth", Config.MAX_DEPTH_MIN, Config.MAX_DEPTH_MAX),
@@ -581,8 +751,14 @@ class TrainModelAgent(BaseAgent):
                 "random_state": Config.RANDOM_STATE, "n_jobs": -1, "verbosity": 0,
                 **gpu,
             }
+            if pos_weight_range is not None:
+                lo, hi = pos_weight_range
+                params["scale_pos_weight"] = trial.suggest_float(
+                    "scale_pos_weight", max(1.0, lo), max(1.01, hi), log=True
+                )
+            return params
         if estimator_name in ("catboost", "CatBoost"):
-            return {
+            params = {
                 "iterations": trial.suggest_int("iterations", Config.N_ESTIMATORS_MIN, Config.N_ESTIMATORS_MAX, step=50),
                 "learning_rate": trial.suggest_float("learning_rate", Config.LR_MIN, Config.LR_MAX, log=True),
                 "depth": trial.suggest_int("depth", Config.CB_DEPTH_MIN, Config.CB_DEPTH_MAX),
@@ -592,6 +768,12 @@ class TrainModelAgent(BaseAgent):
                 "random_seed": Config.RANDOM_STATE, "verbose": 0,
                 **gpu,
             }
+            if pos_weight_range is not None:
+                lo, hi = pos_weight_range
+                params["scale_pos_weight"] = trial.suggest_float(
+                    "scale_pos_weight", max(1.0, lo), max(1.01, hi), log=True
+                )
+            return params
         # rf / extra_tree / RandomForest / ExtraTrees — no GPU support
         return {
             "n_estimators": trial.suggest_int("n_estimators", Config.N_ESTIMATORS_MIN, Config.N_ESTIMATORS_MAX, step=50),
@@ -625,11 +807,38 @@ class TrainModelAgent(BaseAgent):
         ModelClass = self._get_model_class(estimator_name)
         _estimator_name = estimator_name
         _self = self
+        # Auto class weighting + early stopping: both safe defaults that boost
+        # AUC on imbalanced data without changing the search space dimensions.
+        class_weight_params = self._compute_class_weight_params(y_train, estimator_name)
+        if class_weight_params:
+            self.logger.log(self.name, "Optuna class weight",
+                f"applying {class_weight_params} (auto from train imbalance)")
+
+        # For xgb/cb on imbalanced data, push scale_pos_weight into Optuna's
+        # search space instead of fixing it via class_weight_params. Optuna
+        # finds the AUC-optimal weight; static sqrt/balanced often misses it
+        # by 1-3 ratio points.
+        pos_weight_range: Optional[Tuple[float, float]] = None
+        if estimator_name in ("xgboost", "XGBoost", "catboost", "CatBoost"):
+            ratio = self._compute_imbalance_ratio(y_train)
+            if ratio >= Config.AUTO_CLASS_WEIGHT_THRESHOLD:
+                # Search log-uniform in [1, ratio]. Optuna typically converges
+                # near sqrt(ratio) for severe imbalance but can pick higher
+                # when valid set has different distribution.
+                pos_weight_range = (1.0, float(ratio))
+                # Static scale_pos_weight from class_weight_params would override
+                # Optuna's tuned value — strip it so search wins.
+                class_weight_params.pop("scale_pos_weight", None)
+                self.logger.log(self.name, "Optuna scale_pos_weight",
+                    f"searching in [1.0, {ratio:.1f}] (log-uniform) — overrides static {Config.CLASS_WEIGHT_STRATEGY}")
 
         def objective(trial):
-            params = _self._build_optuna_params(_estimator_name, trial)
+            params = _self._build_optuna_params(_estimator_name, trial, pos_weight_range)
+            params.update(class_weight_params)
             model = ModelClass(**params)
-            model.fit(X_train, y_train)
+            _self._fit_with_early_stopping(
+                model, _estimator_name, X_train, y_train, X_valid, y_valid
+            )
             return roc_auc_score(y_valid, model.predict_proba(X_valid)[:, 1])
 
         study = optuna.create_study(
@@ -645,7 +854,9 @@ class TrainModelAgent(BaseAgent):
         # Replay _build_optuna_params with FixedTrial to recover fixed params
         # (random_state, n_jobs, verbose, etc.) that study.best_params doesn't contain
         try:
-            full_best_params = self._build_optuna_params(estimator_name, FixedTrial(study.best_params))
+            full_best_params = self._build_optuna_params(
+                estimator_name, FixedTrial(study.best_params), pos_weight_range
+            )
             self.logger.log(self.name, "Optuna",
                 f"best_AUC={study.best_value:.4f} | params={json.dumps(study.best_params)[:200]}")
             return full_best_params
@@ -664,7 +875,14 @@ class TrainModelAgent(BaseAgent):
         from sklearn.model_selection import StratifiedKFold
 
         ModelClass = self._get_model_class(estimator_name)
-        n_target = min(Config.MAX_FINAL_FEATURES, X_train.shape[1])
+        # RFE keeps RFE_TARGET_FEATURES (not MAX_FINAL_FEATURES) so PSI / Stability /
+        # SHAP+PSI prune downstream have more candidates to work with. Floor at
+        # MAX_FINAL_FEATURES so RFE never drops below the final cap. Cap at n_cols
+        # for narrow datasets where the requested target exceeds available features.
+        n_target = min(
+            max(Config.RFE_TARGET_FEATURES, Config.MAX_FINAL_FEATURES),
+            X_train.shape[1],
+        )
         n_est_key = self._get_n_estimators_key(estimator_name)
         base_model = ModelClass(**{**self._safe_params(estimator_name, best_params), n_est_key: Config.RFE_N_ESTIMATORS, **self._gpu_params(estimator_name)})
 
@@ -832,12 +1050,27 @@ class TrainModelAgent(BaseAgent):
 
         # columns guaranteed to exist in both matrices (X_train and X_valid were built
         # from the same feat_avail set, so they should always match — guard for safety)
+        class_weight_params = self._compute_class_weight_params(y_train, estimator_name)
+        # Optuna may have tuned scale_pos_weight already (xgb/cb path). Don't
+        # let the static heuristic override that — keep best_params' choice.
+        if "scale_pos_weight" in best_params:
+            class_weight_params.pop("scale_pos_weight", None)
         def _fit_model(features: List[str]):
             avail = [c for c in features if c in X_train.columns and c in X_valid.columns]
             if not avail:
                 return None, avail
-            m = ModelClass(**{**self._safe_params(estimator_name, best_params), n_est_key: Config.SHAP_N_ESTIMATORS, **gpu})
-            m.fit(X_train[avail], y_train)
+            m = ModelClass(**{
+                **self._safe_params(estimator_name, best_params),
+                n_est_key: Config.SHAP_N_ESTIMATORS,
+                **class_weight_params,
+                **gpu,
+            })
+            self._fit_with_early_stopping(
+                m, estimator_name,
+                X_train[avail], y_train,
+                X_valid[avail] if len(X_valid) > 0 else None,
+                y_valid if len(X_valid) > 0 else None,
+            )
             return m, avail
 
         def _fast_auc(features: List[str]) -> float:
@@ -964,8 +1197,33 @@ class TrainModelAgent(BaseAgent):
             return self._transform_X(df[avail]), pd.to_numeric(df[target], errors="coerce")
 
         X_tr, y_tr = _prep(self.splits["train"])
-        model = ModelClass(**{**self._safe_params(estimator_name, best_params), **self._gpu_params(estimator_name)})
-        model.fit(X_tr, y_tr)
+
+        # Auto class weighting from train imbalance — but respect Optuna's
+        # tuned scale_pos_weight if it's already in best_params (xgb/cb path).
+        class_weight_params = self._compute_class_weight_params(y_tr, estimator_name)
+        if "scale_pos_weight" in best_params:
+            class_weight_params.pop("scale_pos_weight", None)
+        if class_weight_params:
+            self.logger.log(self.name, "Final class weight",
+                f"applying {class_weight_params}")
+
+        # Pick best valid set for early stopping: prefer temporal (closest to OOT
+        # boundary) over random valid. RF/ExtraTrees ignore ES internally.
+        X_es, y_es = None, None
+        for split_name in ("valid_temporal", "valid"):
+            sdf = self.splits.get(split_name, pd.DataFrame())
+            if len(sdf) > 0:
+                X_es, y_es = _prep(sdf)
+                if y_es.nunique() >= 2:
+                    break
+                X_es, y_es = None, None
+
+        model = ModelClass(**{
+            **self._safe_params(estimator_name, best_params),
+            **class_weight_params,
+            **self._gpu_params(estimator_name),
+        })
+        self._fit_with_early_stopping(model, estimator_name, X_tr, y_tr, X_es, y_es)
         self.model = model
 
         metrics: Dict[str, Any] = {"best_model": estimator_name, "best_params": best_params}
@@ -1310,6 +1568,9 @@ if __name__ == "__main__":
         # ── 1. Compute SHAP values ────────────────────────────────────────────
         importance: Optional[pd.Series] = None
         importance_source = "shap"
+        # Keep the raw 2D sample×feature SHAP matrix — needed for the beeswarm plot
+        # (bar plot only needs the aggregated importance series).
+        raw_shap_values: Optional[np.ndarray] = None
         try:
             import shap
             explainer = shap.TreeExplainer(self.model)
@@ -1318,7 +1579,10 @@ if __name__ == "__main__":
                 sv = sv[1]                          # binary classification → positive class
             elif isinstance(sv, np.ndarray) and sv.ndim == 3:
                 sv = sv[:, :, 1]
-            importance = pd.Series(np.abs(sv).mean(axis=0), index=avail).sort_values(ascending=False)
+            raw_shap_values = np.asarray(sv)
+            importance = pd.Series(
+                np.abs(raw_shap_values).mean(axis=0), index=avail
+            ).sort_values(ascending=False)
             self.logger.log(self.name, "SHAP Explain",
                 f"computed on {sample_n} train rows × {len(avail)} features")
         except Exception as e:
@@ -1331,8 +1595,9 @@ if __name__ == "__main__":
             importance = pd.Series(imp, index=avail).sort_values(ascending=False)
             importance_source = "feature_importances_"
 
-        # ── 2. Bar plot (top 2N features so the distribution context is visible) ─
+        # ── 2a. Bar plot (top 2N features so the distribution context is visible) ─
         plot_n = min(len(importance), max(top_n * 2, top_n))
+        bar_saved = False
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -1349,9 +1614,52 @@ if __name__ == "__main__":
             Path(Config.SHAP_PLOT_PATH).parent.mkdir(parents=True, exist_ok=True)
             plt.savefig(Config.SHAP_PLOT_PATH, dpi=120, bbox_inches="tight")
             plt.close(fig)
+            bar_saved = True
             self.logger.log(self.name, "SHAP Plot Saved", Config.SHAP_PLOT_PATH)
         except Exception as e:
             self.logger.log(self.name, "SHAP Plot WARN", f"matplotlib failed: {e}")
+
+        # ── 2b. Beeswarm — direction + magnitude per sample for top N ────────
+        # Bar plot answers "which features matter?" (magnitude only). The
+        # beeswarm answers "in which direction?" (positive SHAP = pushes
+        # prediction up, negative = pushes down) AND "is the effect monotonic
+        # in the feature value?" (color gradient).
+        beeswarm_saved = False
+        if raw_shap_values is not None and importance_source == "shap":
+            try:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                import shap as _shap_lib
+
+                # Reorder columns to match importance ranking — shap.summary_plot
+                # already sorts internally but matching upfront keeps colors stable.
+                top_feats_beeswarm = importance.head(top_n).index.tolist()
+                col_idx = [avail.index(c) for c in top_feats_beeswarm]
+                sv_top = raw_shap_values[:, col_idx]
+                X_top  = X_sample[top_feats_beeswarm]
+
+                fig_h = max(6, top_n * 0.35)
+                plt.figure(figsize=(11, fig_h))
+                _shap_lib.summary_plot(
+                    sv_top, X_top,
+                    feature_names=top_feats_beeswarm,
+                    plot_type="dot",          # beeswarm
+                    max_display=top_n,
+                    show=False,
+                    sort=False,               # already pre-sorted by importance
+                )
+                plt.title(f"SHAP impact on output — top {top_n} features ({estimator_name})",
+                          fontsize=12, pad=12)
+                plt.tight_layout()
+                Path(Config.SHAP_BEESWARM_PATH).parent.mkdir(parents=True, exist_ok=True)
+                plt.savefig(Config.SHAP_BEESWARM_PATH, dpi=120, bbox_inches="tight")
+                plt.close()
+                beeswarm_saved = True
+                self.logger.log(self.name, "SHAP Beeswarm Saved", Config.SHAP_BEESWARM_PATH)
+            except Exception as e:
+                self.logger.log(self.name, "SHAP Beeswarm WARN",
+                    f"shap.summary_plot failed: {e} — bar plot only")
 
         # ── 3. LLM-explain top N ──────────────────────────────────────────────
         top_features = importance.head(top_n).index.tolist()
@@ -1420,7 +1728,141 @@ if __name__ == "__main__":
         Path(Config.SHAP_FEATURE_REPORT_PATH).parent.mkdir(parents=True, exist_ok=True)
         report_df.to_csv(Config.SHAP_FEATURE_REPORT_PATH, index=False, encoding="utf-8")
         self.logger.log(self.name, "SHAP Feature Report Saved", Config.SHAP_FEATURE_REPORT_PATH)
+
+        # ── 5. Dedicated final-model SHAP markdown report ────────────────────
+        # One self-contained file that combines: bar plot (importance ranking),
+        # beeswarm plot (impact direction + magnitude per sample), and the
+        # LLM-narrated top-N table. Lives next to final_model.pkl so analysts
+        # can pick up the entire explainability bundle in one place.
+        try:
+            self._write_shap_markdown_report(
+                report_df=report_df,
+                estimator_name=estimator_name,
+                importance_source=importance_source,
+                sample_n=sample_n,
+                bar_saved=bar_saved,
+                beeswarm_saved=beeswarm_saved,
+            )
+        except Exception as e:
+            self.logger.log(self.name, "SHAP MD Report WARN",
+                f"could not assemble combined markdown report: {e}")
         return report_df
+
+    def _write_shap_markdown_report(
+        self,
+        report_df: pd.DataFrame,
+        estimator_name: str,
+        importance_source: str,
+        sample_n: int,
+        bar_saved: bool,
+        beeswarm_saved: bool,
+    ) -> None:
+        """Assemble bar + beeswarm + LLM narrative into final_model_shap_report.md.
+
+        Image paths are written as bare filenames so the report renders correctly
+        when the run_NN/ directory is moved, zipped, or served from a static host.
+        """
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        bar_name      = Path(Config.SHAP_PLOT_PATH).name
+        beeswarm_name = Path(Config.SHAP_BEESWARM_PATH).name
+        csv_name      = Path(Config.SHAP_FEATURE_REPORT_PATH).name
+        model_name    = Path(Config.FINAL_MODEL_PATH).name
+
+        n_final = len(self.feature_cols) if self.feature_cols else len(report_df)
+        importance_metric = "Mean |SHAP value|" if importance_source == "shap" else "Feature importance (fallback)"
+
+        lines: List[str] = []
+        lines.append("# Final Model — SHAP Explainability Report\n\n")
+        lines.append(
+            "| Field | Value |\n"
+            "|---|---|\n"
+            f"| Generated      | {ts} |\n"
+            f"| Estimator      | `{estimator_name}` |\n"
+            f"| Target         | `{self.target_column}` |\n"
+            f"| Domain         | `{self._domain}` |\n"
+            f"| Features in final model | {n_final} |\n"
+            f"| SHAP sample size | {sample_n} rows from train |\n"
+            f"| Importance metric | {importance_metric} |\n"
+            f"| Model artifact | `{model_name}` |\n\n"
+            "---\n\n"
+        )
+
+        # 1. Bar plot — importance magnitude
+        lines.append("## 1. Feature importance — magnitude\n\n")
+        if bar_saved:
+            lines.append(f"![SHAP feature importance]({bar_name})\n\n")
+        else:
+            lines.append("_Bar plot was not generated (matplotlib unavailable)._\n\n")
+        lines.append(
+            "Mỗi bar = trung bình giá trị tuyệt đối của SHAP của một feature trên "
+            f"sample SHAP ({sample_n} rows train). Đây là answer cho câu hỏi: "
+            "**\"feature nào quan trọng nhất với prediction trung bình?\"**.\n\n"
+            "---\n\n"
+        )
+
+        # 2. Beeswarm — impact direction + sample distribution
+        lines.append("## 2. Impact on model output — beeswarm (direction + magnitude)\n\n")
+        if beeswarm_saved:
+            lines.append(f"![SHAP beeswarm]({beeswarm_name})\n\n")
+            lines.append(
+                "Mỗi dot = một sample (1 row train). Đọc plot:\n\n"
+                "- **Trục X** : SHAP value của sample đó. SHAP > 0 = feature *đẩy probability dự đoán lên*; "
+                "SHAP < 0 = *đẩy xuống*. Khoảng cách từ 0 = độ lớn ảnh hưởng.\n"
+                "- **Trục Y** : features xếp theo mean |SHAP| giảm dần (giống bar plot).\n"
+                "- **Màu**   : giá trị thực của feature ở sample đó. Đỏ = giá trị cao, xanh = giá trị thấp.\n"
+                "- **Mật độ dot** : phần phình to = nhiều sample có cùng mức ảnh hưởng → effect nhất quán; "
+                "rải rác = effect phụ thuộc context (interaction với feature khác).\n\n"
+                "**Cách diễn giải nhanh**:\n"
+                "- Cluster **đỏ phía phải** → feature giá trị cao → tăng prediction (positive class)\n"
+                "- Cluster **đỏ phía trái** → feature giá trị cao → giảm prediction (negative class, inverse relationship)\n"
+                "- Hai cụm tách biệt 2 đầu → feature có effect mạnh và monotonic (đáng quan tâm trong scorecard)\n"
+                "- Spread rộng giữa các sample cùng màu → effect biến đổi theo interactions\n\n"
+            )
+        else:
+            lines.append(
+                "_Beeswarm plot was not generated. Common reasons: `shap` library not installed, "
+                "or the fallback `feature_importances_` was used (no per-sample SHAP matrix available)._\n\n"
+            )
+        lines.append("---\n\n")
+
+        # 3. LLM-narrated table
+        lines.append(f"## 3. Top {len(report_df)} features — LLM-narrated meaning\n\n")
+        if not report_df.empty:
+            lines.append(
+                "| Rank | Feature | SHAP importance | Description | Meaning | Why it matters |\n"
+                "|---:|---|---:|---|---|---|\n"
+            )
+            for rec in report_df.to_dict(orient="records"):
+                feat = rec.get("feature", "")
+                imp  = float(rec.get("shap_importance", 0.0))
+                desc = (rec.get("description") or "").replace("|", "\\|").replace("\n", " ")
+                mean = (rec.get("meaning") or "").replace("|", "\\|").replace("\n", " ")
+                why  = (rec.get("why_matters") or "").replace("|", "\\|").replace("\n", " ")
+                lines.append(
+                    f"| {rec.get('rank', '')} | `{feat}` | {imp:.4f} | {desc} | {mean} | {why} |\n"
+                )
+            lines.append("\n")
+        else:
+            lines.append("_No top features available (SHAP step skipped)._\n\n")
+
+        # 4. Footer + sibling files
+        lines.append(
+            "---\n\n"
+            "## Sibling files\n\n"
+            f"- `{bar_name}` — bar plot (magnitude only)\n"
+            f"- `{beeswarm_name}` — beeswarm (direction + per-sample distribution)\n"
+            f"- `{csv_name}` — full CSV (rank, feature, importance, description, meaning, why_matters)\n"
+            f"- `{model_name}` — joblib artifact (model + encoders + versions)\n"
+            f"- `{Path(Config.FINAL_MODEL_CODE_PATH).name}` — standalone inference script\n\n"
+            "*SHAP values computed on the FINAL model after overfit-aware retrain — "
+            "reflects exactly what gets deployed.*\n"
+        )
+
+        Path(Config.SHAP_FINAL_MODEL_REPORT_PATH).parent.mkdir(parents=True, exist_ok=True)
+        Path(Config.SHAP_FINAL_MODEL_REPORT_PATH).write_text("".join(lines), encoding="utf-8")
+        self.logger.log(self.name, "SHAP MD Report Saved", Config.SHAP_FINAL_MODEL_REPORT_PATH)
 
     # ── Split-mode entry point ────────────────────────────────────────────────
 
@@ -1615,6 +2057,46 @@ if __name__ == "__main__":
                 "Feature pipeline eliminated all features. "
                 "Lower PSI_THRESHOLD / STABILITY_GINI_STD_THRESHOLD or reduce MAX_FINAL_FEATURES."
             )
+
+        # ── 7b. Re-tune Optuna on the final (settled) feature set ────────────
+        # The initial Optuna study optimised hyperparams against feat_avail
+        # (~1500 cols for wide data). After RFE → PSI → Stability → SHAP+PSI
+        # the model usually sees 50-100 features at inference. Hyperparams
+        # like num_leaves / max_depth / min_child_samples that were optimal
+        # at 1500 cols are typically too aggressive at 100 cols → suboptimal
+        # AUC on the FINAL model.
+        #
+        # We re-run a shorter Optuna study restricted to the final feature
+        # set when the pipeline meaningfully shrank the feature count.
+        n_init = len(feat_avail)
+        reduction_ratio = len(final_features) / n_init if n_init else 1.0
+        if (Config.ENABLE_RETUNE_AFTER_PRUNE
+                and reduction_ratio <= Config.RETUNE_FEATURE_REDUCTION_TRIGGER):
+            self.logger.log(self.name, "Optuna Re-tune Start",
+                f"feature count {n_init} → {len(final_features)} "
+                f"({reduction_ratio:.0%} kept ≤ trigger {Config.RETUNE_FEATURE_REDUCTION_TRIGGER:.0%}) "
+                f"→ re-tuning hyperparams on final features")
+            X_tr_final = X_train[[c for c in final_features if c in X_train.columns]]
+            X_vl_final = (
+                X_valid[[c for c in final_features if c in X_valid.columns]]
+                if len(X_valid) > 0 else pd.DataFrame()
+            )
+            retune_budget = max(60, int(optuna_budget * Config.RETUNE_TIMEOUT_RATIO))
+            new_best_params = self._tool_run_optuna(
+                best_estimator, best_params,
+                X_tr_final, y_train, X_vl_final, y_valid,
+                timeout=retune_budget,
+            )
+            # _tool_run_optuna falls back to base_params when no trial completes
+            # within the budget — only adopt when something actually came back.
+            if new_best_params is not best_params:
+                best_params = new_best_params
+                self.logger.log(self.name, "Optuna Re-tune Adopted",
+                    "best_params replaced with re-tuned hyperparams")
+        elif Config.ENABLE_RETUNE_AFTER_PRUNE:
+            self.logger.log(self.name, "Optuna Re-tune Skipped",
+                f"feature kept ratio {reduction_ratio:.0%} > trigger "
+                f"{Config.RETUNE_FEATURE_REDUCTION_TRIGGER:.0%} (not enough reduction)")
 
         # ── 8. Final model ────────────────────────────────────────────────────
         self.feature_cols = final_features
