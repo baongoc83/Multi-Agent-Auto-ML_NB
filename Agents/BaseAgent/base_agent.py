@@ -181,7 +181,10 @@ class BaseAgent:
                 if not skip_temperature:
                     create_kwargs["temperature"] = Config.LLM_TEMPERATURE
                 response = claude_client.messages.create(**create_kwargs)
-                result = response.content[0].text
+                text_blocks = [b for b in response.content if hasattr(b, "text")]
+                if not text_blocks:
+                    raise ValueError(f"No text block in response: {[type(b).__name__ for b in response.content]}")
+                result = text_blocks[0].text
                 self._log_token_usage(model, response)
                 self.logger.log(self.name, "LLM Response",
                     f"Claude ({model}) | {len(result)} chars | fallback=claude")
@@ -234,7 +237,10 @@ class BaseAgent:
                     create_kwargs["temperature"] = Config.LLM_TEMPERATURE
                 response = self.client.messages.create(**create_kwargs)
                 self._log_token_usage(model, response)
-                result = response.content[0].text
+                text_blocks = [b for b in response.content if hasattr(b, "text")]
+                if not text_blocks:
+                    raise ValueError(f"No text block in response: {[type(b).__name__ for b in response.content]}")
+                result = text_blocks[0].text
                 self.logger.log(self.name, "LLM Response",
                     f"model={model} | {len(result)} chars | backend=gateway")
                 return result
@@ -322,7 +328,23 @@ class BaseAgent:
         "target", "label", "y", "class", "output",
         "default_flag", "fraud", "is_fraud", "churn", "bad_flag",
     ]
-    _DATE_KEYWORDS = ("date", "dt", "time", "month", "snap", "period", "year", "week", "day")
+    # Boundary-aware patterns: matched against the column name in lower-case.
+    # Substring lists like ("dt", "day", "month") used to pick up
+    # `amt_dti`, `days_birth`, `months_balance` etc. — all of which are features,
+    # not snapshot timestamps. We now require either an exact name match, an
+    # `_date` / `_dt` / `_ts` suffix, or a snapshot-style token.
+    _DATE_NAME_PATTERNS = (
+        re.compile(r"^(date|dt|datetime|timestamp|ts|snap_dt|snapshot|"
+                   r"observation_date|report_date|as_of|as_of_date|"
+                   r"date_decision|process_date|month_id|year_month|"
+                   r"period|month|cohort)$"),
+        re.compile(r"_(date|dt|ts|timestamp|snap_dt|snap|month_id|year_month)$"),
+    )
+
+    @classmethod
+    def _looks_like_date_name(cls, col: str) -> bool:
+        col_l = col.lower()
+        return any(p.search(col_l) for p in cls._DATE_NAME_PATTERNS)
 
     def _resolve_target_column(self, df, target_column: str) -> str:
         """Resolve target column: exact → case-insensitive → common aliases → raise."""
@@ -346,17 +368,49 @@ class BaseAgent:
         )
 
     def _auto_detect_date_col(self, df) -> Optional[str]:
-        """Return the first column whose name contains a date keyword and is parseable as datetime."""
+        """Pick the first genuinely temporal column.
+
+        Hardened against false positives that caused the cascading "Must have
+        at least 1 validation dataset for early stopping" failure when a
+        feature column (e.g. days_birth, years_employed, amt_dti) was
+        misclassified as the snapshot date column:
+
+          1. Name must match a boundary-aware date pattern (not just "contains
+             the substring 'dt'").
+          2. Numeric dtypes are REJECTED — pd.to_datetime on int/float
+             interprets values as nanoseconds-since-epoch and silently parses
+             every integer to a near-epoch timestamp. Real date columns are
+             either datetime64 already, or strings that need parsing.
+          3. Parsed values must span ≥ 30 days. All-near-epoch clusters
+             (the failure mode for int-as-ns parsing) collapse to one period,
+             which would then trip the temporal-split fallback.
+
+        Caller should pass `date_col=` explicitly if the snapshot column is
+        encoded as a raw integer (e.g. days_from_anchor).
+        """
         for col in df.columns:
-            if any(kw in col.lower() for kw in self._DATE_KEYWORDS):
-                if pd.api.types.is_datetime64_any_dtype(df[col]):
-                    return col
-                try:
-                    parsed = pd.to_datetime(df[col], errors="coerce")
-                    if parsed.notna().mean() > 0.9:
-                        return col
-                except Exception:
-                    continue
+            if not self._looks_like_date_name(col):
+                continue
+            s = df[col]
+            if pd.api.types.is_datetime64_any_dtype(s):
+                return col
+            # Reject numeric columns — int/float as date is almost always a feature
+            if pd.api.types.is_numeric_dtype(s):
+                continue
+            try:
+                parsed = pd.to_datetime(s, errors="coerce")
+            except Exception:
+                continue
+            if parsed.notna().mean() <= 0.9:
+                continue
+            # Sanity: real snapshot columns span days/months, not a single instant
+            try:
+                span_days = (parsed.max() - parsed.min()).days
+            except Exception:
+                span_days = 0
+            if span_days < 30:
+                continue
+            return col
         return None
 
     @staticmethod

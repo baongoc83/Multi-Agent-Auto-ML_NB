@@ -22,7 +22,8 @@ Raw data  ─►  Agent 1: DataCleaner  ─►  Agent 2: FeatureEngineer  ─►
 - **Gateway backend** cho mạng nội bộ — single source, gateway tự handle failover
 - **OOT temporal split tự động** từ cột date — tự cân bằng `OOT_MIN_RATIO` / `OOT_MAX_RATIO`
 - **Pipeline feature selection 5 tầng**: RFE → PSI drift → Stability Gini → SHAP+PSI iterative pruning → top-N cut
-- **Overfitting detection + LLM-guided retrain** khi gap valid/holdout vượt ngưỡng
+- **Refit-on-train+valid**: sau feature/hyperparam selection, model deploy được refit trên train+valid gộp (CV tìm `best_iteration` ổn định + calibration trên OOF, không leakage); OOT/test giữ nguyên làm holdout sạch
+- **Overfitting detection + LLM-guided retrain** khi gap CV-OOF/holdout (`ref_auc` vs `oot`/`test`) vượt ngưỡng
 - **GPU auto-detect** cho LightGBM, XGBoost, CatBoost
 - **Smart Excel reader**: magic-byte detection cho file `.xls/.xlsx` bị đặt sai extension
 - **Sinh code inference standalone** (`outputs/final_model_code.py`) — chạy độc lập với pipeline
@@ -464,12 +465,13 @@ python tests/test_agent3.py
 ```
 Train data  ─►  FLAML        ─►  estimator + base hyperparams (AutoML)
             ─►  Optuna       ─►  fine-tune hyperparams (TPE, valid_temporal split)
-            ─►  RFE          ─►  cắt xuống MAX_FINAL_FEATURES
+            ─►  RFE          ─►  cắt xuống RFE_TARGET_FEATURES
             ─►  PSI filter   ─►  loại feature drift > PSI_THRESHOLD (train vs OOT)
             ─►  Stability    ─►  loại feature có std Gini theo tháng > threshold
-            ─►  SHAP+PSI     ─►  iterative prune cho đến khi AUC valid ngừng tăng
-            ─►  Final train  ─►  CV + valid_temporal + valid_random + OOT + test
-            ─►  Overfit check ─► nếu detected → LLM-guided retrain với reg mạnh hơn
+            ─►  SHAP+PSI     ─►  iterative prune về ~MAX_FINAL_FEATURES (FEATURE_CAP_POLICY)
+            ─►  Refit         ─►  gộp train+valid, CV best_iteration, calibrate trên OOF
+            ─►  Eval          ─►  OOT (temporal) / test (holdout) — giữ sạch, không gộp
+            ─►  Overfit check ─► gap ref_auc(CV-OOF) vs holdout → LLM-guided retrain
 ```
 
 ---

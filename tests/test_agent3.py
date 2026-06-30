@@ -156,6 +156,7 @@ def test_agent3():
             ("outputs/psi_report.csv",                "PSI drift report (raw)     — Agent 3"),
             ("outputs/stability_report.csv",          "Feature stability report   — Agent 3"),
             ("outputs/shap_psi_prune_log.csv",        "SHAP+PSI pruning log       — Agent 3"),
+            *Config.chart_files(),                    # 9 model diagnostic charts
             ("outputs/final_model.pkl",               "Trained model artifact     — Agent 3"),
             ("outputs/final_model_code.py",           "Standalone inference code  — Agent 3"),
             ("outputs/final_report.md",               "Full pipeline report"),

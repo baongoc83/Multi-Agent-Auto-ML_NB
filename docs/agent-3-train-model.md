@@ -212,31 +212,46 @@ while len(features) > MIN_FEATURES_FLOOR:
 
 ---
 
-## Step 9 — Final train + evaluate ([line 942-985](../Agents/TrainModel/agent_train_model.py#L942-L985))
+## Step 9 — Refit-on-train+valid + evaluate ([`_tool_train_final_model`](../Agents/TrainModel/agent_train_model.py))
+
+Sau khi feature selection + hyperparams đã **chốt** (tuning/selection chạy trên `train`, dùng `valid` làm ES/scoring holdout), model **đem deploy** được **huấn luyện lại trên toàn bộ dữ liệu in-time** để thấy hết mọi dòng trước khi gặp OOT/test. OOT (và `test` ở simple mode) **không bao giờ** bị gộp vào → giữ làm holdout nghiệm thu cuối.
 
 ```python
-model = ModelClass(**best_params).fit(X_train, y_train)  ← train ONLY
+# 0. Merge: X_final = train + valid_temporal + valid_random  (hoặc `valid` ở simple mode)
+#    OOT (và `test` ở simple mode) GIỮ LẠI làm holdout cuối.
+X_final = concat(train, valid_temporal, valid_random)
 
-# CV trên train
-cv_auc = cross_val_score(model, X_train, y_train,
-                          cv=StratifiedKFold(CV_N_SPLITS=5, shuffle=True, random_state=RANDOM_STATE),
-                          scoring="roc_auc", n_jobs=-1)
+# 1. K-fold CV trên X_final (một vòng, ra cả 2 thứ):
+for tr, va in StratifiedKFold(CV_N_SPLITS).split(X_final):
+    fold = ModelClass(**best_params).fit(X_final[tr], es_set=X_final[va])  # early stopping
+    best_iters.append(fold.best_iteration)        # (a) tree count ổn định
+    oof_raw[va] = fold.predict_proba(X_final[va]) # (b) out-of-fold preds (leakage-free)
+best_iteration = median(best_iters)
+cv_auc = mean(per-fold AUC trên oof)              # honest in-time estimate
 
-# Holdout AUCs (chỉ để report, KHÔNG feedback vào model selection)
+# 2. Multi-seed refit trên TOÀN BỘ X_final, cố định n_estimators=best_iteration (KHÔNG ES)
+ensemble = [ModelClass(**best_params, n_estimators=best_iteration, random_state=s).fit(X_final)
+            for s in seeds]
+
+# 3. Calibration KHÔNG leakage: isotonic/sigmoid fit trên oof_raw (CalibratedClassifierCV-style)
+calibrator = fit_calibrator(oof_raw, y_final)
+
+# 4. Per-split AUC + Brier
 for split in [valid_temporal, valid_random, valid, oot, test]:
-    if len(split) > 0:
-        auc = roc_auc_score(y_split, model.predict_proba(X_split)[:, 1])
-        metrics[f"{split}_auc"] = auc
+    metrics[f"{split}_auc"] = roc_auc_score(y_split, ensemble.predict_proba(X_split))
 ```
 
-Holdout AUCs **chỉ để report**, không feed back vào model selection.
+- `best_iteration` chỉ có với LGBM/XGB/CatBoost (có ES). RF/ExtraTrees/DART → `None`, refit với `n_estimators` từ `best_params`.
+- `valid_*` giờ là **in-sample** (đã gộp vào train) → chỉ để minh bạch. **OOT/test** là holdout sạch; **`cv_auc_mean` (OOF)** là ước lượng generalization trung thực.
+- Metrics mới: `final_trained_on="train+valid"`, `final_train_rows`, `best_iteration`, `calibration_split="cv_oof(train+valid)"`.
 
 ---
 
 ## Step 10 — Overfit check + LLM-guided retrain ([line 989-1097](../Agents/TrainModel/agent_train_model.py#L989-L1097))
 
 ```python
-gap = (valid_auc - oot_auc) / valid_auc
+# ref = cv_auc_mean (OOF trên train+valid) — KHÔNG dùng valid_auc vì giờ là in-sample
+gap = (cv_auc_mean - oot_auc) / cv_auc_mean
 if gap > OVERFIT_THRESHOLD (12%):
     overrides = LLM(estimator, current_params, metrics, gap) → JSON với 4-6 reg overrides
     # Hoặc fallback _apply_conservative_regularization:
@@ -246,8 +261,6 @@ if gap > OVERFIT_THRESHOLD (12%):
     #   - rf  : ↓max_depth, ↑min_samples_leaf/split, max_features='sqrt'
     retrain → quay lại Step 9
 ```
-
-Tối đa `MAX_TRAINING_ITERATIONS=3` vòng retrain.
 
 ---
 
@@ -387,7 +400,6 @@ Override qua `.env`: `RANDOM_STATE=...`.
 | `SHAP_PSI_MIN_FEATURES_FLOOR` | 5 | Sàn cứng features |
 | `SHAP_PSI_MIN_FEATURES_RATIO` | 0.10 | Sàn tương đối (×MAX_FINAL_FEATURES) |
 | `OVERFIT_THRESHOLD` | 0.12 | Gap (valid-oot)/valid vượt → retrain |
-| `MAX_TRAINING_ITERATIONS` | 3 | Cap vòng overfit retrain |
 | `CV_N_SPLITS` | 5 | Final CV folds |
 | `RANDOM_STATE` | 42 | Seed mọi random op |
 | `OOT_INIT_MONTHS` | 2 | Floor cho OOT |
