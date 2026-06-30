@@ -421,6 +421,11 @@ class AutoMLPipeline:
         check_distribution: bool = True,
         domain: str = "generic",
         model_type: str = "binary_classification",
+        product_type: str = "generic",
+        calibration: bool = None,
+        temporal_freq: str = None,
+        week_closing_day: str = None,
+        create_interactions: bool = None,
     ):
         """Execute the full three-agent pipeline.
 
@@ -438,6 +443,21 @@ class AutoMLPipeline:
                                 (e.g. re-runs with the same input data).
             domain:             Feature engineering domain (credit_risk | propensity | fraud | generic).
             model_type:         ML problem type (binary_classification | regression | multiclass).
+            product_type:       Lending-product line for Agent 2's product-specific guidance
+                                (consumer_unsecured | credit_card | mortgage | auto | overdraft
+                                 | bnpl | sme | generic).
+            calibration:        Per-run override for probability calibration (Agent 3).
+                                None (default) → use Config.CALIBRATION_ENABLED;
+                                True/False → force on/off for this run only, no env change.
+            temporal_freq:      Per-run override for the temporal-split granularity (Agent 3).
+                                None (default) → use Config.TEMPORAL_FREQ ("auto" = monthly);
+                                "weekly" → OOT / valid_temporal / stability move in whole
+                                weeks. Weekly is opt-in only (never auto-inferred).
+            week_closing_day:   Snapshot/cutoff weekday for weekly runs (MON..SUN). None →
+                                auto-detect the most common weekday in the date column.
+            create_interactions: Per-run override for Agent 2's interaction-feature step.
+                                None (default) → use Config.FE_CREATE_INTERACTIONS_ENABLED;
+                                False → skip all create_interaction actions this run.
         """
         split_mode = (valid_path is not None) or (oot_path is not None)
         if split_mode:
@@ -449,7 +469,7 @@ class AutoMLPipeline:
             mode_label = "single-file (auto-split in Agent 3)"
         self.logger.log("PIPELINE", "Starting",
             f"Input: {input_path} | Target: {target_column} | Domain: {domain} | "
-            f"Model: {model_type} | Mode: {mode_label}")
+            f"Product: {product_type} | Model: {model_type} | Mode: {mode_label}")
 
         try:
             if split_mode:
@@ -461,14 +481,20 @@ class AutoMLPipeline:
                     entity_id_col=entity_id_col, composite_key_cols=composite_key_cols,
                     train_sample_ratio=train_sample_ratio, prefilter=prefilter,
                     check_distribution=check_distribution,
-                    domain=domain, model_type=model_type,
+                    domain=domain, model_type=model_type, product_type=product_type,
+                    calibration=calibration,
+                    temporal_freq=temporal_freq, week_closing_day=week_closing_day,
+                    create_interactions=create_interactions,
                 )
             return self._run_single_mode(
                 input_path=input_path, target_column=target_column,
                 col_descriptions_path=col_descriptions_path,
                 col_descriptions_kwargs=col_descriptions_kwargs,
                 entity_id_col=entity_id_col, composite_key_cols=composite_key_cols,
-                domain=domain, model_type=model_type,
+                domain=domain, model_type=model_type, product_type=product_type,
+                calibration=calibration,
+                temporal_freq=temporal_freq, week_closing_day=week_closing_day,
+                create_interactions=create_interactions,
             )
         finally:
             # Remove the intermediate tempdir even when the pipeline raises —
@@ -493,6 +519,11 @@ class AutoMLPipeline:
         check_distribution: bool,
         domain: str,
         model_type: str,
+        product_type: str = "generic",
+        calibration: bool = None,
+        temporal_freq: str = None,
+        week_closing_day: str = None,
+        create_interactions: bool = None,
     ):
         # ── Stage 0a: schema validation (fail-fast before any agent runs) ─
         self.logger.log("PIPELINE", "Stage 0a", "Validating schema across train / valid / oot")
@@ -546,6 +577,7 @@ class AutoMLPipeline:
             col_descriptions_path=col_descriptions_path,
             domain=domain,
             model_type=model_type,
+            product_type=product_type,
             **(col_descriptions_kwargs or {}),
         )
         # Capture the loaded descriptions before agent2 is released so Agent 3
@@ -557,6 +589,7 @@ class AutoMLPipeline:
             target_column=target_column,
             valid_path=clean_paths.get("valid"),
             oot_path=clean_paths.get("oot"),
+            create_interactions=create_interactions,
         )
         del agent2
 
@@ -573,6 +606,9 @@ class AutoMLPipeline:
             target_column=target_column,
             valid_path=eng_paths.get("valid"),
             oot_path=eng_paths.get("oot"),
+            calibration=calibration,
+            temporal_freq=temporal_freq,
+            week_closing_day=week_closing_day,
         )
 
         self._generate_final_report(report1, report2, report3, final_metrics)
@@ -592,6 +628,11 @@ class AutoMLPipeline:
         composite_key_cols: list,
         domain: str,
         model_type: str,
+        product_type: str = "generic",
+        calibration: bool = None,
+        temporal_freq: str = None,
+        week_closing_day: str = None,
+        create_interactions: bool = None,
     ):
         self.logger.log("PIPELINE", "Stage 1", "Initializing Data Cleaner Agent (single-file mode)")
         agent1 = DataCleanerAgent(
@@ -610,6 +651,7 @@ class AutoMLPipeline:
             col_descriptions_path=col_descriptions_path,
             domain=domain,
             model_type=model_type,
+            product_type=product_type,
             **(col_descriptions_kwargs or {}),
         )
         col_descriptions_loaded = dict(agent2._col_descriptions) if agent2._col_descriptions else {}
@@ -617,6 +659,7 @@ class AutoMLPipeline:
             self.handoff.get_data(),
             self.handoff.get_report(),
             target_column,
+            create_interactions=create_interactions,
         )
         self.handoff.set_data(engineered_data_path, report2, "FeatureEngineer")
         del agent2
@@ -632,6 +675,9 @@ class AutoMLPipeline:
             self.handoff.get_report(),
             target_column,
             oot_df=None,
+            calibration=calibration,
+            temporal_freq=temporal_freq,
+            week_closing_day=week_closing_day,
         )
 
         self._generate_final_report(report1, report2, report3, final_metrics)
@@ -648,6 +694,8 @@ class AutoMLPipeline:
         markdown += f"- Strategy: {report2.get('summary', 'N/A')}\n\n"
         markdown += "## Agent 3: Model Trainer\n"
         markdown += f"- Final Metrics: {metrics}\n\n"
+        markdown += self._render_temporal_section(report3)
+        markdown += self._render_charts_section(report3)
         markdown += self._render_shap_section(report3)
         markdown += self._render_token_section()
 
@@ -655,6 +703,38 @@ class AutoMLPipeline:
             f.write(markdown)
 
         print(f"Final Report saved to: {Config.FINAL_REPORT_PATH}")
+
+    def _render_temporal_section(self, report3: Dict) -> str:
+        """State the temporal cadence so the report is explicit that a snapshot
+        dataset produces a MONTHLY/WEEKLY model (OOT / valid_temporal / stability
+        all move in whole-period steps). Skipped for non-temporal runs."""
+        t = (report3 or {}).get("temporal", {}) or {}
+        cadence = t.get("cadence", "non_temporal")
+        if cadence == "non_temporal":
+            return ""
+        unit = t.get("period_unit", "month")
+        labels = {
+            "monthly_snapshot": "Monthly snapshot — model operates at MONTHLY granularity",
+            "intra_month":      "Intra-month feed — bucketed to whole months",
+            "weekly_snapshot":  "Weekly snapshot — model operates at WEEKLY granularity",
+            "weekly":           "Weekly feed — bucketed to whole weeks",
+        }
+        out: List[str] = [
+            "## Temporal cadence\n\n",
+            f"- **Cadence**: {labels.get(cadence, cadence)}"
+            + (f" (period freq `{t['period_freq']}`)" if t.get("period_freq") else "") + "\n",
+            f"- **History**: {t.get('n_periods_total', '?')} {unit}s "
+            f"[{t.get('first_period', '?')} .. {t.get('last_period', '?')}] "
+            f"({t.get('n_distinct_dates', '?')} distinct dates in `{t.get('date_col', 'date')}`)\n",
+        ]
+        if "oot_periods" in t:
+            out.append(
+                f"- **Split (whole {unit}s)**: train={t.get('train_periods', '?')} | "
+                f"valid_temporal={t.get('valid_temporal_periods', '?')} | "
+                f"oot={t.get('oot_periods', '?')}\n"
+            )
+        out.append("\n")
+        return "".join(out)
 
     def _render_token_section(self) -> str:
         """LLM token attribution per-model + grand total. Helps users compare
@@ -679,6 +759,39 @@ class AutoMLPipeline:
             "*Multiply by your provider's per-token price to get $ cost. "
             "Token counts cover every LLM call in this run (Agent 1+2+3 decisions, "
             "SHAP explain, overfit reg suggest).*\n\n"
+        )
+        return "".join(out)
+
+    def _render_charts_section(self, report3: Dict) -> str:
+        """Embed the 9 model diagnostic charts (Agent 3) into the final report.
+
+        Charts live in `{run_dir}/charts/` so each image is referenced with a
+        `charts/<name>.png` relative path — renders correctly when the run dir
+        is zipped or served statically. Only charts that were actually saved
+        (file exists on disk) are embedded; the rest are silently skipped so a
+        partially-failed chart step doesn't leave broken image links.
+        """
+        from pathlib import Path as _P
+        rendered = []
+        for path, label in Config.chart_files():
+            p = _P(path)
+            if not p.exists():
+                continue
+            # Strip the "— Agent 3" suffix for the in-report caption
+            caption = label.split("—")[0].strip()
+            rel = f"{p.parent.name}/{p.name}"
+            rendered.append((caption, rel))
+
+        if not rendered:
+            return ""
+
+        out: List[str] = ["## Model diagnostic charts\n\n"]
+        for caption, rel in rendered:
+            out.append(f"**{caption}**\n\n")
+            out.append(f"![{caption}]({rel})\n\n")
+        out.append(
+            "_Charts computed on the best available eval split (OOT > valid > test) "
+            "using the calibrated ensemble — reflect deployed scoring behaviour._\n\n"
         )
         return "".join(out)
 

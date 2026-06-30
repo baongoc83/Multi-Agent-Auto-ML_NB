@@ -142,6 +142,14 @@ Examples:
         help="ML problem type passed to Agent 2 prompt (default: binary_classification). "
              "Options: binary_classification | regression | multiclass",
     )
+    parser.add_argument(
+        "--product-type", metavar="PRODUCT", dest="product_type", default="generic",
+        choices=["consumer_unsecured", "credit_card", "mortgage", "auto",
+                 "overdraft", "bnpl", "sme", "generic"],
+        help="Lending-product context for Agent 2's product-specific guidance "
+             "(default: generic). Options: consumer_unsecured | credit_card | "
+             "mortgage | auto | overdraft | bnpl | sme | generic",
+    )
     return parser.parse_args()
 
 
@@ -187,6 +195,8 @@ def _print_files() -> None:
         (Config.SHAP_BEESWARM_PATH,              "SHAP final beeswarm plot    — Agent 3"),
         (Config.SHAP_FEATURE_REPORT_PATH,        "SHAP top features CSV       — Agent 3"),
         (Config.SHAP_FINAL_MODEL_REPORT_PATH,    "SHAP combined markdown rpt  — Agent 3"),
+        # Model diagnostic charts (9 PNGs in charts/)
+        *Config.chart_files(),
         (Config.FINAL_REPORT_PATH,               "Full pipeline report"),
         (Config.EXECUTION_LOG_PATH,              "Agent execution log"),
         # Model deliverables
@@ -259,6 +269,7 @@ def main() -> None:
                   f"desc_field={args.col_desc_field} | "
                   f"group_field={args.col_group_field}")
     print(f"Domain       : {args.domain}")
+    print(f"Product type : {args.product_type}")
     print(f"Model type   : {args.model_type}")
     print()
 
@@ -285,6 +296,7 @@ def main() -> None:
             check_distribution=args.check_distribution,
             domain=args.domain,
             model_type=args.model_type,
+            product_type=args.product_type,
         )
 
         print("\n" + "=" * 65)

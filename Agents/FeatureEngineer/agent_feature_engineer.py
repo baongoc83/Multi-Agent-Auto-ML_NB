@@ -12,6 +12,18 @@ from logger import AgentLogger
 from config import Config
 
 
+# Whitelisted builtins for interaction-expression eval. An empty __builtins__
+# strips EVERYTHING, so common type casts (e.g. `.astype(int)`, missing-flags
+# like `EXT_SOURCE_1.isna().astype(int)`) raise "name 'int' is not defined".
+# We expose only value-level constructors / numeric helpers — no __import__,
+# open, eval, exec, getattr, etc. — so the sandbox stays as tight as before
+# (attribute-chain gadgets were already reachable via df/np regardless).
+_SAFE_EVAL_BUILTINS: Dict[str, Any] = {
+    "int": int, "float": float, "bool": bool, "str": str, "object": object,
+    "abs": abs, "min": min, "max": max, "round": round, "len": len,
+}
+
+
 @dataclass
 class FeatureSpec:
     """Captured transforms from TRAIN, replayed on VALID/OOT.
@@ -24,12 +36,20 @@ class FeatureSpec:
     - onehot_columns: per-col list of dummy column names produced on train,
       used to reindex valid/oot dummies (extra cols dropped, missing cols
       back-filled with 0).
+    - woe_maps: per-column WoE replacement table captured at fit. Each entry
+      has {edges, woe}: edges has n+1 floats fed to np.searchsorted[1:-1],
+      woe has n+1 floats where woe[k] is the replacement for bin k and
+      woe[-1] is the dedicated NaN-bin WoE. Applied IN PLACE — the original
+      raw values are replaced by the log-odds WoE values. This is the
+      scorecard-standard transformation: linearises feature ↔ target and
+      smooths out non-linearity for downstream linear baselines.
     - selected_features: final column subset chosen by select_top_features
       (target appended automatically at apply time).
     """
     interactions:      List[Tuple[str, str, float]] = field(default_factory=list)
     label_encoders:    Dict[str, Any]               = field(default_factory=dict)
     onehot_columns:    Dict[str, List[str]]         = field(default_factory=dict)
+    woe_maps:          Dict[str, Dict[str, Any]]    = field(default_factory=dict)
     selected_features: Optional[List[str]]          = None
     target_column:     Optional[str]                = None
 
@@ -40,7 +60,7 @@ class FeatureSpec:
         for new_col, expression, fill_value in self.interactions:
             safe_locals = {"df": df, "np": np}
             try:
-                df[new_col] = eval(expression, {"__builtins__": {}}, safe_locals)  # noqa: S307
+                df[new_col] = eval(expression, {"__builtins__": _SAFE_EVAL_BUILTINS}, safe_locals)  # noqa: S307
                 df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
                 df[new_col] = df[new_col].fillna(fill_value)
             except Exception as e:
@@ -68,7 +88,29 @@ class FeatureSpec:
             dummies = dummies.reindex(columns=dummy_cols, fill_value=0)
             df = pd.concat([df.drop(columns=[col]), dummies], axis=1)
 
-        # 4. Column selection — keep only the train-chosen features (+ target)
+        # 4. WoE replacement — replace each value with its bin's log-odds.
+        # Train-derived bin edges + WoE table; NaN routes to the dedicated NaN
+        # bin (last index). Values outside train's [min, max] range fold into
+        # the boundary bin — safe because searchsorted clips at the ends.
+        for col, m in self.woe_maps.items():
+            if col not in df.columns:
+                continue
+            edges = np.asarray(m["edges"], dtype=np.float64)
+            woe   = np.asarray(m["woe"],   dtype=np.float64)
+            if len(woe) == 0 or len(edges) < 2:
+                continue
+            nan_bin_idx = len(woe) - 1
+            x = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            nan_mask = np.isnan(x)
+            # Inner edges only; NaN routes to the reserved last bin
+            bin_idx = np.searchsorted(edges[1:-1], x, side="right").astype(np.int64)
+            bin_idx = np.where(nan_mask, nan_bin_idx, bin_idx)
+            # Defensive clip — searchsorted already keeps in range but
+            # protects against malformed specs after manual edits
+            bin_idx = np.clip(bin_idx, 0, nan_bin_idx)
+            df[col] = woe[bin_idx]
+
+        # 5. Column selection — keep only the train-chosen features (+ target)
         if self.selected_features is not None:
             keep = [c for c in self.selected_features if c in df.columns]
             if self.target_column and self.target_column in df.columns and self.target_column not in keep:
@@ -81,6 +123,13 @@ class FeatureSpec:
             "interactions": [[n, e, f] for (n, e, f) in self.interactions],
             "label_encoders": sorted(self.label_encoders.keys()),
             "onehot_columns": {c: list(v) for c, v in self.onehot_columns.items()},
+            "woe_maps": {
+                c: {"n_bins": len(m["woe"]) - 1,
+                    "iv":     round(float(m.get("iv", 0.0)), 4),
+                    "edges_min": float(min(e for e in m["edges"] if np.isfinite(e))) if any(np.isfinite(e) for e in m["edges"]) else None,
+                    "edges_max": float(max(e for e in m["edges"] if np.isfinite(e))) if any(np.isfinite(e) for e in m["edges"]) else None}
+                for c, m in self.woe_maps.items()
+            },
             "selected_features": self.selected_features,
             "target_column": self.target_column,
         }
@@ -127,6 +176,87 @@ Apply standard feature engineering: ratio features between semantically related 
 frequency encoding for high-cardinality categoricals, interaction terms between correlated predictors.""",
     }
 
+    # Product-line guidance — orthogonal to DOMAIN. The DOMAIN dict tells the
+    # LLM *what the target means* (default / propensity / fraud); this dict
+    # tells it *which behavioural family to emphasise* given the lending
+    # product. Used to allocate 40-50% of the feature budget per the prompt.
+    _PRODUCT_GUIDANCE: Dict[str, str] = {
+        "consumer_unsecured": """\
+► CONSUMER_UNSECURED  (vay tiêu dùng tín chấp)
+  Primary drivers — income stability, bureau distress, application channel.
+  Must-have feature families:
+    - DTI variants: debt / income, annuity / income, total_dpd / income
+    - Bureau enquiry recency: days_since_last_enquiry, count_enquiries_3m
+    - Employment stability: days_employed / days_birth (career-stage ratio)
+    - External bureau scores: ext_source_1 * ext_source_2, mean across
+      ext_source_1..3, missing-flag per ext_source
+    - Income vs peer (median by occupation_type / region)""",
+
+        "credit_card": """\
+► CREDIT_CARD  (thẻ tín dụng)
+  Primary drivers — utilisation, payment behaviour, cycle stress.
+  Must-have feature families:
+    - Current utilisation: amt_balance / (amt_credit_limit + 1)
+    - Peak utilisation: max across last N monthly utilisation columns
+    - Min-payment ratio: amt_payment_current / (amt_inst_min_regularity + 1)
+      (paying only the minimum repeatedly = stress signal)
+    - Cash-advance share: amt_drawings_atm / (amt_drawings_total + 1)
+    - Utilisation volatility: std of monthly utilisation
+    - Delta utilisation (current - 3m mean) — sudden spend spikes
+    - Months-on-book × utilisation interaction""",
+
+        "mortgage": """\
+► MORTGAGE / AUTO  (secured loans)
+  Primary drivers — LTV, LTI, collateral stability, term burden.
+  Must-have feature families:
+    - LTV: amt_credit / (amt_goods_price + 1)
+    - LTI: amt_credit / (amt_income_total + 1)
+    - Down-payment ratio: 1 - LTV
+    - Term burden: amt_annuity * cnt_payment / (amt_income_total + 1)
+    - For auto: own_car_age × amt_credit (depreciation-adjusted exposure)""",
+
+        "auto": """\
+► AUTO  (secured by vehicle)
+  Primary drivers — LTV on depreciating collateral, term burden, owner age.
+  Must-have feature families:
+    - LTV: amt_credit / (amt_goods_price + 1)
+    - Depreciation-adjusted exposure: own_car_age * amt_credit
+    - Term burden: amt_annuity * cnt_payment / (amt_income_total + 1)
+    - Owner age × car age interaction""",
+
+        "overdraft": """\
+► OVERDRAFT / BNPL  (revolving short-term)
+  Primary drivers — transactional velocity, balance volatility, repayment cadence.
+  Must-have feature families:
+    - Days_negative / (days_active + 1) ratio
+    - Average overdraft depth: mean negative balance
+    - Repayment cadence: median days between drawdown and repayment
+    - Tenure-adjusted exposure: amt_credit / (months_on_book + 1)""",
+
+        "bnpl": """\
+► BNPL  (Buy Now Pay Later)
+  Primary drivers — transactional velocity, basket size, repayment cadence.
+  Must-have feature families:
+    - Average basket size + std
+    - Days between transactions (velocity)
+    - Repayment cadence vs schedule
+    - Tenure-adjusted exposure""",
+
+        "sme": """\
+► SME  (small / medium enterprise lending)
+  Primary drivers — turnover stability, sector risk, owner credit history.
+  Must-have feature families:
+    - Revenue CAGR / volatility (std / mean of monthly turnover)
+    - Account turnover / declared revenue (sanity-check ratio)
+    - Cross-link owner application features (DTI, bureau) to entity
+    - Sector benchmark deviation""",
+
+        "generic": """\
+► GENERIC  (no product-specific guidance)
+  Apply universal Family A–H interactions guided by COLUMN DESCRIPTIONS.
+  Same-group ratios + cross-group ratios should fill 40-50% of the budget.""",
+    }
+
     def __init__(
         self,
         logger: AgentLogger,
@@ -136,6 +266,7 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         col_group_field: Optional[str] = None,
         domain: str = "generic",
         model_type: str = "binary_classification",
+        product_type: str = "generic",
     ):
         super().__init__(name="FeatureEngineer", role="Feature Architect", logger=logger)
         self.df: pd.DataFrame = None
@@ -144,6 +275,10 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         self._date_col: Optional[str] = None
         self.domain = domain.lower()
         self.model_type = model_type.lower()
+        self.product_type = product_type.lower()
+        # Master switch for the create_interaction step (Config default; can be
+        # overridden per-run via process(..., create_interactions=...)).
+        self.create_interactions_enabled: bool = Config.FE_CREATE_INTERACTIONS_ENABLED
         self._col_descriptions: Dict[str, str] = self._load_col_descriptions(
             col_descriptions_path, col_name_field, col_desc_field, col_group_field
         )
@@ -155,8 +290,31 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         self._last_interaction_fill: float = 0.0
         self._batch_label_encoders: Dict[str, Any] = {}
         self._batch_onehot_cols: Dict[str, List[str]] = {}
+        # IV cache — populated by compute_iv tool, read by select_top_features
+        # when criterion='iv'. Empty dict means "IV not computed yet" so the
+        # selector falls back to f_classif / f_regression.
+        self._last_iv_scores: Dict[str, float] = {}
+        self._last_woe_maps: Dict[str, Dict[int, float]] = {}
+        # Full WoE payload {col: {edges, woe, iv}} populated by compute_iv,
+        # consumed by apply_woe_transform to do the in-place WoE replacement.
+        self._last_woe_data: Dict[str, Dict[str, Any]] = {}
+        # WoE transforms actually applied (subset of _last_woe_data, after
+        # min_iv filtering). Copied into FeatureSpec by _execute_llm_decisions
+        # so valid/oot replay uses the same bin edges + WoE values.
+        self._last_applied_woe: Dict[str, Dict[str, Any]] = {}
         self.tool_registry = ToolRegistry()
         self._register_tools()
+
+    def _apply_create_interactions_override(self, create_interactions: Optional[bool]) -> None:
+        """Resolve the interaction-step switch: None keeps the Config default,
+        an explicit bool overrides it for this run and logs the decision."""
+        if create_interactions is not None:
+            self.create_interactions_enabled = bool(create_interactions)
+            self.logger.log(self.name, "Interaction step override",
+                f"create_interactions={self.create_interactions_enabled} (per-run, overrides Config)")
+        if not self.create_interactions_enabled:
+            self.logger.log(self.name, "Interaction step",
+                "DISABLED — create_interaction actions will be skipped this run")
 
     def _get_domain_guidance(self) -> str:
         if self.domain not in self._DOMAIN_GUIDANCE:
@@ -165,6 +323,13 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
                 f"Valid options: {list(self._DOMAIN_GUIDANCE.keys())}")
         template = self._DOMAIN_GUIDANCE.get(self.domain, self._DOMAIN_GUIDANCE["generic"])
         return template.format(model_type=self.model_type)
+
+    def _get_product_guidance(self) -> str:
+        if self.product_type not in self._PRODUCT_GUIDANCE:
+            self.logger.log(self.name, "WARN",
+                f"Unknown product_type '{self.product_type}' — using generic guidance. "
+                f"Valid options: {list(self._PRODUCT_GUIDANCE.keys())}")
+        return self._PRODUCT_GUIDANCE.get(self.product_type, self._PRODUCT_GUIDANCE["generic"])
 
     def _load_col_descriptions(
         self,
@@ -332,20 +497,52 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             {"df": "The dataframe", "target": "Target column name"},
         )
         self.tool_registry.register(
+            "compute_iv",
+            "Computes Information Value (IV) per feature against a binary target — "
+            "credit-risk gold standard. Captures non-linear signal via WoE binning. "
+            "Run BEFORE apply_woe_transform and select_top_features when using "
+            "criterion='iv'. Also caches per-feature WoE tables so the optional "
+            "apply_woe_transform step can replay them.",
+            {
+                "df": "The dataframe",
+                "target": "Target column name (must be binary)",
+                "bins": "Number of quantile bins for numeric features (default 10)",
+                "method": "Binning method: 'quantile' (default) or 'uniform'",
+            },
+        )
+        self.tool_registry.register(
+            "apply_woe_transform",
+            f"Replaces each value with its bin's WoE (log-odds). Banking scorecard "
+            f"standard — linearises feature/target relationship and smooths "
+            f"non-linearity; typically +1-3% AUC on credit data. Requires "
+            f"compute_iv to have run first. Only transforms features with "
+            f"IV >= min_iv (default {Config.WOE_MIN_IV}); low-IV features keep "
+            f"raw values so GBM can still split on them.",
+            {
+                "df": "The dataframe",
+                "min_iv": "Skip WoE transform for features with IV below this "
+                          f"(default {Config.WOE_MIN_IV} = Siddiqi useless/weak boundary)",
+            },
+        )
+        self.tool_registry.register(
             "select_top_features",
-            "Keeps only the k most predictive features",
+            f"Keeps only the k most predictive features. With criterion='iv', uses "
+            f"IV scores from compute_iv and greedily prunes multicollinear pairs "
+            f"(|corr| > {Config.MULTICOLLINEARITY_THRESHOLD} drops the lower-IV partner, "
+            f"keeps the higher-IV one).",
             {
                 "df": "The dataframe",
                 "target": "Target column name",
                 "k": "Number of top features to keep",
+                "criterion": "'iv' (uses compute_iv cache) or 'default' (f_classif / f_regression)",
             },
         )
 
     def _tool_create_interaction(self, df: pd.DataFrame, new_col: str, expression: str) -> pd.DataFrame:
-        # Restrict eval to df and np only — no builtins — to prevent code injection
+        # Restrict eval to df/np + a safe builtins whitelist to prevent code injection
         safe_locals = {"df": df, "np": np}
         try:
-            df[new_col] = eval(expression, {"__builtins__": {}}, safe_locals)  # noqa: S307
+            df[new_col] = eval(expression, {"__builtins__": _SAFE_EVAL_BUILTINS}, safe_locals)  # noqa: S307
             df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
             train_median = df[new_col].median()
             # Median can still be NaN if every value is NaN/inf — use 0.0 as a safe sentinel
@@ -462,11 +659,297 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         }
         return json.dumps(result, indent=2)
 
-    def _tool_select_top_features(self, df: pd.DataFrame, target: str, k: int) -> pd.DataFrame:
+    @staticmethod
+    def _compute_iv_single(
+        x: np.ndarray,
+        y: np.ndarray,
+        bins: int,
+        method: str,
+    ) -> Tuple[float, np.ndarray, np.ndarray]:
+        """Vectorised IV + per-bin WoE for one numeric column.
+
+        Returns (iv, woe_array, edges_array) where:
+          - woe_array: length = n_value_bins + 1; last index is the NaN bin.
+            woe_array[bin_idx] gives the WoE replacement value.
+          - edges_array: length = n_value_bins + 1; passed to np.searchsorted
+            on its INNER slice [1:-1] to map values → bin indices [0..n_value_bins-1].
+            Stored so valid/oot replay can bin identically without re-quantizing.
+
+        Pure numpy hot path — avoids the per-column pandas overhead that
+        dominates IV compute at 1.5M × 5k scale (qcut + crosstab is ~10x slower
+        than searchsorted + bincount).
+
+        Low-nunique branch (≤ `bins` unique values): treats each unique value as
+        its own bin. This catches label-encoded categoricals (CODE_GENDER,
+        FLAG_*, etc.) — quantile binning collapses them to 1 bin and loses signal.
+
+        NaN values always get the dedicated last bin so missing-pattern signal
+        (FAMILY F: ext_source_1 missingness etc.) contributes to IV the same way
+        a real bin would. Laplace smoothing (eps=0.5) protects against log(0).
+        """
+        nan_mask = np.isnan(x)
+        x_valid = x[~nan_mask]
+
+        if len(x_valid) < 2:
+            return 0.0, np.array([]), np.array([])
+
+        unique_vals = np.unique(x_valid)
+        n_unique = len(unique_vals)
+        # < 2 unique → no signal regardless of method
+        if n_unique < 2:
+            return 0.0, np.array([]), np.array([])
+
+        # ── Edges selection ────────────────────────────────────────────────
+        # Low-cardinality branch: each unique value becomes its own bin.
+        # Edges = [-inf, midpoint_1, ..., midpoint_{n-1}, +inf] so searchsorted
+        # routes each value to a stable bin index. Critical for encoded
+        # categoricals after label encoding.
+        if n_unique <= bins:
+            sorted_unique = np.sort(unique_vals)
+            midpoints = (sorted_unique[:-1] + sorted_unique[1:]) / 2.0
+            edges = np.concatenate([[-np.inf], midpoints, [np.inf]])
+        elif method == "quantile":
+            edges = np.unique(np.quantile(x_valid, np.linspace(0, 1, bins + 1)))
+        else:  # uniform
+            edges = np.linspace(x_valid.min(), x_valid.max(), bins + 1)
+
+        if len(edges) < 2:
+            return 0.0, np.array([]), np.array([])
+
+        # ── Bin assignment ────────────────────────────────────────────────
+        # Inner edges only — searchsorted maps non-NaN values to [0, n_value_bins-1].
+        # NaN values get the dedicated last bin index = n_value_bins.
+        n_value_bins = len(edges) - 1
+        nan_bin_idx = n_value_bins
+        total_bins = n_value_bins + 1  # value bins + NaN bin (always reserved)
+        bin_idx = np.searchsorted(edges[1:-1], x, side="right").astype(np.int64)
+        bin_idx = np.where(nan_mask, nan_bin_idx, bin_idx)
+
+        # ── Cross-tab via bincount ────────────────────────────────────────
+        pos = np.bincount(bin_idx, weights=y.astype(np.float64), minlength=total_bins)
+        total = np.bincount(bin_idx, minlength=total_bins).astype(np.float64)
+        neg = total - pos
+
+        total_pos = pos.sum()
+        total_neg = neg.sum()
+        if total_pos == 0 or total_neg == 0:
+            return 0.0, np.array([]), np.array([])
+
+        # ── Laplace-smoothed WoE ─────────────────────────────────────────
+        # eps=0.5 per bin protects log(0) when a bin is pure-class.
+        eps = 0.5
+        p_pos = (pos + eps) / (total_pos + eps * total_bins)
+        p_neg = (neg + eps) / (total_neg + eps * total_bins)
+        woe = np.log(p_neg / p_pos)
+        iv = float(np.sum((p_neg - p_pos) * woe))
+        return iv, woe, edges
+
+    def _tool_compute_iv(
+        self,
+        df: pd.DataFrame,
+        target: str,
+        bins: int = None,
+        method: str = "quantile",
+    ) -> str:
+        """Information Value per feature (binary target only).
+
+        Populates `self._last_iv_scores` so `select_top_features` with
+        criterion='iv' can read them without recomputing. Returns a JSON
+        summary with Siddiqi IV bands, top-20 features, and leakage suspects
+        (IV >= IV_LEAKAGE_THRESHOLD).
+
+        Designed for wide data (1.5M × 15k): column-by-column iteration,
+        pre-filters constant / heavily-null columns, gc.collect() every 1000
+        cols. Total cost ~10-15 min at that scale. Categorical columns are
+        skipped (encode_all_categorical must run first per the prompt).
+        """
+        if target not in df.columns:
+            raise ValueError(f"Target column '{target}' not found")
+
+        if bins is None:
+            bins = Config.IV_BINS_DEFAULT
+
+        y = pd.to_numeric(df[target], errors="coerce")
+        valid_mask = y.notna()
+        y_valid = y[valid_mask].astype(np.int64).values
+        n_unique = pd.Series(y_valid).nunique()
+        if n_unique != 2:
+            raise ValueError(
+                f"IV requires a BINARY target — got {n_unique} unique values. "
+                "Use correlation_analysis / select_top_features (default criterion) for regression."
+            )
+
+        # Iterate dtypes by metadata only — slicing df[feature_cols] would
+        # trigger block consolidation and OOM on wide TRAIN data (the same
+        # trap select_top_features avoids).
+        dtypes = df.dtypes
+        feature_cols = [
+            c for c in df.columns
+            if c != target
+            and c not in self._protected_cols
+            and pd.api.types.is_numeric_dtype(dtypes[c])
+        ]
+        if not feature_cols:
+            self._last_iv_scores = {}
+            return json.dumps({"warning": "no numeric features to score"}, indent=2)
+
+        score_idx = df.index[valid_mask]
+
+        iv_scores: Dict[str, float] = {}
+        # Full WoE structures keyed by column. Stored as plain lists/floats so
+        # they are JSON / pickle friendly when persisted into FeatureSpec.
+        #   edges:  inner+outer edges (n+1 floats) — fed to np.searchsorted[1:-1]
+        #   woe:    n+1 floats (last = NaN bin WoE)
+        #   iv:     diagnostic for debugging / leakage audit
+        woe_data: Dict[str, Dict[str, Any]] = {}
+        skipped_null = skipped_const = computed = 0
+
+        import gc as _gc
+        for i, col in enumerate(feature_cols):
+            s = df[col]
+            # Cheap pre-filters first — avoid quantile on dead columns
+            if s.isnull().mean() > Config.IV_MAX_NULL_RATIO:
+                iv_scores[col] = 0.0
+                skipped_null += 1
+                continue
+            x = s.loc[score_idx].to_numpy(dtype=np.float64, copy=False)
+            if np.isnan(x).all() or np.nanstd(x) == 0:
+                iv_scores[col] = 0.0
+                skipped_const += 1
+                continue
+            try:
+                iv, woe_arr, edges_arr = self._compute_iv_single(
+                    x, y_valid, bins=bins, method=method
+                )
+                iv_scores[col] = iv
+                if iv > 0 and len(woe_arr) > 0:
+                    woe_data[col] = {
+                        "edges": edges_arr.tolist(),
+                        "woe":   woe_arr.tolist(),
+                        "iv":    iv,
+                    }
+                computed += 1
+            except Exception:
+                iv_scores[col] = 0.0
+            # Periodic GC + progress log — keeps peak RSS bounded on 15k-col runs
+            if (i + 1) % 1000 == 0:
+                _gc.collect()
+                self.logger.log(self.name, "compute_iv progress",
+                    f"{i + 1}/{len(feature_cols)} cols scored")
+
+        self._last_iv_scores = iv_scores
+        # Stored as full edges+woe payload (used by apply_woe_transform). Backwards-
+        # compat shim: _last_woe_maps mirrors just the per-bin woe values so any
+        # old caller that only looked up WoE per bin still works.
+        self._last_woe_data = woe_data
+        self._last_woe_maps = {c: {i: w for i, w in enumerate(d["woe"])}
+                               for c, d in woe_data.items()}
+
+        sorted_iv = sorted(iv_scores.items(), key=lambda kv: kv[1], reverse=True)
+        leakage_threshold = Config.IV_LEAKAGE_THRESHOLD
+        bands = {
+            "useless_(<0.02)":      sum(1 for _, v in sorted_iv if v < 0.02),
+            "weak_(0.02-0.10)":     sum(1 for _, v in sorted_iv if 0.02 <= v < 0.10),
+            "medium_(0.10-0.30)":   sum(1 for _, v in sorted_iv if 0.10 <= v < 0.30),
+            "strong_(0.30-0.50)":   sum(1 for _, v in sorted_iv if 0.30 <= v < leakage_threshold),
+            f"leakage_suspect_(>={leakage_threshold})":
+                                    sum(1 for _, v in sorted_iv if v >= leakage_threshold),
+        }
+        result = {
+            "n_features_scored": computed,
+            "n_skipped_high_null": skipped_null,
+            "n_skipped_constant": skipped_const,
+            "bins": bins,
+            "method": method,
+            "iv_bands_siddiqi": bands,
+            "top_20_iv": dict(sorted_iv[:20]),
+            "leakage_suspects": [c for c, v in sorted_iv if v >= leakage_threshold],
+        }
+        self.logger.log(self.name, "compute_iv done",
+            f"scored={computed} skip_null={skipped_null} skip_const={skipped_const} "
+            f"bands={bands}")
+        return json.dumps(result, indent=2)
+
+    def _tool_apply_woe_transform(
+        self,
+        df: pd.DataFrame,
+        min_iv: float = None,
+    ) -> pd.DataFrame:
+        """Replace each value in qualifying columns with its bin's WoE.
+
+        Requires compute_iv to have run first (uses cached edges + WoE per
+        column from `self._last_woe_data`). Columns with IV < min_iv are
+        skipped (Siddiqi 'useless' band — WoE there is noise more than signal).
+
+        After this step:
+          - Feature columns are in log-odds scale (typically [-3, +3]).
+          - Feature ↔ target relationship is linearised — boosts LR baseline,
+            smooths GBM split thresholds at tail bins, +1-3% AUC on credit data.
+          - NaN is replaced by the dedicated NaN-bin WoE (missing-pattern signal
+            is preserved as a real numeric value, no separate flag needed).
+
+        Updates `self._last_applied_woe` so `_execute_llm_decisions` can copy
+        the per-column edges+WoE into FeatureSpec for valid/oot replay.
+        Idempotent if called twice — second call sees no IV cache mismatch.
+        """
+        if min_iv is None:
+            min_iv = Config.WOE_MIN_IV
+        woe_data = getattr(self, "_last_woe_data", None) or {}
+        if not woe_data:
+            raise ValueError(
+                "apply_woe_transform requires compute_iv to have run first — "
+                "no cached WoE data found. Run compute_iv before apply_woe_transform."
+            )
+
+        applied: Dict[str, Dict[str, Any]] = {}
+        skipped_low_iv = skipped_missing = transformed = 0
+        for col, m in woe_data.items():
+            if col not in df.columns:
+                skipped_missing += 1
+                continue
+            iv = float(m.get("iv", 0.0))
+            if iv < min_iv:
+                skipped_low_iv += 1
+                continue
+            edges = np.asarray(m["edges"], dtype=np.float64)
+            woe   = np.asarray(m["woe"],   dtype=np.float64)
+            if len(woe) == 0 or len(edges) < 2:
+                skipped_low_iv += 1
+                continue
+            nan_bin_idx = len(woe) - 1
+            x = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            nan_mask = np.isnan(x)
+            bin_idx = np.searchsorted(edges[1:-1], x, side="right").astype(np.int64)
+            bin_idx = np.where(nan_mask, nan_bin_idx, bin_idx)
+            bin_idx = np.clip(bin_idx, 0, nan_bin_idx)
+            df[col] = woe[bin_idx]
+            applied[col] = m  # store the same edges+woe payload for replay
+            transformed += 1
+
+        self._last_applied_woe = applied
+        self.logger.log(self.name, "apply_woe_transform",
+            f"transformed={transformed} | skipped_low_iv(<{min_iv})={skipped_low_iv} | "
+            f"skipped_missing_col={skipped_missing}")
+        return df
+
+    def _tool_select_top_features(
+        self,
+        df: pd.DataFrame,
+        target: str,
+        k: int,
+        criterion: str = "default",
+    ) -> pd.DataFrame:
         """Score features on the TRAIN frame (caller passes self.df=train) and
         keep the top-k. The retained column list is exposed via
         `_last_selected_features` so it can be captured into FeatureSpec and
         applied to valid/oot during transform.
+
+        criterion:
+          'iv'      — use Information Value cached by compute_iv. Also runs
+                      a greedy multicollinearity prune (|corr| > MULTICOLLINEARITY_THRESHOLD
+                      drops the lower-IV partner). Falls back to 'default' if
+                      no IV scores are cached (compute_iv was not called).
+          'default' — f_classif (binary) / f_regression. No multicollinearity prune.
         """
         if target not in df.columns:
             raise ValueError(f"Target column '{target}' not found")
@@ -489,31 +972,89 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             # Not enough training signal — return df unchanged
             return df
 
-        is_classification = pd.Series(y_valid).nunique() < Config.CLASSIFICATION_UNIQUE_THRESHOLD
-        score_func = f_classif if is_classification else f_regression
-
         score_idx = df.index[valid_mask]
+        use_iv = (criterion == "iv") and bool(self._last_iv_scores)
+        if criterion == "iv" and not self._last_iv_scores:
+            self.logger.log(self.name, "select_top_features WARN",
+                "criterion='iv' requested but no IV scores cached — "
+                "did compute_iv run? Falling back to f_classif / f_regression.")
 
-        scores: Dict[str, float] = {}
-        for col in numeric_features:
-            x = df.loc[score_idx, col]
-            med = x.median()
-            if pd.isna(med):
-                scores[col] = 0.0
-                continue
-            x = x.fillna(med).values
-            if x.std() == 0:
-                scores[col] = 0.0
-                continue
-            try:
-                f_stat, _ = score_func(x.reshape(-1, 1), y_valid)
-                scores[col] = float(f_stat[0]) if not np.isnan(f_stat[0]) else 0.0
-            except Exception:
-                scores[col] = 0.0
+        if use_iv:
+            # Only score features that have a cached IV (skipped cols got 0.0 from compute_iv)
+            scores: Dict[str, float] = {
+                c: self._last_iv_scores.get(c, 0.0) for c in numeric_features
+            }
+        else:
+            is_classification = pd.Series(y_valid).nunique() < Config.CLASSIFICATION_UNIQUE_THRESHOLD
+            score_func = f_classif if is_classification else f_regression
+
+            scores: Dict[str, float] = {}
+            for col in numeric_features:
+                x = df.loc[score_idx, col]
+                med = x.median()
+                if pd.isna(med):
+                    scores[col] = 0.0
+                    continue
+                x = x.fillna(med).values
+                if x.std() == 0:
+                    scores[col] = 0.0
+                    continue
+                try:
+                    f_stat, _ = score_func(x.reshape(-1, 1), y_valid)
+                    scores[col] = float(f_stat[0]) if not np.isnan(f_stat[0]) else 0.0
+                except Exception:
+                    scores[col] = 0.0
 
         eligible = [c for c, s in scores.items() if s > 0]
         k = min(k, len(eligible) if eligible else len(scores))
-        selected_numeric = sorted(scores, key=scores.__getitem__, reverse=True)[:k]
+        sorted_features = sorted(scores, key=scores.__getitem__, reverse=True)
+
+        if use_iv:
+            # Greedy multicollinearity prune — walk down the IV-sorted list,
+            # accept a candidate only if it's not strongly correlated with any
+            # already-kept feature (|corr| > MULTICOLLINEARITY_THRESHOLD).
+            # Cost is bounded at O(k * kept) pair-corrs; we extract one column
+            # at a time so we never materialise a k×n_rows matrix.
+            mc_threshold = Config.MULTICOLLINEARITY_THRESHOLD
+            kept_series: Dict[str, np.ndarray] = {}  # cache numpy arrays for kept cols
+            selected_numeric: List[str] = []
+            dropped_collinear: List[Tuple[str, str, float]] = []
+            for col in sorted_features:
+                if len(selected_numeric) >= k:
+                    break
+                if scores.get(col, 0.0) <= 0:
+                    continue
+                x_cand = df.loc[score_idx, col].to_numpy(dtype=np.float64, copy=False)
+                # Replace NaN with column mean for the corr coefficient — same as np.corrcoef
+                # treats it but vectorised so 200²=40k pair-corrs stay manageable.
+                if np.isnan(x_cand).any():
+                    m = np.nanmean(x_cand)
+                    x_cand = np.where(np.isnan(x_cand), m, x_cand)
+                drop = False
+                drop_partner: Optional[str] = None
+                drop_corr: float = 0.0
+                for kept_col, x_kept in kept_series.items():
+                    # np.corrcoef returns 2x2; we want the off-diagonal
+                    if x_cand.std() == 0 or x_kept.std() == 0:
+                        continue
+                    c = float(np.corrcoef(x_cand, x_kept)[0, 1])
+                    if not np.isnan(c) and abs(c) > mc_threshold:
+                        drop = True
+                        drop_partner = kept_col
+                        drop_corr = c
+                        break
+                if drop:
+                    dropped_collinear.append((col, drop_partner, drop_corr))
+                    continue
+                kept_series[col] = x_cand
+                selected_numeric.append(col)
+            if dropped_collinear:
+                self.logger.log(self.name, "select_top_features prune",
+                    f"Dropped {len(dropped_collinear)} multicollinear features "
+                    f"(|corr| > {mc_threshold}) — sample: "
+                    f"{dropped_collinear[:5]}")
+        else:
+            selected_numeric = sorted_features[:k]
         final_cols = selected_numeric + non_numeric_cols + [target]
         # Exposed for capture into FeatureSpec
         self._last_selected_features = list(final_cols)
@@ -560,12 +1101,18 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         train_path: str,
         previous_report: Dict[str, Any],
         target_column: str,
+        create_interactions: Optional[bool] = None,
     ) -> Tuple[pd.DataFrame, FeatureSpec, List[str], Tuple[int, int]]:
         """Load TRAIN, run LLM feature-engineering, return (engineered_train, spec, actions, original_shape).
 
         The spec captures every column transform so valid/oot can be transformed
         without re-running the LLM. Encoders are fitted on train only.
+
+        create_interactions: per-run override for the interaction step. None →
+        use Config.FE_CREATE_INTERACTIONS_ENABLED; False → skip all
+        create_interaction actions this run.
         """
+        self._apply_create_interactions_override(create_interactions)
         self.logger.log(self.name, "fit_transform start", f"Loading train from {train_path}")
         self.df = self.load_dataframe(train_path)
         self.target_column = self._resolve_target_column(self.df, target_column)
@@ -597,15 +1144,21 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         target_column: str,
         valid_path: Optional[str] = None,
         oot_path: Optional[str] = None,
+        create_interactions: Optional[bool] = None,
     ) -> Tuple[Dict[str, Optional[str]], Dict[str, Any]]:
         """Pre-split mode entry point. Fit on train, transform valid/oot one at a time.
+
+        create_interactions: per-run override for the interaction step. None →
+        use Config.FE_CREATE_INTERACTIONS_ENABLED; False → skip all
+        create_interaction actions this run.
 
         Returns ({"train": path, "valid": path|None, "oot": path|None}, report).
         """
         import gc
 
         train_df, spec, actions_taken, original_shape = self.fit_transform(
-            train_path, previous_report, target_column)
+            train_path, previous_report, target_column,
+            create_interactions=create_interactions)
 
         Path(Config.ENGINEERED_TRAIN_PATH).parent.mkdir(exist_ok=True)
         train_df.to_parquet(Config.ENGINEERED_TRAIN_PATH, compression="snappy", index=False)
@@ -663,8 +1216,15 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         df: pd.DataFrame,
         previous_report: Dict[str, Any],
         target_column: str,
+        create_interactions: Optional[bool] = None,
     ) -> Tuple[str, Dict[str, Any]]:
-        """Single-file mode. Used when no valid/oot was supplied to the pipeline."""
+        """Single-file mode. Used when no valid/oot was supplied to the pipeline.
+
+        create_interactions: per-run override for the interaction step. None →
+        use Config.FE_CREATE_INTERACTIONS_ENABLED; False → skip all
+        create_interaction actions this run.
+        """
+        self._apply_create_interactions_override(create_interactions)
         self.logger.log(self.name, "Process Start", f"Received clean data with shape {df.shape}")
 
         self.df = df.copy()
@@ -728,6 +1288,7 @@ Auto-generated by FeatureEngineerAgent  |  {ts}
 Interactions    : {len(spec.interactions)}
 Label encoders  : {len(spec.label_encoders)}
 One-hot columns : {len(spec.onehot_columns)}
+WoE transforms  : {len(spec.woe_maps)}
 Selected features : {0 if spec.selected_features is None else len(spec.selected_features)}
 
 Replay the feature engineering transforms captured during the original
@@ -747,6 +1308,14 @@ import joblib
 _SPEC_PATH = Path(__file__).parent / "{spec_filename}"
 _spec = joblib.load(_SPEC_PATH)
 
+# Safe builtins whitelist for interaction-expression eval — mirrors the source
+# repo. Empty builtins would break casts like `.astype(int)` ("name 'int' is
+# not defined"); only value-level constructors/helpers are exposed.
+_SAFE_EVAL_BUILTINS = {{
+    "int": int, "float": float, "bool": bool, "str": str, "object": object,
+    "abs": abs, "min": min, "max": max, "round": round, "len": len,
+}}
+
 
 def apply(df: pd.DataFrame) -> pd.DataFrame:
     """Replay every captured transform in fit-time order.
@@ -757,7 +1326,7 @@ def apply(df: pd.DataFrame) -> pd.DataFrame:
     for new_col, expression, fill_value in _spec.interactions:
         safe_locals = {{"df": df, "np": np}}
         try:
-            df[new_col] = eval(expression, {{"__builtins__": {{}}}}, safe_locals)  # noqa: S307
+            df[new_col] = eval(expression, {{"__builtins__": _SAFE_EVAL_BUILTINS}}, safe_locals)  # noqa: S307
             df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
             df[new_col] = df[new_col].fillna(fill_value)
         except Exception as e:
@@ -782,7 +1351,25 @@ def apply(df: pd.DataFrame) -> pd.DataFrame:
         dummies = dummies.reindex(columns=dummy_cols, fill_value=0)
         df = pd.concat([df.drop(columns=[col]), dummies], axis=1)
 
-    # 4. Column selection — keep only train-chosen features (+ target)
+    # 4. WoE replacement — log-odds substitution per train-derived bin.
+    # NaN routes to the dedicated last bin; out-of-range values fold into
+    # the boundary bin (searchsorted clips on the ends).
+    for col, m in _spec.woe_maps.items():
+        if col not in df.columns:
+            continue
+        edges = np.asarray(m["edges"], dtype=np.float64)
+        woe   = np.asarray(m["woe"],   dtype=np.float64)
+        if len(woe) == 0 or len(edges) < 2:
+            continue
+        nan_bin_idx = len(woe) - 1
+        x = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        nan_mask = np.isnan(x)
+        bin_idx = np.searchsorted(edges[1:-1], x, side="right").astype(np.int64)
+        bin_idx = np.where(nan_mask, nan_bin_idx, bin_idx)
+        bin_idx = np.clip(bin_idx, 0, nan_bin_idx)
+        df[col] = woe[bin_idx]
+
+    # 5. Column selection — keep only train-chosen features (+ target)
     if _spec.selected_features is not None:
         keep = [c for c in _spec.selected_features if c in df.columns]
         if _spec.target_column and _spec.target_column in df.columns and _spec.target_column not in keep:
@@ -941,6 +1528,12 @@ if __name__ == "__main__":
             PROTECTED_COLS=protected_display,
             DATE_COL=date_col_display,
             DOMAIN_GUIDANCE=self._get_domain_guidance(),
+            PRODUCT_TYPE=self.product_type,
+            PRODUCT_GUIDANCE=self._get_product_guidance(),
+            TARGET_NEW_FEATURE_COUNT=Config.TARGET_NEW_FEATURE_COUNT,
+            IV_LEAKAGE_THRESHOLD=Config.IV_LEAKAGE_THRESHOLD,
+            MULTICOLLINEARITY_THRESHOLD=Config.MULTICOLLINEARITY_THRESHOLD,
+            IV_MAX_NULL_RATIO_PCT=int(Config.IV_MAX_NULL_RATIO * 100),
         )
 
     def _build_engineering_prompt(self, analysis: Dict, previous_report: Dict) -> str:
@@ -989,6 +1582,11 @@ if __name__ == "__main__":
                     if action_type == "create_interaction":
                         new_col = action_spec.get("new_col")
                         expression = action_spec.get("expression", "")
+                        # Master switch: skip the whole interaction step when disabled
+                        if not self.create_interactions_enabled:
+                            self.logger.log(self.name, f"SKIP {action_type}",
+                                f"interaction step disabled (FE_CREATE_INTERACTIONS_ENABLED=false) — skipped '{new_col}'")
+                            continue
                         # Block if expression references any protected column
                         refs_protected = any(f"'{c}'" in expression or f'"{c}"' in expression
                                             for c in self._protected_cols)
@@ -1033,8 +1631,36 @@ if __name__ == "__main__":
                         actions_taken.append(f"Analyzed correlations: {reason}")
                         self.logger.log(self.name, "Correlation Results", result[:500])
 
+                    elif action_type == "compute_iv":
+                        bins = int(action_spec.get("bins", Config.IV_BINS_DEFAULT))
+                        method = action_spec.get("method", "quantile")
+                        # Reset IV cache so a re-run starts clean; on failure the
+                        # selector falls back to f_classif rather than reading stale scores.
+                        self._last_iv_scores = {}
+                        self._last_woe_maps = {}
+                        self._last_woe_data = {}
+                        result = self.execute_tool("compute_iv", df=self.df,
+                                                   target=self.target_column,
+                                                   bins=bins, method=method)
+                        actions_taken.append(f"Computed IV (bins={bins}, method={method}): {reason}")
+                        self.logger.log(self.name, "IV Results", result[:1000])
+
+                    elif action_type == "apply_woe_transform":
+                        min_iv = float(action_spec.get("min_iv", Config.WOE_MIN_IV))
+                        self._last_applied_woe = {}
+                        self.df = self.execute_tool("apply_woe_transform",
+                                                    df=self.df, min_iv=min_iv)
+                        # Persist the applied WoE payload into the spec so valid/oot
+                        # replay binning + WoE-lookup is identical to TRAIN.
+                        spec.woe_maps.update(self._last_applied_woe)
+                        actions_taken.append(
+                            f"Applied WoE transform to {len(self._last_applied_woe)} "
+                            f"features (min_iv={min_iv}): {reason}"
+                        )
+
                     elif action_type == "select_top_features":
                         k = int(action_spec.get("k", self._suggest_top_k()))
+                        criterion = action_spec.get("criterion", "default")
                         # Snapshot protected cols — SelectKBest drops them since they're non-numeric / not scored
                         protected_snapshot = {
                             col: self.df[col].copy()
@@ -1043,7 +1669,8 @@ if __name__ == "__main__":
                         }
                         self._last_selected_features = None
                         self.df = self.execute_tool("select_top_features", df=self.df,
-                                                    target=self.target_column, k=k)
+                                                    target=self.target_column, k=k,
+                                                    criterion=criterion)
                         # Re-add any protected cols that were removed by selection
                         restored: List[str] = []
                         for col, series in protected_snapshot.items():
@@ -1055,7 +1682,7 @@ if __name__ == "__main__":
                         # Capture the FINAL column list (including restored protected cols)
                         # so transform applies the same selection to valid/oot
                         spec.selected_features = list(self.df.columns)
-                        actions_taken.append(f"Selected top {k} features: {reason}")
+                        actions_taken.append(f"Selected top {k} features (criterion={criterion}): {reason}")
 
                     else:
                         self.logger.log(self.name, "WARN",

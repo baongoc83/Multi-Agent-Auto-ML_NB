@@ -60,10 +60,35 @@ class TrainModelAgent(BaseAgent):
         self.target_column: str = None
         self.date_col: Optional[str] = None
         self.id_col: Optional[str] = None
+        # Temporal frequency controls the granularity of every temporal slice.
+        # temporal_freq ∈ {"auto","weekly","monthly"} (default from Config); when
+        # "weekly", week_closing_day picks the W-anchor (auto from data if blank).
+        # Resolved into period_freq (e.g. "M" / "W-FRI") + period_unit at split time.
+        self.temporal_freq: str = Config.TEMPORAL_FREQ
+        self.week_closing_day: str = Config.WEEK_CLOSING_DAY
+        self.period_freq: str = "M"
+        self.period_unit: str = "month"
+        # Temporal cadence detected from date_col during _tool_split_data.
+        # cadence ∈ {"monthly_snapshot","intra_month","weekly_snapshot","weekly",
+        # "non_temporal"}; temporal_meta records how many WHOLE PERIODS (months or
+        # weeks) each split spans so the report makes the granularity explicit.
+        self.date_cadence: Optional[str] = None
+        self.temporal_meta: Dict[str, object] = {"cadence": "non_temporal"}
         self.splits: Dict[str, pd.DataFrame] = {}
         self.feature_cols: List[str] = []
         self._cat_encoders: Dict[str, Any] = {}
         self.model: Any = None
+        # Multi-seed bagging ensemble + isotonic/sigmoid calibrator. Populated
+        # by _tool_train_final_model. ensemble_models[0] == self.model
+        # (the primary fit used by SHAP). calibrator is None when disabled
+        # or when no usable calibration split was found.
+        self.ensemble_models: List[Any] = []
+        self.calibrator: Any = None
+        # Resolved calibration on/off for THIS run. Defaults to the global
+        # Config toggle; process()/process_splits() may override per-run via the
+        # `calibration=` arg (None → keep Config default). Read in
+        # _tool_train_final_model so the overfit-retry path honours it too.
+        self.calibration_enabled: bool = Config.CALIBRATION_ENABLED
         # Forwarded from FeatureEngineer / Pipeline so the post-training SHAP
         # explain step can ground the LLM's narrative in real column semantics.
         self._col_descriptions: Dict[str, str] = col_descriptions or {}
@@ -156,6 +181,27 @@ class TrainModelAgent(BaseAgent):
         """CatBoost uses 'iterations', all others use 'n_estimators'."""
         return "iterations" if estimator_name in ("catboost", "CatBoost") else "n_estimators"
 
+    def _extract_best_iteration(self, model, estimator_name: str) -> Optional[int]:
+        """Return the early-stopping-selected tree count as an n_estimators value,
+        or None for libs/configs without ES (RF / ExtraTrees / DART / failure).
+
+        lightgbm exposes 0-based-safe `best_iteration_`; xgboost/catboost expose a
+        0-indexed best iteration → +1 to convert to a tree count.
+        """
+        try:
+            if estimator_name in ("lgbm", "LightGBM"):
+                bi = getattr(model, "best_iteration_", None)
+                return int(bi) if bi else None
+            if estimator_name in ("xgboost", "XGBoost"):
+                bi = getattr(model, "best_iteration", None)
+                return int(bi) + 1 if bi is not None else None
+            if estimator_name in ("catboost", "CatBoost"):
+                bi = model.get_best_iteration()
+                return int(bi) + 1 if bi is not None else None
+        except Exception:
+            return None
+        return None
+
     def _get_model_class(self, estimator_name: str):
         from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
         mapping = {
@@ -199,6 +245,8 @@ class TrainModelAgent(BaseAgent):
             "reg_alpha", "reg_lambda", "min_split_gain", "bagging_freq",
             "random_state", "n_jobs", "verbose", "device",
             "class_weight", "importance_type",
+            # DART-mode hyperparameters (Optuna-tuned when boosting_type='dart')
+            "boosting_type", "drop_rate", "max_drop", "skip_drop",
         }
         _xgb = {
             "n_estimators", "learning_rate", "max_depth", "min_child_weight",
@@ -335,7 +383,14 @@ class TrainModelAgent(BaseAgent):
         rounds = rounds if rounds is not None else Config.EARLY_STOPPING_ROUNDS
         no_val = X_val is None or len(X_val) == 0
         rf_like = estimator_name in ("rf", "RandomForest", "extra_tree", "ExtraTrees")
-        if no_val or rf_like:
+        # DART boosting rebuilds dropped trees each round → ES gives no signal
+        # (every validation eval can be arbitrarily worse than the previous
+        # round). LightGBM raises at fit time if both are set together.
+        lgbm_dart = (
+            estimator_name in ("lgbm", "LightGBM")
+            and getattr(model, "boosting_type", None) == "dart"
+        )
+        if no_val or rf_like or lgbm_dart:
             model.fit(X_tr, y_tr)
             return model
         try:
@@ -351,8 +406,18 @@ class TrainModelAgent(BaseAgent):
             elif estimator_name in ("xgboost", "XGBoost"):
                 import xgboost as xgb
                 if int(xgb.__version__.split(".")[0]) >= 2:
+                    # XGBoost 2.x takes early_stopping_rounds on the ctor — but
+                    # this param PERSISTS on the fitted model, so any later
+                    # cross_val_score / sklearn refit clones the model with ES
+                    # still active but no eval_set, raising
+                    # "Must have at least 1 validation dataset for early stopping"
+                    # and failing every CV fold. Always reset it after the fit.
                     model.set_params(early_stopping_rounds=rounds)
                     model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+                    try:
+                        model.set_params(early_stopping_rounds=None)
+                    except Exception:
+                        pass
                 else:
                     model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)],
                               early_stopping_rounds=rounds, verbose=False)
@@ -455,6 +520,27 @@ class TrainModelAgent(BaseAgent):
         except ValueError:
             return _split(df, test_size=test_size, stratify=None, random_state=rs)
 
+    def _resolve_period_freq(self, dt_series: pd.Series) -> Tuple[str, str]:
+        """Resolve (pandas period freq, human unit) from temporal_freq.
+
+        "weekly" → ("W-<ANCHOR>", "week"); the anchor is the snapshot/closing
+        weekday — taken from week_closing_day, else auto-detected as the most
+        common weekday present in date_col. Everything else → ("M", "month").
+        Weekly is opt-in only (never auto-inferred) to avoid mis-detection.
+        """
+        mode = (self.temporal_freq or "auto").lower()
+        if mode != "weekly":
+            return "M", "month"
+        valid = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
+        anchor = (self.week_closing_day or "").strip().upper()
+        if anchor not in valid:
+            wd = dt_series.dropna().dt.day_name().str[:3].str.upper()
+            anchor = wd.mode().iloc[0] if not wd.empty else "SUN"
+            self.logger.log(self.name, "Temporal freq",
+                f"weekly cadence — week_closing_day auto-detected = {anchor} "
+                "(most common weekday in date_col; set week_closing_day to override)")
+        return f"W-{anchor}", "week"
+
     def _tool_split_data(
         self, df: pd.DataFrame, provided_oot: Optional[pd.DataFrame] = None
     ) -> Dict[str, pd.DataFrame]:
@@ -523,23 +609,59 @@ class TrainModelAgent(BaseAgent):
             }
 
         if self.date_col and self.date_col in df.columns:
-            # Compute year-month as a standalone Series — avoids df.copy() and the
-            # later .drop(columns=["_ym"]) which each allocate a full copy of the frame.
+            # Bucket each row into a period (month or week) as a standalone Series —
+            # avoids df.copy() and the later .drop(columns=["_ym"]) which each
+            # allocate a full copy of the frame. Frequency is resolved from
+            # temporal_freq: monthly by default, weekly only when opted in.
             _dt = pd.to_datetime(df[self.date_col], errors="coerce")
-            ym  = _dt.dt.to_period("M")
+            self.period_freq, self.period_unit = self._resolve_period_freq(_dt)
+            ym  = _dt.dt.to_period(self.period_freq)
 
             nat_count = int(_dt.isna().sum())
             if nat_count:
                 self.logger.log(self.name, "WARN",
                     f"{nat_count} rows have unparseable dates in '{self.date_col}' — "
                     "treated as non-OOT (assigned to train pool)")
-            sorted_months = sorted(ym.dropna().unique())
+            sorted_months = sorted(ym.dropna().unique())   # periods (month or week)
             valid_rows = total - nat_count
 
-            # B2 fix: need >= 2 distinct months to create a meaningful OOT set
+            # ── Detect temporal cadence on the FULL series (authoritative) ──────
+            # "*_snapshot": exactly one distinct calendar date per period (e.g.
+            # every row stamped 2023-01-31, or every Friday) → the model operates
+            # at that granularity, so every temporal slice (OOT, valid_temporal,
+            # stability) must move in whole-period steps. Otherwise "intra_month" /
+            # "weekly" (multiple dates per period). Recorded so the report is
+            # explicit about the granularity rather than a blind row-count split.
+            n_dates_total = int(_dt.dropna().nunique())
+            n_periods_total = len(sorted_months)
+            is_snapshot = (n_dates_total == n_periods_total)
+            if self.period_unit == "week":
+                self.date_cadence = "weekly_snapshot" if is_snapshot else "weekly"
+            else:
+                self.date_cadence = "monthly_snapshot" if is_snapshot else "intra_month"
+            self.temporal_meta = {
+                "cadence": self.date_cadence,
+                "period_unit": self.period_unit,
+                "period_freq": self.period_freq,
+                "date_col": self.date_col,
+                "n_periods_total": n_periods_total,
+                "n_distinct_dates": n_dates_total,
+                "first_period": str(sorted_months[0]) if sorted_months else None,
+                "last_period": str(sorted_months[-1]) if sorted_months else None,
+            }
+            if n_periods_total >= 2:
+                runs_at = self.period_unit.upper()
+                self.logger.log(self.name, "Temporal cadence",
+                    f"{self.date_cadence} | {n_periods_total} {self.period_unit}s "
+                    f"[{self.temporal_meta['first_period']}..{self.temporal_meta['last_period']}] "
+                    f"| {n_dates_total} distinct dates"
+                    + (f" — model runs {runs_at}LY; all temporal splits snap to whole {self.period_unit}s"
+                       if is_snapshot else ""))
+
+            # B2 fix: need >= 2 distinct periods to create a meaningful OOT set
             if len(sorted_months) < 2:
                 self.logger.log(self.name, "WARN",
-                    f"Only {len(sorted_months)} distinct month(s) in '{self.date_col}' — "
+                    f"Only {len(sorted_months)} distinct {self.period_unit}(s) in '{self.date_col}' — "
                     "cannot create OOT split, falling back to simple split")
                 # fall through to simple split below
                 ym = None
@@ -569,8 +691,8 @@ class TrainModelAgent(BaseAgent):
                     oot_ratio = ym.isin(sorted_months[-n_oot:]).sum() / valid_rows
                     self.logger.log(self.name, "WARN",
                         f"OOT exceeded cap {Config.OOT_MAX_RATIO:.0%} — "
-                        f"reduced to {n_oot} month(s) = {oot_ratio:.1%}. "
-                        "Data may have coarse month granularity or heavy recency bias.")
+                        f"reduced to {n_oot} {self.period_unit}(s) = {oot_ratio:.1%}. "
+                        f"Data may have coarse {self.period_unit} granularity or heavy recency bias.")
 
                 mask_oot  = ym.isin(set(sorted_months[-n_oot:])).values
                 mask_pool = ~mask_oot
@@ -585,13 +707,45 @@ class TrainModelAgent(BaseAgent):
                     # Materialise oot_df first (smaller subset)
                     oot_df = df[mask_oot].reset_index(drop=True)
 
-                    # Valid-temporal: indices of pool rows closest to OOT boundary by date
+                    # Valid-temporal: pool rows closest to the OOT boundary.
+                    # Selection is snapped to WHOLE PERIOD boundaries (month or
+                    # week), not a raw row-count slice. Without snapping, snapshot
+                    # data (all rows in a period share the same date, e.g.
+                    # 2023-01-31 or a Friday) would have valid_temporal and train
+                    # contain rows from the SAME snapshot period — no real temporal
+                    # separation. Whole-period snapping is safe for any cadence: it
+                    # picks the minimum trailing pool periods whose combined row
+                    # count covers n_temporal, keeping period boundaries intact.
                     valid_size = max(1, int(round(pool_size * Config.TRAIN_TEST_SPLIT_SIZE)))
                     n_temporal = max(1, int(round(valid_size * Config.VALID_TEMPORAL_RATIO)))
-                    pool_orig_idx = df.index[mask_pool]
+
+                    pool_ym_s   = ym[mask_pool]          # Series: pool rows → Period
+                    pool_months = sorted(pool_ym_s.dropna().unique())
+
+                    # Cadence already detected on the full series above. For a
+                    # snapshot cadence, snapping valid_temporal to whole periods is
+                    # what prevents train + valid_temporal sharing the same snapshot
+                    # period (within-period leakage).
+                    if self.date_cadence in ("monthly_snapshot", "weekly_snapshot"):
+                        self.logger.log(self.name, "Split temporal",
+                            f"{self.date_cadence} — snapping valid_temporal to "
+                            f"whole {self.period_unit}s to avoid within-{self.period_unit} leakage")
+
+                    n_val_months = 1
+                    while n_val_months < len(pool_months):
+                        covered = int(pool_ym_s.isin(pool_months[-n_val_months:]).sum())
+                        if covered >= n_temporal:
+                            break
+                        n_val_months += 1
+                    # Always leave at least 1 pool period for train
+                    n_val_months = min(n_val_months, max(1, len(pool_months) - 1))
+
                     temporal_orig_idx = set(
-                        _dt.loc[mask_pool].sort_values(ascending=False).iloc[:n_temporal].index
+                        pool_ym_s[pool_ym_s.isin(set(pool_months[-n_val_months:]))].index
                     )
+                    self.logger.log(self.name, "Split temporal",
+                        f"valid_temporal = {n_val_months} whole {self.period_unit}(s) | "
+                        f"rows={len(temporal_orig_idx)} | target_rows={n_temporal}")
                     del _dt, ym  # free temporary Series before creating large DataFrames
 
                     mask_temp_orig = pd.Series(False, index=df.index)
@@ -615,8 +769,33 @@ class TrainModelAgent(BaseAgent):
 
                     valid_df = pd.concat([valid_temp_df, valid_rand_df], ignore_index=True)
 
+                    # Degenerate-split warning — usually means date_col is a
+                    # mislabelled feature (e.g. days_birth coerced as
+                    # nanoseconds-since-epoch). The downstream eval_set / CV
+                    # paths will fall back to `valid` or skip ES entirely,
+                    # but the user almost certainly wants to know.
+                    target_in = lambda d: target in d.columns and len(d) > 0
+                    bad_temp = (target_in(valid_temp_df)
+                                and pd.to_numeric(valid_temp_df[target], errors="coerce").nunique() < 2)
+                    bad_oot  = (target_in(oot_df)
+                                and pd.to_numeric(oot_df[target], errors="coerce").nunique() < 2)
+                    if bad_temp or bad_oot or len(valid_temp_df) < 10 or len(oot_df) < 10:
+                        self.logger.log(self.name, "SPLIT WARN",
+                            f"Degenerate temporal split — valid_temp={len(valid_temp_df)} rows "
+                            f"(bad_classes={bad_temp}), oot={len(oot_df)} rows "
+                            f"(bad_classes={bad_oot}). date_col='{self.date_col}' may not be a "
+                            "real snapshot column; downstream will fall back to `valid` for ES.")
+
+                    # Record how many whole periods each temporal split spans so
+                    # the report states the cadence (monthly/weekly) explicitly.
+                    self.temporal_meta.update({
+                        "oot_periods": int(n_oot),
+                        "valid_temporal_periods": int(n_val_months),
+                        "train_periods": int(len(pool_months) - n_val_months),
+                    })
+
                     self.logger.log(self.name, "Split (OOT)",
-                        f"oot_months={n_oot} | oot_ratio={len(oot_df)/total:.1%} | "
+                        f"oot_{self.period_unit}s={n_oot} | oot_ratio={len(oot_df)/total:.1%} | "
                         f"train={len(train_df)} | valid_temp={len(valid_temp_df)} | "
                         f"valid_rand={len(valid_rand_df)} | oot={len(oot_df)}")
                     return {
@@ -625,7 +804,11 @@ class TrainModelAgent(BaseAgent):
                         "oot": oot_df, "test": empty.copy(),
                     }
 
-        # Fallback: no date col or fell through from OOT path
+        # Fallback: no date col or fell through from OOT path. No temporal OOT was
+        # produced, so the splits are NOT month-based — mark cadence accordingly
+        # (overrides any cadence detected before the fall-through).
+        self.temporal_meta = {"cadence": "non_temporal"}
+        self.date_cadence = "non_temporal"
         # 3-way stratified split: 60% train / 20% valid / 20% test (no temporal OOT)
         train_valid_df, test_df = self._stratified_split(df, target, 0.20, rs)
         train_df, valid_df      = self._stratified_split(train_valid_df, target, 0.25, rs)
@@ -723,7 +906,14 @@ class TrainModelAgent(BaseAgent):
         """
         gpu = self._gpu_params(estimator_name)
         if estimator_name in ("lgbm", "LightGBM"):
-            return {
+            # DART (Dropouts meet Multiple Additive Regression Trees) — dropout
+            # applied to existing trees during boosting. Slower (3-5x) but
+            # often +0.3-1% AUC on credit data because it regularises tail
+            # bins where gbdt overfits. ES is incompatible with DART (it
+            # rebuilds dropped trees each round) — handled in _fit_with_early_stopping.
+            boosting_type = trial.suggest_categorical("boosting_type", ["gbdt", "dart"])
+            params = {
+                "boosting_type": boosting_type,
                 "n_estimators": trial.suggest_int("n_estimators", Config.N_ESTIMATORS_MIN, Config.N_ESTIMATORS_MAX, step=50),
                 "learning_rate": trial.suggest_float("learning_rate", Config.LR_MIN, Config.LR_MAX, log=True),
                 "num_leaves": trial.suggest_int("num_leaves", Config.NUM_LEAVES_MIN, Config.NUM_LEAVES_MAX),
@@ -736,6 +926,13 @@ class TrainModelAgent(BaseAgent):
                 "random_state": Config.RANDOM_STATE, "n_jobs": -1, "verbose": -1,
                 **gpu,
             }
+            if boosting_type == "dart":
+                # DART-specific drop hyperparams. Bounds picked from LightGBM
+                # paper § 4 + bank credit-risk benchmarking sweet spot.
+                params["drop_rate"] = trial.suggest_float("drop_rate", 0.05, 0.3)
+                params["max_drop"] = trial.suggest_int("max_drop", 30, 100)
+                params["skip_drop"] = trial.suggest_float("skip_drop", 0.3, 0.7)
+            return params
         if estimator_name in ("xgboost", "XGBoost"):
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", Config.N_ESTIMATORS_MIN, Config.N_ESTIMATORS_MAX, step=50),
@@ -978,12 +1175,20 @@ class TrainModelAgent(BaseAgent):
 
         tmp = train_df.copy()
         tmp[self.date_col] = pd.to_datetime(tmp[self.date_col], errors="coerce")
-        tmp["_ym"] = tmp[self.date_col].dt.to_period("M")
+        # In pre-split mode _tool_split_data's date branch is skipped, so
+        # period_freq may still be the default "M" — honour an explicit weekly
+        # request here too so split-mode weekly models get weekly stability.
+        if self.temporal_freq == "weekly" and self.period_freq == "M":
+            self.period_freq, self.period_unit = self._resolve_period_freq(tmp[self.date_col])
+        # Group Gini by the SAME period as the split (month or week) so a weekly
+        # model gets weekly stability; STABILITY_MIN_MONTHS is read as a min count
+        # of periods regardless of unit.
+        tmp["_ym"] = tmp[self.date_col].dt.to_period(self.period_freq)
         periods = sorted(tmp["_ym"].dropna().unique())
 
         if len(periods) < Config.STABILITY_MIN_MONTHS:
             self.logger.log(self.name, "Stability",
-                f"Only {len(periods)} months < min={Config.STABILITY_MIN_MONTHS} → skip")
+                f"Only {len(periods)} {self.period_unit}s < min={Config.STABILITY_MIN_MONTHS} → skip")
             return feature_cols, pd.DataFrame()
 
         records = []
@@ -1037,6 +1242,16 @@ class TrainModelAgent(BaseAgent):
             int(Config.MAX_FINAL_FEATURES * Config.SHAP_PSI_MIN_FEATURES_RATIO),
         )
         max_no_improve = Config.SHAP_PSI_MAX_NO_IMPROVE
+        # Policy: 'auc_first' = early-stop fires immediately when AUC stops
+        # improving (final count may exceed MAX_FINAL_FEATURES);
+        # 'cap_first' = ignore early-stop until we cross MAX_FINAL_FEATURES,
+        # then re-enable it for fine-tuning down toward the floor.
+        cap_policy = Config.FEATURE_CAP_POLICY
+        if cap_policy not in ("auc_first", "cap_first"):
+            self.logger.log(self.name, "SHAP+PSI WARN",
+                f"Unknown FEATURE_CAP_POLICY '{cap_policy}' — defaulting to 'auc_first'")
+            cap_policy = "auc_first"
+        feature_cap = Config.MAX_FINAL_FEATURES
 
         has_valid = len(X_valid) > 0 and y_valid.nunique() >= 2
         if not has_valid:
@@ -1113,7 +1328,8 @@ class TrainModelAgent(BaseAgent):
 
         self.logger.log(self.name, "SHAP+PSI Prune",
             f"start={len(current_features)} | baseline_valid_auc={best_auc:.4f} | "
-            f"min_features={min_features} | psi_available={bool(psi_lookup)}")
+            f"min_features={min_features} | cap={feature_cap} | "
+            f"policy={cap_policy} | psi_available={bool(psi_lookup)}")
 
         step = 0
         while len(current_features) > min_features:
@@ -1157,6 +1373,15 @@ class TrainModelAgent(BaseAgent):
 
             current_features = candidate  # always advance current (greedy exploration)
 
+            # Forced advance: in 'cap_first' policy, while still above OR at the
+            # cap we override the AUC-improvement rule to guarantee the cap is
+            # met. Using >= (not >) ensures the boundary step (cap+1 → cap) also
+            # snapshots, so best_features ends ≤ feature_cap exactly. Once we
+            # drop below the cap, the normal AUC-driven snapshot logic resumes
+            # and best_features can only improve from that point on.
+            force_advance = (cap_policy == "cap_first"
+                             and len(current_features) >= feature_cap)
+
             if improved:
                 best_features = list(current_features)
                 best_auc = candidate_auc
@@ -1164,6 +1389,15 @@ class TrainModelAgent(BaseAgent):
                 self.logger.log(self.name, "SHAP+PSI",
                     f"step={step} removed '{worst_feat}' | "
                     f"n={len(current_features)} | auc={candidate_auc:.4f}")
+            elif force_advance:
+                # AUC tụt nhưng đang trên cap → vẫn snapshot để cap chắc chắn đạt.
+                # Reset streak: khi cross cap vào Phase 2, early-stop có ngân sách full.
+                best_features = list(current_features)
+                no_improve_streak = 0
+                self.logger.log(self.name, "SHAP+PSI",
+                    f"step={step} forced remove '{worst_feat}' "
+                    f"(above cap {feature_cap}) → n={len(current_features)} | "
+                    f"auc={candidate_auc:.4f} (Δ={candidate_auc - best_auc:+.4f})")
             else:
                 no_improve_streak += 1
                 self.logger.log(self.name, "SHAP+PSI",
@@ -1187,7 +1421,35 @@ class TrainModelAgent(BaseAgent):
         best_params: Dict,
         feature_cols: List[str],
     ) -> Dict[str, Any]:
-        from sklearn.model_selection import StratifiedKFold, cross_val_score
+        """Train the production-ready final model.
+
+        Refit-on-train+valid flow (banking AUC stack). Feature selection and
+        hyperparameter tuning happen earlier on train (with valid as the ES /
+        scoring holdout); here the DEPLOYED model is refit on the full in-time
+        data so it sees every available row before facing OOT/test.
+
+          0. Merge — X_final = train + valid_temporal + valid_random (or `valid`
+             in simple mode). OOT (and `test` in simple mode) are held out.
+          1. K-fold CV on X_final — each fold fits with early stopping to give a
+             stable best_iteration (median across folds) AND collects out-of-fold
+             raw probabilities. cv_auc_mean (OOF) is the honest in-time estimate.
+          2. Multi-seed bagging — refit `Config.MULTI_SEED_N` copies of the
+             Optuna-best config on the FULL X_final with the tree count fixed to
+             best_iteration (no ES, since valid is now in-sample). Mean of base
+             raw probas. MULTI_SEED_N=1 reverts to single-model behaviour.
+          3. Leakage-free calibration — isotonic/sigmoid fit on the pooled CV
+             out-of-fold predictions (CalibratedClassifierCV-style). Required for
+             IFRS9 / Basel PD — AUC neutral, big Brier improvement.
+          4. Per-split AUC + Brier eval — valid_* are in-sample after the merge
+             (reported for transparency); OOT/test are the clean final holdouts.
+
+        State written:
+          self.model            — primary single-seed fit (used by SHAP)
+          self.ensemble_models  — list[BaseEstimator] of all fitted seeds
+          self.calibrator       — IsotonicRegression / _SigmoidCalibrator or None
+        """
+        from sklearn.model_selection import StratifiedKFold
+        from sklearn.metrics import brier_score_loss
 
         target = self.target_column
         ModelClass = self._get_model_class(estimator_name)
@@ -1196,44 +1458,173 @@ class TrainModelAgent(BaseAgent):
             avail = [c for c in feature_cols if c in df.columns]
             return self._transform_X(df[avail]), pd.to_numeric(df[target], errors="coerce")
 
-        X_tr, y_tr = _prep(self.splits["train"])
+        # ── Build the FINAL training set = train + ALL valid ─────────────
+        # Banking rule: once features + hyperparams are locked during model
+        # SELECTION, the DEPLOYED model is refit on every in-time row
+        # (train + valid_temporal + valid_random, or `valid` in simple mode).
+        # OOT (and `test` in simple mode) are NEVER merged in → they stay clean
+        # final holdouts for the out-of-time / hold-out acceptance report.
+        train_df_only = self.splits["train"]
+        final_parts   = [train_df_only]
+        merged_labels: List[str] = []
+        for s in ("valid_temporal", "valid_random"):
+            sdf = self.splits.get(s, pd.DataFrame())
+            if len(sdf) > 0:
+                final_parts.append(sdf); merged_labels.append(s)
+        if len(final_parts) == 1:                       # simple (non-temporal) mode
+            vdf = self.splits.get("valid", pd.DataFrame())
+            if len(vdf) > 0:
+                final_parts.append(vdf); merged_labels.append("valid")
+        final_df = (pd.concat(final_parts, ignore_index=True)
+                    if len(final_parts) > 1 else train_df_only)
+        X_fin, y_fin = _prep(final_df)
+        self.logger.log(self.name, "Final training set",
+            f"train+valid merged → rows={len(X_fin)} "
+            f"(train={len(train_df_only)} + [{', '.join(merged_labels) or 'none'}]); "
+            "OOT/test held out as final acceptance set")
 
-        # Auto class weighting from train imbalance — but respect Optuna's
+        # Auto class weighting from the MERGED labels — but respect Optuna's
         # tuned scale_pos_weight if it's already in best_params (xgb/cb path).
-        class_weight_params = self._compute_class_weight_params(y_tr, estimator_name)
+        class_weight_params = self._compute_class_weight_params(y_fin, estimator_name)
         if "scale_pos_weight" in best_params:
             class_weight_params.pop("scale_pos_weight", None)
         if class_weight_params:
             self.logger.log(self.name, "Final class weight",
                 f"applying {class_weight_params}")
 
-        # Pick best valid set for early stopping: prefer temporal (closest to OOT
-        # boundary) over random valid. RF/ExtraTrees ignore ES internally.
-        X_es, y_es = None, None
-        for split_name in ("valid_temporal", "valid"):
-            sdf = self.splits.get(split_name, pd.DataFrame())
-            if len(sdf) > 0:
-                X_es, y_es = _prep(sdf)
-                if y_es.nunique() >= 2:
-                    break
-                X_es, y_es = None, None
+        seed_param = self._random_state_key(estimator_name)
+        n_est_key  = self._get_n_estimators_key(estimator_name)
 
-        model = ModelClass(**{
-            **self._safe_params(estimator_name, best_params),
-            **class_weight_params,
-            **self._gpu_params(estimator_name),
-        })
-        self._fit_with_early_stopping(model, estimator_name, X_tr, y_tr, X_es, y_es)
-        self.model = model
+        def _base_params(seed: int) -> Dict[str, Any]:
+            return {
+                **self._safe_params(estimator_name, best_params),
+                **class_weight_params,
+                **self._gpu_params(estimator_name),
+                seed_param: seed,
+            }
 
-        metrics: Dict[str, Any] = {"best_model": estimator_name, "best_params": best_params}
+        # ── 1. K-fold CV on train+valid → stable best_iteration + OOF preds ──
+        # One CV pass over the merged set yields BOTH:
+        #   (a) a robust early-stopping tree count (median best_iteration across
+        #       folds) to refit with on the full merged set, and
+        #   (b) out-of-fold raw probabilities for LEAKAGE-FREE calibration (each
+        #       row scored by a fold model that never trained on it).
+        # Preferred over a single ES holdout because `valid` is now inside the
+        # training data — there is no clean held split left to early-stop on.
+        oof_raw   = np.full(len(y_fin), np.nan)
+        best_iters: List[int] = []
+        fold_aucs:  List[float] = []
+        cv_ok = False
+        try:
+            n_splits = max(2, min(Config.CV_N_SPLITS, int(y_fin.value_counts().min())))
+            skf = StratifiedKFold(n_splits=n_splits, shuffle=True,
+                                  random_state=Config.RANDOM_STATE)
+            for f_tr, f_va in skf.split(X_fin, y_fin):
+                fm = ModelClass(**_base_params(Config.RANDOM_STATE))
+                self._fit_with_early_stopping(
+                    fm, estimator_name,
+                    X_fin.iloc[f_tr], y_fin.iloc[f_tr],
+                    X_fin.iloc[f_va], y_fin.iloc[f_va])
+                bi = self._extract_best_iteration(fm, estimator_name)
+                if bi:
+                    best_iters.append(bi)
+                p = fm.predict_proba(X_fin.iloc[f_va])[:, 1]
+                oof_raw[f_va] = p
+                if y_fin.iloc[f_va].nunique() >= 2:
+                    fold_aucs.append(float(roc_auc_score(y_fin.iloc[f_va], p)))
+            cv_ok = True
+        except Exception as e:
+            self.logger.log(self.name, "CV WARN",
+                f"K-fold on train+valid failed ({e}) — refit without fixed "
+                "iteration and skip OOF calibration")
 
-        cv = StratifiedKFold(n_splits=Config.CV_N_SPLITS, shuffle=True, random_state=Config.RANDOM_STATE)
-        cv_scores = cross_val_score(model, X_tr, y_tr, cv=cv, scoring="roc_auc", n_jobs=-1)
-        metrics["cv_auc_mean"] = round(float(cv_scores.mean()), 4)
-        metrics["cv_auc_std"] = round(float(cv_scores.std()), 4)
-        self.logger.log(self.name, "CV AUC",
-            f"{metrics['cv_auc_mean']:.4f} ± {metrics['cv_auc_std']:.4f}")
+        best_iteration = int(np.median(best_iters)) if best_iters else None
+        self.logger.log(self.name, "Best iteration (CV on train+valid)",
+            f"folds={best_iters or 'n/a (no ES)'} → median={best_iteration} "
+            f"({n_est_key}) | cv_folds={len(fold_aucs)}")
+
+        # ── 2. Multi-seed refit on the FULL merged set (fixed iteration, no ES) ──
+        # Disabled flag → single-seed legacy path; keep ensemble_models a list so
+        # the artifact / replay shape stays uniform.
+        if Config.MULTI_SEED_ENABLED:
+            n_seeds = max(1, int(Config.MULTI_SEED_N))
+        else:
+            n_seeds = 1
+        seeds: List[int] = [Config.RANDOM_STATE]
+        for i in range(1, n_seeds):
+            seeds.append(Config.RANDOM_STATE + Config.MULTI_SEED_BASE_OFFSET * i)
+        self.logger.log(self.name, "Multi-seed bagging",
+            f"enabled={Config.MULTI_SEED_ENABLED} | n_seeds={n_seeds} | seeds={seeds} | "
+            f"refit on train+valid (rows={len(X_fin)}) | fixed {n_est_key}={best_iteration}")
+
+        ensemble_models: List[Any] = []
+        for idx, seed in enumerate(seeds):
+            params = _base_params(seed)
+            if best_iteration is not None:
+                params[n_est_key] = best_iteration       # lock ES-derived tree count
+            m = ModelClass(**params)
+            m.fit(X_fin, y_fin)                            # no ES — iteration fixed
+            ensemble_models.append(m)
+            self.logger.log(self.name, f"Final fit (seed {idx+1}/{n_seeds})",
+                f"seed={seed} | done")
+        self.ensemble_models = ensemble_models
+        self.model = ensemble_models[0]  # primary for SHAP / single-model ops
+
+        def _ensemble_raw_proba(X) -> np.ndarray:
+            """Mean of base models' P(class=1) — defined here so the calibrator
+            fit + metric eval share the exact same prediction logic."""
+            return np.mean([m.predict_proba(X)[:, 1] for m in ensemble_models], axis=0)
+
+        # ── 3. Leakage-free calibration on the CV out-of-fold predictions ──
+        # `valid` is inside the training data now, so calibrate on the pooled
+        # OOF probabilities instead (CalibratedClassifierCV-style, no leakage).
+        self.calibrator = None
+        calibration_split_used = None
+        if self.calibration_enabled and cv_ok:
+            mask  = ~np.isnan(oof_raw)
+            y_oof = y_fin.values[mask]
+            if mask.sum() >= 100 and pd.Series(y_oof).nunique() >= 2:
+                try:
+                    self.calibrator = self._fit_calibrator(
+                        oof_raw[mask], y_oof, method=Config.CALIBRATION_METHOD)
+                    calibration_split_used = "cv_oof(train+valid)"
+                    self.logger.log(self.name, "Calibration fit",
+                        f"method={Config.CALIBRATION_METHOD} | source=CV out-of-fold | "
+                        f"n_rows={int(mask.sum())} (leakage-free)")
+                except Exception as e:
+                    self.logger.log(self.name, "Calibration WARN",
+                        f"OOF calibration failed: {e}")
+            else:
+                self.logger.log(self.name, "Calibration",
+                    f"insufficient OOF rows/classes ({int(mask.sum())}) — skipped")
+        elif not self.calibration_enabled:
+            self.logger.log(self.name, "Calibration",
+                "disabled for this run (calibration=False or CALIBRATION_ENABLED=false)")
+        else:
+            self.logger.log(self.name, "Calibration",
+                "no CV OOF available (CV failed) — calibration skipped")
+
+        # ── 4. Metrics ────────────────────────────────────────────────────
+        metrics: Dict[str, Any] = {
+            "best_model":           estimator_name,
+            "best_params":          best_params,
+            "n_seeds":              n_seeds,
+            "final_trained_on":     "train+valid",
+            "final_train_rows":     int(len(X_fin)),
+            "best_iteration":       best_iteration,
+            "calibration_method":   Config.CALIBRATION_METHOD if self.calibrator is not None else None,
+            "calibration_split":    calibration_split_used,
+        }
+        # CV AUC is now the honest in-time estimate: out-of-fold on train+valid.
+        if fold_aucs:
+            metrics["cv_auc_mean"] = round(float(np.mean(fold_aucs)), 4)
+            metrics["cv_auc_std"]  = round(float(np.std(fold_aucs)), 4)
+            self.logger.log(self.name, "CV AUC (train+valid OOF)",
+                f"{metrics['cv_auc_mean']:.4f} ± {metrics['cv_auc_std']:.4f}")
+
+        # ── 5. Per-split AUC + Brier. NOTE: valid_* are IN-SAMPLE now (merged
+        #       into training) — kept for transparency; OOT/test are the clean
+        #       holdouts and the cv_auc above is the honest generalization proxy.
 
         for split_name in ("valid_temporal", "valid_random", "valid", "oot", "test"):
             split_df = self.splits.get(split_name, pd.DataFrame())
@@ -1243,13 +1634,66 @@ class TrainModelAgent(BaseAgent):
             if y_s.nunique() < 2:
                 continue
             try:
-                auc = roc_auc_score(y_s, model.predict_proba(X_s)[:, 1])
-                metrics[f"{split_name}_auc"] = round(float(auc), 4)
-                self.logger.log(self.name, f"{split_name} AUC", f"{auc:.4f}")
+                raw_proba = _ensemble_raw_proba(X_s)
+                cal_proba = self._apply_calibrator(raw_proba) if self.calibrator is not None else raw_proba
+                # AUC is rank-based → calibration is monotonic → same number, but report both for audit
+                auc_raw = float(roc_auc_score(y_s, raw_proba))
+                auc_cal = float(roc_auc_score(y_s, cal_proba))
+                brier_raw = float(brier_score_loss(y_s, raw_proba))
+                brier_cal = float(brier_score_loss(y_s, cal_proba))
+                metrics[f"{split_name}_auc"]       = round(auc_cal, 4)
+                metrics[f"{split_name}_auc_raw"]   = round(auc_raw, 4)
+                metrics[f"{split_name}_brier"]     = round(brier_cal, 4)
+                metrics[f"{split_name}_brier_raw"] = round(brier_raw, 4)
+                self.logger.log(self.name, f"{split_name} metrics",
+                    f"AUC raw={auc_raw:.4f} cal={auc_cal:.4f} | "
+                    f"Brier raw={brier_raw:.4f} cal={brier_cal:.4f}")
             except Exception as e:
-                self.logger.log(self.name, f"{split_name} AUC error", str(e))
+                self.logger.log(self.name, f"{split_name} eval error", str(e))
 
         return metrics
+
+    @staticmethod
+    def _random_state_key(estimator_name: str) -> str:
+        """Per-library random-state ctor kwarg. Used by multi-seed bagging."""
+        if estimator_name in ("catboost", "CatBoost"):
+            return "random_seed"
+        return "random_state"
+
+    @staticmethod
+    def _fit_calibrator(raw_proba: np.ndarray, y: np.ndarray, method: str):
+        """Fit a probability calibrator (raw P(positive) → calibrated P).
+
+        Returns an object with a `.predict(np.ndarray) -> np.ndarray` method
+        so the artifact stays self-contained. Both branches are pure sklearn
+        classes — load anywhere sklearn is installed without custom modules.
+        """
+        if method == "sigmoid":
+            # Platt scaling — fit logistic on raw probas
+            from sklearn.linear_model import LogisticRegression
+            clf = LogisticRegression(C=1e6, solver="lbfgs")
+            clf.fit(raw_proba.reshape(-1, 1), y)
+            # Wrap into a uniform interface
+            class _SigmoidCalibrator:
+                def __init__(self, clf): self.clf = clf
+                def predict(self, x):
+                    return self.clf.predict_proba(np.asarray(x).reshape(-1, 1))[:, 1]
+            return _SigmoidCalibrator(clf)
+        # Default: isotonic — banking standard for non-monotonic calibration drift
+        from sklearn.isotonic import IsotonicRegression
+        iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+        iso.fit(raw_proba, y)
+        return iso
+
+    def _apply_calibrator(self, raw_proba: np.ndarray) -> np.ndarray:
+        """Apply self.calibrator to raw P(positive). Returns calibrated probs.
+
+        IsotonicRegression uses .predict; the sigmoid wrapper also exposes .predict.
+        """
+        if self.calibrator is None:
+            return raw_proba
+        cal = self.calibrator.predict(raw_proba)
+        return np.clip(cal, 1e-15, 1 - 1e-15)
 
     # ── Overfitting detection & remediation ──────────────────────────────────
 
@@ -1257,19 +1701,27 @@ class TrainModelAgent(BaseAgent):
     def _check_overfitting(metrics: Dict, threshold: float = 0.12) -> Dict:
         """Return overfitting diagnosis.
 
-        Gap = (valid_auc - holdout_auc) / valid_auc.  detected=True when any
-        holdout gap exceeds threshold.
+        Gap = (ref_auc - holdout_auc) / ref_auc.  detected=True when any holdout
+        gap exceeds threshold.
+
+        Reference = cv_auc_mean (out-of-fold on train+valid) — the honest in-time
+        generalization estimate. The final model is refit on train+valid, so the
+        per-split valid_auc is in-sample (optimistic) and would inflate the gap;
+        cv_auc avoids that false trigger. Falls back to valid_auc only if CV AUC
+        is unavailable (e.g. CV failed on tiny data).
         """
-        valid_auc = metrics.get("valid_auc") or metrics.get("valid_temporal_auc") or 0.0
+        ref_auc = (metrics.get("cv_auc_mean")
+                   or metrics.get("valid_auc")
+                   or metrics.get("valid_temporal_auc") or 0.0)
         gaps: Dict[str, float] = {}
-        if valid_auc > 0:
+        if ref_auc > 0:
             for key in ("test_auc", "oot_auc"):
                 val = metrics.get(key)
                 if isinstance(val, float):
-                    gap = (valid_auc - val) / valid_auc
+                    gap = (ref_auc - val) / ref_auc
                     if gap > threshold:
                         gaps[key] = round(gap, 4)
-        return {"detected": bool(gaps), "gaps": gaps, "valid_auc": round(valid_auc, 4)}
+        return {"detected": bool(gaps), "gaps": gaps, "ref_auc": round(ref_auc, 4)}
 
     def _apply_conservative_regularization(self, estimator_name: str, params: Dict) -> Dict:
         """Fallback: manually strengthen regularization when LLM parsing fails."""
@@ -1395,19 +1847,37 @@ class TrainModelAgent(BaseAgent):
         return versions
 
     def _save_model(self, feature_cols: List[str]) -> None:
+        """Persist artifact with ensemble + calibrator (banking AUC stack).
+
+        Schema:
+          model            primary single-seed fit (back-compat — old replay code
+                           that reads `artifact['model']` keeps working at the
+                           cost of skipping the ensemble averaging).
+          ensemble_models  list of all fitted base models (len == MULTI_SEED_N).
+                           predict_proba should mean across these for production.
+          calibrator       fitted IsotonicRegression / sigmoid wrapper or None.
+                           Applied after ensemble averaging to map raw → calibrated PD.
+        """
         import joblib
+        models = self.ensemble_models or [self.model]
         artifact = {
-            "model":          self.model,
-            "feature_cols":   feature_cols,
-            "cat_encoders":   self._cat_encoders,
-            "target_column":  self.target_column,
-            "estimator_name": self.model.__class__.__name__,
-            "versions":       self._collect_runtime_versions(self.model.__class__.__name__),
+            "model":             self.model,                # primary, back-compat
+            "ensemble_models":   models,
+            "calibrator":        self.calibrator,
+            "calibration_method": Config.CALIBRATION_METHOD if self.calibrator is not None else None,
+            "n_seeds":           len(models),
+            "feature_cols":      feature_cols,
+            "cat_encoders":      self._cat_encoders,
+            "target_column":     self.target_column,
+            "estimator_name":    self.model.__class__.__name__,
+            "versions":          self._collect_runtime_versions(self.model.__class__.__name__),
         }
         Path(Config.RUN_DIR).mkdir(parents=True, exist_ok=True)
         joblib.dump(artifact, Config.FINAL_MODEL_PATH)
         self.logger.log(self.name, "Model Saved",
-            f"{Config.FINAL_MODEL_PATH} | versions={artifact['versions']}")
+            f"{Config.FINAL_MODEL_PATH} | n_seeds={len(models)} | "
+            f"calibrator={'yes (' + Config.CALIBRATION_METHOD + ')' if self.calibrator is not None else 'no'} | "
+            f"versions={artifact['versions']}")
 
     def _generate_model_code(self, estimator_name: str, best_params: Dict,
                               feature_cols: List[str]) -> None:
@@ -1435,10 +1905,14 @@ from pathlib import Path
 _ARTIFACT_PATH = Path(__file__).parent / "final_model.pkl"
 _artifact      = joblib.load(_ARTIFACT_PATH)
 
-model         = _artifact["model"]
-feature_cols  = _artifact["feature_cols"]
-cat_encoders  = _artifact["cat_encoders"]
-target_column = _artifact["target_column"]
+# `model` is the primary single-seed fit (back-compat). Production scoring uses
+# `ensemble_models` (multi-seed mean) + `calibrator` (isotonic / sigmoid map).
+model            = _artifact["model"]
+ensemble_models  = _artifact.get("ensemble_models", [model])
+calibrator       = _artifact.get("calibrator", None)
+feature_cols     = _artifact["feature_cols"]
+cat_encoders     = _artifact["cat_encoders"]
+target_column    = _artifact["target_column"]
 
 # ── Version compatibility check ──────────────────────────────────────────────
 # Warn (do not raise) when the deployment env differs from the training env —
@@ -1500,8 +1974,29 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Prediction helpers ────────────────────────────────────────────────────────
 def predict_proba(df: pd.DataFrame) -> np.ndarray:
-    """Return probability of the positive class (shape: n_samples,)."""
-    return model.predict_proba(preprocess(df))[:, 1]
+    """Return calibrated probability of the positive class (shape: n_samples,).
+
+    Two-stage banking PD: ensemble-mean raw probability across all seeds, then
+    isotonic / sigmoid calibration mapping to a probability that obeys
+    P(default) ≈ observed default rate per score band. Required for IFRS9 ECL.
+    """
+    X = preprocess(df)
+    # Mean of base models' P(positive). 1-model artifact still works (mean of 1).
+    raw = np.mean([m.predict_proba(X)[:, 1] for m in ensemble_models], axis=0)
+    if calibrator is not None:
+        cal = calibrator.predict(raw)
+        return np.clip(cal, 1e-15, 1 - 1e-15)
+    return raw
+
+
+def predict_proba_raw(df: pd.DataFrame) -> np.ndarray:
+    """Uncalibrated ensemble probability — useful for diagnostics / debugging.
+
+    Same rank order as predict_proba (calibration is monotonic) so AUC is
+    identical; differs only in scale + matches observed-vs-predicted PD.
+    """
+    X = preprocess(df)
+    return np.mean([m.predict_proba(X)[:, 1] for m in ensemble_models], axis=0)
 
 
 def predict(df: pd.DataFrame, threshold: float = 0.5) -> np.ndarray:
@@ -1864,6 +2359,245 @@ if __name__ == "__main__":
         Path(Config.SHAP_FINAL_MODEL_REPORT_PATH).write_text("".join(lines), encoding="utf-8")
         self.logger.log(self.name, "SHAP MD Report Saved", Config.SHAP_FINAL_MODEL_REPORT_PATH)
 
+    # ── Step 10: Model diagnostic charts ─────────────────────────────────────
+
+    def _tool_generate_model_charts(
+        self,
+        feature_cols: List[str],
+        estimator_name: str,
+    ) -> Dict[str, str]:
+        """Generate 9 model diagnostic charts and save to {RUN_DIR}/charts/.
+
+        Uses the best available eval split (OOT > valid > test).
+        Each chart is wrapped in try/except — failures are logged and skipped.
+        Returns dict {chart_key: saved_path} for charts that succeeded.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        chart_dir = Path(Config.CHART_DIR)
+        chart_dir.mkdir(parents=True, exist_ok=True)
+        saved: Dict[str, str] = {}
+
+        # Pick best eval split — prefer the clean final holdouts (oot, then test
+        # in simple mode). `valid` is in-sample after the train+valid refit, so it
+        # is the last resort only.
+        X_eval, y_eval, split_name = None, None, None
+        for sname in ("oot", "test", "valid"):
+            sdf = self.splits.get(sname, pd.DataFrame())
+            if len(sdf) < 50:
+                continue
+            avail = [c for c in feature_cols if c in sdf.columns]
+            if not avail:
+                continue
+            X_s = self._transform_X(sdf[avail])
+            y_s = pd.to_numeric(sdf[self.target_column], errors="coerce")
+            if y_s.nunique() < 2:
+                continue
+            X_eval, y_eval, split_name = X_s, y_s, sname
+            break
+
+        if X_eval is None:
+            self.logger.log(self.name, "Charts WARN", "No usable eval split (≥50 rows, 2 classes) — skipping all charts")
+            return saved
+
+        # Ensemble predict → calibrate
+        y_score = np.mean([m.predict_proba(X_eval)[:, 1] for m in self.ensemble_models], axis=0)
+        if self.calibrator is not None:
+            y_score = np.clip(self.calibrator.predict(y_score), 1e-15, 1 - 1e-15)
+        y_true = y_eval.values
+
+        self.logger.log(self.name, "Charts", f"generating on split='{split_name}' | n={len(y_true)}")
+
+        STYLE = {"dpi": 120, "bbox_inches": "tight"}
+        BLUE, RED, GREEN = "#2196F3", "#F44336", "#4CAF50"
+
+        def _decile_table(y_true, y_score, n=Config.CHART_N_DECILES):
+            df = pd.DataFrame({"score": y_score, "label": y_true})
+            df["decile"] = pd.qcut(-df["score"], q=n, labels=False, duplicates="drop") + 1
+            grp = df.groupby("decile").agg(
+                n_total=("label", "count"),
+                n_bad=("label", "sum"),
+                avg_score=("score", "mean"),
+            ).reset_index().sort_values("decile")
+            total_bad = max(y_true.sum(), 1)
+            grp["bad_rate"] = grp["n_bad"] / grp["n_total"]
+            grp["cum_bad"] = grp["n_bad"].cumsum()
+            grp["cum_total"] = grp["n_total"].cumsum()
+            grp["cum_bad_pct"] = grp["cum_bad"] / total_bad
+            return grp
+
+        # ── 1. ROC Curve ──────────────────────────────────────────────────
+        try:
+            from sklearn.metrics import roc_curve, roc_auc_score
+            fpr, tpr, _ = roc_curve(y_true, y_score)
+            auc = roc_auc_score(y_true, y_score)
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.plot(fpr, tpr, color=BLUE, lw=2, label=f"AUC = {auc:.4f}")
+            ax.plot([0, 1], [0, 1], "k--", lw=1)
+            ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
+            ax.set_title(f"ROC Curve — {estimator_name} ({split_name})")
+            ax.legend(loc="lower right"); ax.grid(linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(Config.CHART_ROC_PATH, **STYLE); plt.close(fig)
+            saved["roc"] = Config.CHART_ROC_PATH
+        except Exception as e:
+            self.logger.log(self.name, "Chart WARN", f"ROC failed: {e}")
+
+        # ── 2. Precision-Recall Curve ─────────────────────────────────────
+        try:
+            from sklearn.metrics import precision_recall_curve, average_precision_score
+            prec, rec, _ = precision_recall_curve(y_true, y_score)
+            ap = average_precision_score(y_true, y_score)
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.plot(rec, prec, color=BLUE, lw=2, label=f"AP = {ap:.4f}")
+            ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
+            ax.set_title(f"Precision-Recall Curve — {estimator_name} ({split_name})")
+            ax.legend(); ax.grid(linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(Config.CHART_PR_PATH, **STYLE); plt.close(fig)
+            saved["pr"] = Config.CHART_PR_PATH
+        except Exception as e:
+            self.logger.log(self.name, "Chart WARN", f"PR Curve failed: {e}")
+
+        # ── 3. KS Curve ───────────────────────────────────────────────────
+        try:
+            ks_df = (pd.DataFrame({"score": y_score, "label": y_true})
+                     .sort_values("score", ascending=False)
+                     .reset_index(drop=True))
+            total_bad  = max(int(y_true.sum()), 1)
+            total_good = max(int(len(y_true) - y_true.sum()), 1)
+            ks_df["cum_bad_rate"]  = ks_df["label"].cumsum() / total_bad
+            ks_df["cum_good_rate"] = (1 - ks_df["label"]).cumsum() / total_good
+            ks_df["ks"]            = ks_df["cum_bad_rate"] - ks_df["cum_good_rate"]
+            ks_val = ks_df["ks"].max()
+            ks_idx = ks_df["ks"].idxmax()
+            x_axis = np.linspace(0, 1, len(ks_df))
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.plot(x_axis, ks_df["cum_bad_rate"].values,  color=RED,   lw=2, label="Cumulative Bad")
+            ax.plot(x_axis, ks_df["cum_good_rate"].values, color=GREEN, lw=2, label="Cumulative Good")
+            ax.axvline(x=x_axis[ks_idx], color="gray", linestyle="--", lw=1)
+            ax.annotate(f"KS={ks_val:.4f}",
+                        xy=(x_axis[ks_idx], ks_df.loc[ks_idx, "cum_bad_rate"]),
+                        xytext=(5, -15), textcoords="offset points", fontsize=10, color="gray")
+            ax.set_xlabel("Population (sorted by score desc)"); ax.set_ylabel("Cumulative Rate")
+            ax.set_title(f"KS Curve — {estimator_name} ({split_name})")
+            ax.legend(); ax.grid(linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(Config.CHART_KS_PATH, **STYLE); plt.close(fig)
+            saved["ks"] = Config.CHART_KS_PATH
+            self.logger.log(self.name, "Chart KS", f"KS={ks_val:.4f}")
+        except Exception as e:
+            self.logger.log(self.name, "Chart WARN", f"KS Curve failed: {e}")
+
+        # ── 4-7. Decile-based charts (one pass) ───────────────────────────
+        try:
+            dec = _decile_table(y_true, y_score)
+            avg_bad_rate = float(y_true.mean())
+            dec_labels = dec["decile"].astype(str).tolist()
+            # Stay accurate when CHART_N_DECILES != 10 (no longer "deciles").
+            _nb = Config.CHART_N_DECILES
+            bucket_word = "Decile" if _nb == 10 else f"Bucket (of {_nb})"
+
+            # 4. Lift Chart
+            lift_vals = (dec["bad_rate"] / avg_bad_rate).tolist()
+            fig, ax = plt.subplots(figsize=(8, 5))
+            bars = ax.bar(dec_labels, lift_vals, color=BLUE)
+            ax.axhline(1.0, color=RED, linestyle="--", lw=1.5, label="Baseline (lift=1)")
+            for bar, val in zip(bars, lift_vals):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+                        f"{val:.2f}x", ha="center", va="bottom", fontsize=8)
+            ax.set_xlabel(f"{bucket_word} (1=highest score)"); ax.set_ylabel("Lift")
+            ax.set_title(f"Lift Chart — {estimator_name} ({split_name})")
+            ax.legend(); ax.grid(axis="y", linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(Config.CHART_LIFT_PATH, **STYLE); plt.close(fig)
+            saved["lift"] = Config.CHART_LIFT_PATH
+
+            # 5. Gain Chart
+            x_pct = (dec["cum_total"] / dec["cum_total"].iloc[-1] * 100).tolist()
+            y_pct = (dec["cum_bad_pct"] * 100).tolist()
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.plot([0] + x_pct, [0] + y_pct, color=BLUE, lw=2, marker="o", ms=4, label="Model")
+            ax.plot([0, 100], [0, 100], "k--", lw=1, label="Random")
+            ax.set_xlabel("% Population"); ax.set_ylabel("% Bad Captured")
+            ax.set_title(f"Gain Chart — {estimator_name} ({split_name})")
+            ax.legend(); ax.grid(linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(Config.CHART_GAIN_PATH, **STYLE); plt.close(fig)
+            saved["gain"] = Config.CHART_GAIN_PATH
+
+            # 6. Bad Rate by Decile
+            bad_rates = (dec["bad_rate"] * 100).tolist()
+            fig, ax = plt.subplots(figsize=(8, 5))
+            bars = ax.bar(dec_labels, bad_rates, color=BLUE)
+            ax.axhline(avg_bad_rate * 100, color=RED, linestyle="--", lw=1.5,
+                       label=f"Overall={avg_bad_rate:.1%}")
+            for bar, val in zip(bars, dec["bad_rate"].tolist()):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                        f"{val:.1%}", ha="center", va="bottom", fontsize=8)
+            ax.set_xlabel(f"{bucket_word} (1=highest score)"); ax.set_ylabel("Bad Rate (%)")
+            ax.set_title(f"Bad Rate by {bucket_word} — {estimator_name} ({split_name})")
+            ax.legend(); ax.grid(axis="y", linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(Config.CHART_BAD_RATE_DECILE_PATH, **STYLE); plt.close(fig)
+            saved["bad_rate_decile"] = Config.CHART_BAD_RATE_DECILE_PATH
+
+            # 7. Average Score by Decile
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(dec_labels, dec["avg_score"].tolist(), color=BLUE, lw=2, marker="o", ms=5)
+            for x, y in zip(dec_labels, dec["avg_score"].tolist()):
+                ax.annotate(f"{y:.3f}", xy=(x, y), xytext=(0, 6),
+                            textcoords="offset points", ha="center", fontsize=8)
+            ax.set_xlabel(f"{bucket_word} (1=highest score)"); ax.set_ylabel("Average Score")
+            ax.set_title(f"Average Score by {bucket_word} — {estimator_name} ({split_name})")
+            ax.grid(linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(Config.CHART_AVG_SCORE_DECILE_PATH, **STYLE); plt.close(fig)
+            saved["avg_score_decile"] = Config.CHART_AVG_SCORE_DECILE_PATH
+
+            self.logger.log(self.name, "Charts Saved", "Lift + Gain + Bad Rate + Avg Score by Decile")
+        except Exception as e:
+            self.logger.log(self.name, "Chart WARN", f"Decile charts failed: {e}")
+
+        # ── 8. Calibration Plot ───────────────────────────────────────────
+        try:
+            from sklearn.calibration import calibration_curve
+            frac_pos, mean_pred = calibration_curve(
+                y_true, y_score, n_bins=Config.CHART_N_DECILES, strategy="quantile")
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.plot(mean_pred, frac_pos, color=BLUE, lw=2, marker="o", ms=5, label="Model")
+            ax.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect calibration")
+            ax.set_xlabel("Mean predicted probability"); ax.set_ylabel("Fraction of positives")
+            ax.set_title(f"Calibration Plot — {estimator_name} ({split_name})")
+            ax.legend(); ax.grid(linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(Config.CHART_CALIBRATION_PATH, **STYLE); plt.close(fig)
+            saved["calibration"] = Config.CHART_CALIBRATION_PATH
+        except Exception as e:
+            self.logger.log(self.name, "Chart WARN", f"Calibration Plot failed: {e}")
+
+        # ── 9. Score Distribution (Good vs Bad) ───────────────────────────
+        try:
+            scores_good = y_score[y_true == 0]
+            scores_bad  = y_score[y_true == 1]
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.hist(scores_good, bins=50, alpha=0.6, color=GREEN, label="Good (0)", density=True)
+            ax.hist(scores_bad,  bins=50, alpha=0.6, color=RED,   label="Bad (1)",  density=True)
+            ax.set_xlabel("Score"); ax.set_ylabel("Density")
+            ax.set_title(f"Score Distribution (Good vs Bad) — {estimator_name} ({split_name})")
+            ax.legend(); ax.grid(linestyle=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(Config.CHART_SCORE_DIST_PATH, **STYLE); plt.close(fig)
+            saved["score_dist"] = Config.CHART_SCORE_DIST_PATH
+        except Exception as e:
+            self.logger.log(self.name, "Chart WARN", f"Score Distribution failed: {e}")
+
+        self.logger.log(self.name, "Charts Complete",
+            f"{len(saved)}/9 charts saved to {chart_dir}")
+        return saved
+
     # ── Split-mode entry point ────────────────────────────────────────────────
 
     def process_splits(
@@ -1875,6 +2609,9 @@ if __name__ == "__main__":
         oot_path: Optional[str] = None,
         date_col: Optional[str] = None,
         id_col: Optional[str] = None,
+        calibration: Optional[bool] = None,
+        temporal_freq: Optional[str] = None,
+        week_closing_day: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Load 3 pre-engineered partitions, add `_split_` marker, dispatch to `process`.
 
@@ -1918,6 +2655,9 @@ if __name__ == "__main__":
             date_col=date_col,
             id_col=id_col,
             oot_df=None,  # OOT comes through the marker — never via oot_df arg
+            calibration=calibration,
+            temporal_freq=temporal_freq,
+            week_closing_day=week_closing_day,
         )
 
     # ── Main process ──────────────────────────────────────────────────────────
@@ -1930,8 +2670,28 @@ if __name__ == "__main__":
         date_col: Optional[str] = None,
         id_col: Optional[str] = None,
         oot_df: Optional[pd.DataFrame] = None,
+        calibration: Optional[bool] = None,
+        temporal_freq: Optional[str] = None,
+        week_closing_day: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         self.logger.log(self.name, "Process Start", f"Shape={df.shape}")
+        # Per-run calibration override. None → keep the global Config default set
+        # in __init__; True/False → override CALIBRATION_ENABLED for this run only.
+        if calibration is not None:
+            self.calibration_enabled = bool(calibration)
+            self.logger.log(self.name, "Calibration override",
+                f"calibration={self.calibration_enabled} (per-run arg overrides "
+                f"CALIBRATION_ENABLED={Config.CALIBRATION_ENABLED})")
+        # Per-run temporal-frequency override. None → keep Config default; weekly
+        # is opt-in here. week_closing_day picks the W-anchor (auto from data if
+        # omitted). Both feed _resolve_period_freq during _tool_split_data.
+        if temporal_freq is not None:
+            self.temporal_freq = str(temporal_freq).lower()
+            self.logger.log(self.name, "Temporal freq override",
+                f"temporal_freq={self.temporal_freq} (per-run arg overrides "
+                f"TEMPORAL_FREQ={Config.TEMPORAL_FREQ})")
+        if week_closing_day is not None:
+            self.week_closing_day = str(week_closing_day).strip().upper()
         self.logger.log(self.name, "Previous Agent Summary",
             previous_report.get("summary", "No summary"))
 
@@ -2109,14 +2869,27 @@ if __name__ == "__main__":
                 f"{k.replace('_auc', '')}_gap={v:.1%}" for k, v in overfit_info["gaps"].items()
             )
             self.logger.log(self.name, "OVERFIT DETECTED",
-                f"valid_auc={overfit_info['valid_auc']:.4f} | {gap_log} "
+                f"ref_auc(cv_oof)={overfit_info['ref_auc']:.4f} | {gap_log} "
                 f"(threshold={Config.OVERFIT_THRESHOLD:.0%}) → requesting LLM-guided retrain")
 
             import io as _io
             import joblib as _jl
+            # Snapshot the FULL training state, not just self.model: production
+            # scoring (and the diagnostic charts) read self.ensemble_models +
+            # self.calibrator, which _tool_train_final_model overwrites on the
+            # retry below. If we only restored self.model on revert, the saved
+            # artifact would mix the original primary fit with the *discarded*
+            # retry ensemble/calibrator → inconsistent deployed model.
             _buf = _io.BytesIO()
-            _jl.dump(self.model, _buf)
-            _orig_model_bytes = _buf.getvalue()
+            _jl.dump(
+                {
+                    "model":           self.model,
+                    "ensemble_models": self.ensemble_models,
+                    "calibrator":      self.calibrator,
+                },
+                _buf,
+            )
+            _orig_state_bytes = _buf.getvalue()
             orig_best_params = best_params
 
             retrain_params = self._get_antioverfitting_params(
@@ -2140,11 +2913,15 @@ if __name__ == "__main__":
                     f"(was {orig_holdout:.4f}) | still_overfit={overfit_retry['detected']}")
                 overfit_info["retrain"] = _status
             else:
-                self.model = _jl.load(_io.BytesIO(_orig_model_bytes))
+                _orig_state = _jl.load(_io.BytesIO(_orig_state_bytes))
+                self.model           = _orig_state["model"]
+                self.ensemble_models = _orig_state["ensemble_models"]
+                self.calibrator      = _orig_state["calibrator"]
                 best_params = orig_best_params
                 self.logger.log(self.name, "Overfit Retry Reverted",
                     f"Retrain degraded {_holdout_key}: "
-                    f"{retry_holdout:.4f} < {orig_holdout:.4f} → original model restored")
+                    f"{retry_holdout:.4f} < {orig_holdout:.4f} → original model "
+                    f"(+ensemble +calibrator) restored")
                 overfit_info["retrain"] = "reverted"
         else:
             overfit_info["retrain"] = "not_needed"
@@ -2153,7 +2930,15 @@ if __name__ == "__main__":
         self._save_model(final_features)
         self._generate_model_code(best_estimator, best_params, final_features)
 
-        # ── 9. SHAP visual + LLM-explained top features ──────────────────────
+        # ── 9. Model diagnostic charts ────────────────────────────────────────
+        chart_paths: Dict[str, str] = {}
+        try:
+            chart_paths = self._tool_generate_model_charts(final_features, best_estimator)
+        except Exception as e:
+            self.logger.log(self.name, "Charts ERROR",
+                f"chart generation failed: {e} — continuing without charts")
+
+        # ── 10. SHAP visual + LLM-explained top features ─────────────────────
         # Runs on the *final* model so importances reflect what actually ships.
         # Gracefully degrades: missing shap → feature_importances_; LLM failure
         # → CSV without narrative columns. Toggle with SHAP_FINAL_EXPLAIN_ENABLED.
@@ -2168,7 +2953,7 @@ if __name__ == "__main__":
                 self.logger.log(self.name, "SHAP Explain ERROR",
                     f"final-model SHAP explain failed: {e} — continuing without it")
 
-        # ── 10. LLM summary ──────────────────────────────────────────────────
+        # ── 11. LLM summary ──────────────────────────────────────────────────
         summary = self._generate_llm_summary(
             best_estimator, best_params, metrics,
             len(feat_avail), len(rfe_features), len(psi_features),
@@ -2177,11 +2962,12 @@ if __name__ == "__main__":
             overfit_info=overfit_info,
         )
 
-        # ── 11. Save report ──────────────────────────────────────────────────
+        # ── 12. Save report ──────────────────────────────────────────────────
         report = {
             "agent": self.name,
             "best_estimator": best_estimator,
             "best_params": best_params,
+            "chart_paths": chart_paths,
             "feature_pipeline": {
                 "n_init": len(feat_avail),
                 "n_after_rfe": len(rfe_features),
@@ -2197,6 +2983,7 @@ if __name__ == "__main__":
             ),
             "splits": {k: len(v) for k, v in self.splits.items()
                        if isinstance(v, pd.DataFrame)},
+            "temporal": self.temporal_meta,
             "metrics": metrics,
             "summary": summary,
         }

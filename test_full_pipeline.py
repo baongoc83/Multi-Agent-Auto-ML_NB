@@ -129,6 +129,7 @@ def main():
             entity_id_col="SK_ID_CURR",
             composite_key_cols=["SK_ID_CURR"],
             domain="credit_risk",
+            product_type="credit_card",
             model_type="binary_classification",
         )
 
@@ -225,6 +226,7 @@ def main():
             (Config.SHAP_BEESWARM_PATH,              "SHAP final beeswarm plot    — Agent 3"),
             (Config.SHAP_FEATURE_REPORT_PATH,        "SHAP top features CSV       — Agent 3"),
             (Config.SHAP_FINAL_MODEL_REPORT_PATH,    "SHAP combined markdown rpt  — Agent 3"),
+            *Config.chart_files(),                   # 9 model diagnostic charts
             (Config.FINAL_MODEL_PATH,                "Trained model artifact      — Agent 3"),
             (Config.FINAL_MODEL_CODE_PATH,           "Standalone inference code   — Agent 3"),
             (Config.FINAL_REPORT_PATH,               "Full pipeline report"),

@@ -151,7 +151,6 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 |---------|----------|-------|
 | `NULL_DROP_THRESHOLD` | `0.8` | Cột có tỷ lệ null > 80% sẽ bị gợi ý xóa |
 | `HIGH_CARDINALITY_THRESHOLD` | `50` | Cột có > 50 giá trị unique sẽ bỏ qua bước value_counts trong log |
-| `SAMPLE_STATS_PREVIEW` | `3` | Số cột sample lấy stats để đưa vào prompt LLM |
 | `DUPLICATE_PCT_THRESHOLD` | `1.0` | Tỷ lệ row trùng lặp > 1% → gợi ý drop duplicates |
 | `PK_VIOLATION_PCT_THRESHOLD` | `1.0` | Tỷ lệ vi phạm composite key > 1% → gợi ý deduplicate_by_key |
 | `ENTITY_ORPHAN_PCT_THRESHOLD` | `5.0` | Tỷ lệ entity không có identity anchor > 5% → cảnh báo data quality |
@@ -171,12 +170,24 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 | `HIGH_CORRELATION_THRESHOLD` | `0.8` | Cặp feature có correlation > 0.8 → gợi ý bỏ một cái (multicollinearity) |
 | `LOW_CORRELATION_THRESHOLD` | `0.04` | Correlation với target < 0.04 → feature yếu, ưu tiên loại |
 | `MIN_CORRELATION_THRESHOLD` | `0.001` | Correlation với target < 0.001 → feature gần như vô nghĩa, flag xóa |
-| `TOP_K_FEATURES_CAP` | `350` | Trần tối đa số feature được chọn (dù `TOP_K_RATIO` tính ra nhiều hơn vẫn bị cap) |
+| `TOP_K_FEATURES_CAP` | `800` | Trần tối đa số feature được chọn (dù `TOP_K_RATIO` tính ra nhiều hơn vẫn bị cap) |
 | `TOP_K_RATIO` | `0.70` | Tỷ lệ feature giữ lại khi `select_top_features` (0 < ratio ≤ 1) |
 | `FEATURE_META_NUMERIC_RATIO` | `0.6` | Tỷ lệ cột numeric đưa metadata vào prompt LLM (0 < ratio ≤ 1) |
-| `FEATURE_META_MAX_NUMERIC_COLS` | `200` | Trần cứng số cột numeric đưa vào prompt (an toàn cho dataset rất rộng) |
-| `FEATURE_META_MAX_CATEGORICAL_COLS` | `40` | Tối đa số cột categorical đưa metadata đầy đủ vào prompt |
-| `MAX_DESC_PER_GROUP` | `30` | Tối đa số description hiển thị mỗi group trong khối column-description của prompt |
+| `FEATURE_META_MAX_NUMERIC_COLS` | `300` | Trần cứng số cột numeric đưa vào prompt (an toàn cho dataset rất rộng) |
+| `FEATURE_META_MAX_CATEGORICAL_COLS` | `80` | Tối đa số cột categorical đưa metadata đầy đủ vào prompt |
+| `MAX_DESC_PER_GROUP` | `50` | Tối đa số description hiển thị mỗi group trong khối column-description của prompt |
+| `TARGET_NEW_FEATURE_COUNT` | `25` | Số interaction feature mục tiêu LLM sinh mỗi run (Agent 2 dùng để chia phân bổ FAMILY A–H) |
+| `FE_CREATE_INTERACTIONS_ENABLED` | `true` | Công tắc bước tạo interaction feature. `false` → bỏ qua toàn bộ action `create_interaction` (chỉ dùng cột gốc + encoded; IV/WoE/selection vẫn chạy). Override per-run từ pipeline: `pipeline.run(..., create_interactions=False)`; hoặc gọi agent trực tiếp: `process(...)` / `process_splits(...)` / `fit_transform(..., create_interactions=False)` |
+
+### IV / WoE feature selection (chuẩn vàng credit-risk)
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `IV_BINS_DEFAULT` | `10` | Số quantile bin của `compute_iv` (chuẩn Siddiqi); tăng 20 cho phân phối dày, giảm 5 nếu phần lớn feature < 50 unique |
+| `IV_LEAKAGE_THRESHOLD` | `0.50` | IV ≥ ngưỡng này → flag leakage-suspect; cũng là cận trên của band "strong" (useless < 0.02 ≤ weak < 0.10 ≤ medium < 0.30 ≤ strong < ngưỡng ≤ suspect) |
+| `MULTICOLLINEARITY_THRESHOLD` | `0.85` | \|Pearson\| vượt ngưỡng → `select_top_features(criterion='iv')` bỏ feature IV thấp hơn trong cặp; siết 0.75 cho scorecard nghiêm |
+| `IV_MAX_NULL_RATIO` | `0.50` | Bỏ qua compute IV cho cột missing trên mức này (IV bị NaN-bin chi phối, vô nghĩa) |
+| `WOE_MIN_IV` | `0.02` | IV tối thiểu để được `apply_woe_transform`; dưới mức này WoE thêm noise hơn là tuyến tính hóa |
 
 ---
 
@@ -186,14 +197,28 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 |---------|----------|-------|
 | `TRAIN_TEST_SPLIT_SIZE` | `0.2` | Tỷ lệ valid trong pool sau khi tách OOT (20% pool → valid) |
 | `RANDOM_STATE` | `42` | Seed cố định cho tất cả random operations (split, model, Optuna) |
-| `MAX_TRAINING_ITERATIONS` | `3` | Số vòng lặp feedback tối đa của training loop |
-| `MODELS_TO_COMPARE` | `XGBoost,RandomForest,ExtraTrees,LightGBM,CatBoost` | Danh sách model FLAML sẽ thử (comma-separated) |
 | `CLASSIFICATION_UNIQUE_THRESHOLD` | `10` | Target có ≤ 10 giá trị unique → classification, ngược lại → regression |
 | `CV_N_SPLITS` | `5` | Số fold StratifiedKFold cho đánh giá CV cuối cùng của model |
-| `TARGET_ROC_AUC` | `0.85` | Ngưỡng AUC mục tiêu để pipeline coi là "đạt" |
-| `TARGET_F1` | `0.80` | Ngưỡng F1 mục tiêu |
-| `TARGET_R2` | `0.75` | Ngưỡng R² mục tiêu (bài toán regression) |
-| `TARGET_ACCURACY` | `0.85` | Ngưỡng Accuracy mục tiêu |
+
+---
+
+## Probability Calibration (IFRS9 / scorecard PD)
+
+Bọc model cuối bằng isotonic/sigmoid calibration fit trên held-out valid split → raw ranking score thành xác suất hiệu chỉnh (well-calibrated PD). **Là lựa chọn, không bị force** — bật mặc định; tắt thì agent log `disabled by CALIBRATION_ENABLED=false` và `self.calibrator=None`, mọi downstream (metrics, save model, charts) bỏ qua sạch.
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `CALIBRATION_ENABLED` | `true` | `true` → fit calibrator trên split đầu tiên đủ điều kiện (`valid_random` → `valid_temporal` → `valid` → `oot`, cần ≥ 100 rows & 2 class). `false` → tắt hoàn toàn, model trả raw probability. AUC neutral; cải thiện lớn Brier/log-loss |
+| `CALIBRATION_METHOD` | `isotonic` | `isotonic` (non-parametric, banking default, cần ≥ ~1000 rows calibration) hoặc `sigmoid` (Platt scaling, rẻ hơn, hợp calibration set nhỏ) |
+
+---
+
+## Multi-seed Bagging (variance reduction)
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `MULTI_SEED_ENABLED` | `true` | `true` → train `MULTI_SEED_N` bản best-config với seed khác nhau, average `predict_proba`. `false` → single-model legacy |
+| `MULTI_SEED_N` | `5` | Số seed khi bật. +0.1–0.3% AUC + PD ổn định hơn giữa các lần retrain |
 
 ---
 
@@ -201,10 +226,16 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
-| `OOT_INIT_MONTHS` | `2` | Sàn tối thiểu số tháng luôn đưa vào OOT (dù tỷ lệ chưa đủ) |
+| `TEMPORAL_FREQ` | `auto` | Độ phân giải mọi lát cắt thời gian (OOT / valid_temporal / stability). `auto` = bucket theo **tháng** (nhận `monthly_snapshot` vs `intra_month`, **không bao giờ tự đoán weekly**); `weekly` = bucket theo **tuần** (phải khai báo rõ); `monthly` = ép tháng. |
+| `WEEK_CLOSING_DAY` | `` (auto) | Ngày chốt tuần (snapshot/cutoff) khi `TEMPORAL_FREQ=weekly`: `MON`..`SUN`. Để trống → tự lấy weekday phổ biến nhất trong `date_col`. |
+| `OOT_INIT_MONTHS` | `2` | Sàn tối thiểu số **kỳ** (tháng/tuần) luôn đưa vào OOT (dù tỷ lệ chưa đủ) |
 | `OOT_MIN_RATIO` | `0.15` | Mở rộng OOT cho đến khi đạt ≥ 15% tổng data |
 | `OOT_MAX_RATIO` | `0.20` | Trần cứng OOT — thu hẹp nếu vượt 20% |
 | `VALID_TEMPORAL_RATIO` | `0.20` | Tỷ lệ valid_temporal trong tổng valid set (20% valid gần OOT boundary nhất) |
+
+> **Weekly model**: chỉ bật bằng param (không auto). Có thể override per-run thay vì env:
+> `pipeline.run(..., temporal_freq="weekly", week_closing_day="FRI")`.
+> Khi đó OOT lấy trailing whole-weeks, valid_temporal snap nguyên tuần (tránh leak trong cùng tuần), stability Gini group theo tuần; report ghi `temporal.cadence="weekly_snapshot"` + số tuần mỗi split. `OOT_INIT_MONTHS` / `STABILITY_MIN_MONTHS` được hiểu là **số kỳ** (tuần) trong chế độ weekly — cân nhắc tăng nếu lịch sử tuần dài.
 
 ---
 
@@ -212,10 +243,10 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
-| `FLAML_TIME_BUDGET` | `600` | Thời gian tối đa (giây) FLAML được phép tìm kiếm model tốt nhất |
+| `FLAML_TIME_BUDGET` | `3600` | Thời gian tối đa (giây) FLAML được phép tìm kiếm model tốt nhất |
 | `FLAML_ESTIMATORS` | `xgboost,lgbm,catboost,rf,extra_tree` | Danh sách estimator FLAML thử |
 | `FLAML_N_SPLITS` | `5` | Số fold CV khi FLAML không có validation set riêng |
-| `FLAML_MAX_ROWS` | `100000` | Trần số row truyền vào FLAML; sample ngẫu nhiên nếu dataset lớn hơn (tránh OOM khi FLAML copy DataFrame) |
+| `FLAML_MAX_ROWS` | `500000` | Trần số row truyền vào FLAML; sample ngẫu nhiên nếu dataset lớn hơn (tránh OOM khi FLAML copy DataFrame) |
 
 ---
 
@@ -223,14 +254,14 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
-| `OPTUNA_N_TRIALS` | `50` | Số trial tối đa Optuna chạy để tìm hyperparams tốt nhất |
-| `OPTUNA_TIMEOUT` | `600` | Timeout (giây) cho toàn bộ Optuna study |
-| `LR_MIN` / `LR_MAX` | `0.01` / `0.3` | Khoảng learning rate Optuna tìm kiếm (tất cả model) |
-| `MAX_DEPTH_MIN` / `MAX_DEPTH_MAX` | `3` / `10` | Khoảng max_depth cây (XGBoost, LGBM, RF, ExtraTrees) |
-| `N_ESTIMATORS_MIN` / `N_ESTIMATORS_MAX` | `100` / `1000` | Khoảng số cây |
+| `OPTUNA_N_TRIALS` | `300` | Số trial tối đa Optuna chạy để tìm hyperparams tốt nhất |
+| `OPTUNA_TIMEOUT` | `7200` | Timeout (giây) cho toàn bộ Optuna study (thường bind trước `N_TRIALS`) |
+| `LR_MIN` / `LR_MAX` | `0.005` / `0.3` | Khoảng learning rate Optuna tìm kiếm (tất cả model) |
+| `MAX_DEPTH_MIN` / `MAX_DEPTH_MAX` | `3` / `12` | Khoảng max_depth cây (XGBoost, LGBM, RF, ExtraTrees) |
+| `N_ESTIMATORS_MIN` / `N_ESTIMATORS_MAX` | `100` / `2000` | Khoảng số cây (cận trên lớn vô hại nhờ early stopping) |
 | `SUBSAMPLE_MIN` / `SUBSAMPLE_MAX` | `0.4` / `1.0` | Khoảng tỷ lệ sample row/col khi train mỗi cây |
-| `NUM_LEAVES_MIN` / `NUM_LEAVES_MAX` | `15` / `256` | Khoảng num_leaves riêng của LightGBM |
-| `CB_DEPTH_MIN` / `CB_DEPTH_MAX` | `4` / `10` | Khoảng depth riêng của CatBoost |
+| `NUM_LEAVES_MIN` / `NUM_LEAVES_MAX` | `15` / `512` | Khoảng num_leaves riêng của LightGBM |
+| `CB_DEPTH_MIN` / `CB_DEPTH_MAX` | `4` / `12` | Khoảng depth riêng của CatBoost |
 
 ---
 
@@ -238,8 +269,8 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
-| `RFE_TARGET_FEATURES` | `50` | Số feature muốn giữ lại sau RFE |
-| `RFE_STEP` | `0.05` | Mỗi vòng RFE loại bỏ 5% số feature còn lại |
+| `RFE_TARGET_FEATURES` | `150` | Số feature muốn giữ lại sau RFE |
+| `RFE_STEP` | `0.01` | Mỗi vòng RFE loại bỏ 1% số feature còn lại (bước nhỏ → nhiều vòng refit hơn) |
 | `RFE_CV_SPLITS` | `3` | Số fold CV dùng trong RFECV (chỉ khi `ENABLE_RFECV=true`) |
 | `ENABLE_RFECV` | `false` | Bật RFECV (tự chọn số feature tối ưu qua CV). `false` = dùng RFE cố định |
 | `RFE_N_ESTIMATORS` | `200` | n_estimators cho base model fit trong RFE selection |
@@ -250,7 +281,7 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
-| `PSI_THRESHOLD` | `0.3` | PSI > 0.3 → feature drift quá lớn giữa train và OOT → DROP |
+| `PSI_THRESHOLD` | `0.35` | PSI > 0.35 → feature drift quá lớn giữa train và OOT → DROP (nâng từ 0.30 vì SHAP+PSI prune đã cân PSI vs importance) |
 | `PSI_BINS` | `100` | Số bin tính PSI (nhiều bin → chính xác hơn, cần đủ data) |
 
 ---
@@ -260,8 +291,8 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
 | `STABILITY_MIN_MONTHS` | `6` | Cần ít nhất 6 tháng data mới chạy stability check, ít hơn → skip |
-| `STABILITY_GINI_STD_THRESHOLD` | `0.15` | Độ lệch chuẩn Gini theo tháng > 0.15 → feature không ổn định → DROP |
-| `STABILITY_MIN_GINI` | `0.02` | Gini trung bình < 0.02 → feature gần như không có predictive power → DROP |
+| `STABILITY_GINI_STD_THRESHOLD` | `0.20` | Độ lệch chuẩn Gini theo tháng > 0.20 → feature không ổn định → DROP (nâng từ 0.15 để prune có thêm ứng viên cân với SHAP) |
+| `STABILITY_MIN_GINI` | `0.01` | Gini trung bình < 0.01 → feature gần như không có predictive power → DROP |
 
 ---
 
@@ -279,11 +310,12 @@ Loại bỏ feature có SHAP importance thấp + PSI drift cao theo từng bư�
 
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
-| `SHAP_N_ESTIMATORS` | `100` | n_estimators cho model nhanh fit tại mỗi step pruning |
-| `SHAP_SAMPLE_SIZE` | `2000` | Tối đa số row sample để tính SHAP value (cân bằng tốc độ vs độ chính xác) |
-| `SHAP_PSI_MAX_NO_IMPROVE` | `2` | Dừng pruning sau N step liên tiếp không cải thiện AUC |
+| `SHAP_N_ESTIMATORS` | `200` | n_estimators cho model nhanh fit tại mỗi step pruning |
+| `SHAP_SAMPLE_SIZE` | `20000` | Tối đa số row sample để tính SHAP value (5K cho rank nhiễu ở 1.5M+ rows; 20K ổn định prune run-to-run) |
+| `SHAP_PSI_MAX_NO_IMPROVE` | `3` | Dừng pruning sau N step liên tiếp không cải thiện AUC (nâng từ 2 để vượt plateau cục bộ) |
 | `SHAP_PSI_MIN_FEATURES_FLOOR` | `5` | Sàn cứng tối thiểu số feature giữ lại sau pruning |
 | `SHAP_PSI_MIN_FEATURES_RATIO` | `0.10` | Sàn tương đối: giữ ít nhất 10% × `MAX_FINAL_FEATURES` |
+| `FEATURE_CAP_POLICY` | `auc_first` | Khi chạm streak early-stop mà count vẫn > `MAX_FINAL_FEATURES`: `auc_first` = ưu tiên AUC, dừng prune (cap là target mềm); `cap_first` = prune tiếp tới ≤ cap rồi mới bật lại early-stop |
 
 ---
 
@@ -312,7 +344,17 @@ Sau khi final model train xong (kể cả sau overfit-retrain), Agent 3 compute 
 
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
-| `OVERFIT_THRESHOLD` | `0.12` | Gap tương đối `(valid_auc - holdout_auc) / valid_auc` > 12% → flag overfit và trigger LLM-guided retrain |
+| `OVERFIT_THRESHOLD` | `0.12` | Gap tương đối `(ref_auc - holdout_auc) / ref_auc` > 12% → flag overfit và trigger LLM-guided retrain. `ref_auc` = `cv_auc_mean` (OOF in-time, fallback `valid_auc` → `valid_temporal_auc`); holdout = `oot`/`test`. Đã đổi từ in-sample `valid_auc` sang OOF sau refactor refit-on-train+valid để tránh false trigger |
+
+---
+
+## Model Diagnostic Charts
+
+Agent 3 sinh 9 chart chẩn đoán (`{run_dir}/charts/*.png`) sau khi train model cuối: ROC, PR, KS, Lift, Gain, Bad-rate by decile, Avg-score by decile, Calibration, Score distribution. Nhúng vào `final_report.md` qua `pipeline._render_charts_section`.
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `CHART_N_DECILES` | `10` | Số quantile-bucket cho các chart Lift / Gain / Bad-rate / Avg-score **và** calibration reliability plot. `10` = decile cổ điển. Tăng (vd `20`) để mịn hơn trên eval split lớn; giảm (vd `5`) trên split nhỏ để tránh bucket rỗng. Khi `≠ 10`, nhãn trục/title tự đổi "Decile" → "Bucket (of N)" |
 
 ---
 

@@ -9,7 +9,11 @@ Note: numeric_features_shown / categorical_features_shown indicate how many colu
 <<COL_DESC_SECTION>>
 TARGET COLUMN: <<TARGET_COLUMN>>
 
-Decide which feature engineering actions to perform. Follow the action order:
-  encode_all_categorical → create_interaction(s) → correlation_analysis → select_top_features
+Decide which feature engineering actions to perform. Follow the strict action order:
+  encode_all_categorical → create_interaction(s) → compute_iv → apply_woe_transform → correlation_analysis → select_top_features(criterion='iv')
+
+compute_iv MUST run before apply_woe_transform AND before select_top_features
+when criterion='iv' is used — otherwise apply_woe_transform errors out and
+the selector silently falls back to f_classif / f_regression.
 
 Provide your response in the JSON format specified.
