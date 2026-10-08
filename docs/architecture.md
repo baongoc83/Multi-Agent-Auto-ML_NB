@@ -13,7 +13,7 @@ multi-agent-auto-ml-v1.1/
 │
 ├── main.py                  ◄── CLI entry point
 ├── pipeline.py              ◄── AutoMLPipeline orchestrator + Stage 0a/0b
-├── handoff.py               ◄── State holder cho single-file mode
+├── splitting.py             ◄── Chia train/valid/oot (dùng chung pipeline + Agent 3)
 ├── logger.py                ◄── AgentLogger (log + markdown report)
 ├── config.py                ◄── Config + LLM client factory
 ├── config_gateway.py        ◄── GatewayConfig override khi LLM_BACKEND=gateway
@@ -70,7 +70,7 @@ flowchart TD
     Pipe --> A1[DataCleanerAgent + CleaningSpec]
     Pipe --> A2[FeatureEngineerAgent + FeatureSpec]
     Pipe --> A3[TrainModelAgent]
-    Pipe --> HO[Handoff<br/>chỉ dùng single-file mode]
+    Pipe --> SP[splitting.auto_split<br/>chia train/valid/oot]
 
     A1 -.kế thừa.-> Base[BaseAgent]
     A2 -.kế thừa.-> Base
@@ -134,12 +134,11 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    Raw[(Raw data)] --> A1
-    A1[Agent 1<br/>clean] -->|clean_data.parquet<br/>+ report1| HO1[Handoff]
-    HO1 --> A2[Agent 2<br/>feature engineering]
-    A2 -->|engineered_data.parquet<br/>+ report2| HO2[Handoff]
-    HO2 --> A3[Agent 3<br/>auto-split<br/>+ train + eval]
-    A3 --> Outs[(final_model.pkl<br/>+ inference code<br/>+ reports)]
+    Raw[(Raw data)] --> SP[Stage 0<br/>splitting.auto_split]
+    SP -->|"train / valid / oot or test"| A1
+    A1[Agent 1<br/>fit on train<br/>replay on holdouts] -->|clean_*.parquet<br/>+ report1| A2
+    A2[Agent 2<br/>fit on train<br/>replay on holdouts] -->|engineered_*.parquet<br/>+ report2| A3
+    A3[Agent 3<br/>train + eval<br/>theo split đã chia] --> Outs[(final_model.pkl<br/>+ replay bundle<br/>+ reports)]
 
     style A1 fill:#a8d8ea
     style A2 fill:#ffd3b6
@@ -829,43 +828,33 @@ Benchmark (50k × 1400 mixed): 1.82 GB → 190 MB (≈9.6×). Cho case 100k × 1
 
 ---
 
-## 9. Handoff — single-file mode only
+## 9. Replay bundle — chạy lại một run ở môi trường khác
+
+Mỗi run ghi 6 file đủ để tái lập toàn trình (split → transform → retrain | score).
+Chi tiết đầy đủ: [replay.md](replay.md).
 
 ```mermaid
 sequenceDiagram
-    participant P as Pipeline
-    participant H as Handoff
-    participant A1 as Agent 1
-    participant A2 as Agent 2
-    participant A3 as Agent 3
-    participant FS as Filesystem
+    participant U as User
+    participant R as replay_pipeline.py
+    participant M as replay_manifest.json
+    participant S as split_assignment.parquet
+    participant SP as cleaning_spec.pkl<br/>feature_spec.pkl
+    participant A3 as TrainModelAgent
 
-    Note over P,A3: SINGLE-FILE MODE — Handoff caches data between agents
-
-    P->>A1: process(input_path)
-    A1->>FS: write clean_data.parquet
-    A1-->>P: (path, report1)
-    P->>H: set_data(path, report1, "DataCleaner")
-    H->>H: invalidate cache
-
-    P->>H: get_data()
-    H->>FS: load_dataframe (cached)
-    H-->>P: DataFrame
-    P->>H: get_report()
-    H-->>P: report1
-
-    P->>A2: process(df, report1, target)
-    A2->>FS: write engineered_data.parquet
-    A2-->>P: (path, report2)
-    P->>H: set_data(path, report2, "FeatureEngineer")
-
-    P->>H: get_data() + get_report()
-    H-->>P: DataFrame + report2
-
-    P->>A3: process(df, report2, target, oot_df=None)
-    A3->>FS: write final_model.pkl + reports
-    A3-->>P: (metrics, report3)
+    U->>R: replay_pipeline.py <raw> --mode retrain
+    R->>M: đọc quyết định đã chốt<br/>(estimator, best_params, final features)
+    R->>S: join theo key + _key_occ_<br/>sort theo _split_pos_
+    Note over R,S: dựng lại ĐÚNG partition + ĐÚNG thứ tự dòng
+    R->>SP: CleaningSpec.apply (mọi partition)<br/>+ apply_row_ops (chỉ train)
+    R->>SP: FeatureSpec.apply
+    R->>A3: replay_fit(...) — bỏ FLAML/Optuna/RFE/PSI/SHAP
+    A3-->>R: metrics
+    R->>M: so với expected_metrics
+    R-->>U: "Reproduced exactly" hoặc chỉ ra chặng nào sai
 ```
+
+`--mode score` bỏ bước split và `replay_fit`, chỉ load `final_model.pkl` để chấm điểm dữ liệu mới.
 
 ---
 

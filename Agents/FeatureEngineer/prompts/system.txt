@@ -172,6 +172,16 @@ STABILITY AWARENESS (DATE_COL = <<DATE_COL>>)
    common. Cross-group features (application × bureau, application × cc)
    are usually more stable than within-bureau composites.
 
+   After your actions run, this agent re-scores every selected feature's IV on
+   the OOT partition using the bin edges frozen from TRAIN, and reports
+   iv_train vs iv_oot plus the correlation between the two WoE vectors. That
+   catches what PSI cannot: a feature whose distribution is stable but whose
+   relationship to the target weakens or REVERSES out of time. You do not emit
+   an action for this — it is an automatic post-check. What it means for you:
+   prefer features whose relationship to default is structural (debt burden,
+   utilisation, LTV) over ones that ride a point-in-time behavioural regime,
+   because the latter are what show up as WoE reversals.
+
 LEAKAGE AUDIT — reject any feature where:
    • The parent column could have been computed after the target event
      (post-default flags, post-charge-off updates).

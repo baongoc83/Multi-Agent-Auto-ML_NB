@@ -1,6 +1,7 @@
 import re
 import time
 from typing import Any, Dict, Optional
+import numpy as np
 import pandas as pd
 from logger import AgentLogger
 from config import Config
@@ -276,6 +277,15 @@ class BaseAgent:
             f"temp={Config.LLM_TEMPERATURE} | top_p={Config.LLM_TOP_P} | "
             f"max_tokens={effective_max} | json_mode={json_mode}")
 
+        # ── No proxy hosted: straight to the direct providers ─────────────────
+        if getattr(Config, "LLM_SKIP_PROXY", False):
+            if Config.OPENAI_API_KEY:
+                try:
+                    return self._call_direct_api(system_prompt, prompt, json_mode, max_tokens)
+                except Exception as eo:
+                    self.logger.log(self.name, "ERROR", f"OpenAI direct failed: {eo}")
+            return self._call_claude_api(system_prompt, prompt, json_mode, max_tokens)
+
         # ── Primary attempt ───────────────────────────────────────────────────
         try:
             result = self._call_via_proxy(model, system_prompt, prompt, json_mode, max_tokens)
@@ -531,6 +541,101 @@ class BaseAgent:
 
     @classmethod
     def load_dataframe(cls, path: str) -> pd.DataFrame:
+        """Load a DataFrame and normalise it to a reader-independent form.
+
+        See `normalize_loaded_frame` for why the normalisation exists. Every
+        agent and the pipeline load through here, so a frame can never reach
+        feature engineering still carrying a reader's private dtype choices.
+        """
+        return cls.normalize_loaded_frame(cls._load_dataframe_raw(path))
+
+    @staticmethod
+    def normalize_loaded_frame(df: pd.DataFrame) -> pd.DataFrame:
+        """Erase the differences between file readers, in place where possible.
+
+        The same table read as CSV, parquet, Excel or from a database arrives
+        with different dtypes, and those differences change the MODEL — not
+        just the representation:
+
+          * An integer column containing nulls is float64 from CSV/parquet but
+            Int64 from a DB driver or the pyarrow backend. `astype(str)` then
+            yields "1.0" vs "1", so the label encoder builds different classes
+            and `get_dummies` emits differently-named columns.
+          * Nulls stringify as "nan" (numpy object), "None" (after a parquet
+            round-trip) or "<NA>" (nullable string dtype) — three spellings of
+            one thing.
+          * A date is datetime64 from parquet/Excel but plain text from CSV.
+            Downstream that is the difference between a feature holding epoch
+            nanoseconds and one holding a string category.
+          * A SQL NUMERIC arrives as decimal.Decimal objects in an object
+            column, which is neither numeric nor categorical to pandas.
+
+        Normalising at the boundary means the rest of the pipeline sees one
+        canonical frame and no component has to defend itself. The choices here
+        follow what `pd.read_csv` produces, because CSV is the format with the
+        least metadata — anything richer can be reduced to it, not the reverse.
+        """
+        from decimal import Decimal
+
+        for col in df.columns:
+            s = df[col]
+            dt = s.dtype
+
+            # pandas nullable extension dtypes -> numpy equivalents + np.nan
+            if isinstance(dt, pd.api.extensions.ExtensionDtype) and not isinstance(
+                    dt, pd.CategoricalDtype):
+                kind = getattr(dt, "kind", None)
+                if kind in ("i", "u", "f"):
+                    df[col] = pd.to_numeric(s, errors="coerce").astype("float64")
+                    continue
+                if kind == "b":
+                    df[col] = s.astype("object").where(s.notna(), np.nan)
+                    continue
+                # string[python] / string[pyarrow] and anything else -> object
+                df[col] = s.astype("object").where(s.notna(), np.nan)
+                continue
+
+            # Categorical -> its plain values; the codes are a storage detail
+            # and would otherwise encode differently than the same data as text.
+            # A categorical OF NUMBERS has to land back on a numeric dtype, or
+            # it stays object and gets label-encoded downstream while the same
+            # column from CSV is treated as numeric.
+            if isinstance(dt, pd.CategoricalDtype):
+                plain = s.astype("object").where(s.notna(), np.nan)
+                if pd.api.types.is_numeric_dtype(dt.categories):
+                    plain = pd.to_numeric(plain, errors="coerce")
+                    if plain.notna().all() and (plain % 1 == 0).all():
+                        plain = plain.astype("int64")
+                df[col] = plain
+                continue
+
+            # Datetime -> ISO text, which is what CSV would have given us.
+            # Everything that needs real timestamps (the splitter, the temporal
+            # checks, the stability step) calls pd.to_datetime explicitly.
+            if pd.api.types.is_datetime64_any_dtype(dt):
+                # Date-only when every timestamp is midnight, matching what
+                # `to_csv` writes for the same column. Otherwise the CSV and
+                # parquet copies of one table would still disagree here.
+                midnight_only = bool(
+                    ((s.dt.hour == 0) & (s.dt.minute == 0)
+                     & (s.dt.second == 0) & (s.dt.microsecond == 0)
+                     & (s.dt.nanosecond == 0)).all()
+                )
+                fmt = "%Y-%m-%d" if midnight_only else "%Y-%m-%d %H:%M:%S"
+                df[col] = s.dt.strftime(fmt).where(s.notna(), np.nan)
+                continue
+
+            # Decimal objects from SQL drivers -> float64
+            if dt == object:
+                first = next((v for v in s.head(100) if v is not None and v is not pd.NaT
+                              and not (isinstance(v, float) and np.isnan(v))), None)
+                if isinstance(first, Decimal):
+                    df[col] = pd.to_numeric(s, errors="coerce").astype("float64")
+
+        return df
+
+    @classmethod
+    def _load_dataframe_raw(cls, path: str) -> pd.DataFrame:
         """Load a DataFrame from a local or remote path.
 
         Supported formats   : .csv, .tsv, .parquet, .orc, .feather/.ftr,

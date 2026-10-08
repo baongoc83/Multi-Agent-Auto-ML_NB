@@ -276,7 +276,8 @@ Sampling chỉ áp dụng **train**, stratified theo target → giữ class bala
 multi-agent-auto-ml-v1.1/
 ├── main.py                          # CLI entry point
 ├── pipeline.py                      # AutoMLPipeline — orchestrator + Stage 0a/0b
-├── handoff.py                       # State holder cho single-file mode
+├── splitting.py                     # Chia train/valid/oot — dùng chung pipeline + Agent 3
+├── replay_driver.py                 # Template replay_pipeline.py cho mỗi run
 ├── logger.py                        # AgentLogger — log + markdown report
 ├── config.py                        # Toàn bộ config + LLM client factory
 ├── config_gateway.py                # GatewayConfig override khi LLM_BACKEND=gateway

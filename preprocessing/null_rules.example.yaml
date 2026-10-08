@@ -1,0 +1,22 @@
+# Example rules for preprocessing.NullProcessor. Every feature needs a rule.
+group_defaults:                 # applied to features listed in feature_groups
+  numerical:
+    missing_strategy: median
+    add_missing_indicator: true
+  categorical:
+    missing_strategy: explicit_category
+  binary:
+    missing_strategy: missing_indicator_only
+    add_missing_indicator: true
+
+feature_groups:
+  numerical: [income, casa_balance, cc_utilization, txn_count_3m, debt_income_ratio]
+  categorical: [customer_segment]
+  binary: [has_card]
+
+features:                       # per-feature override (wins over group_defaults)
+  casa_balance:      {missing_type: structural}
+  txn_count_3m:      {missing_type: behavioral, missing_strategy: zero, add_missing_indicator: false}
+  income:            {missing_type: unknown}
+  debt_income_ratio: {missing_type: data_quality}   # denominator 0 -> NULL from Feature Store
+  customer_segment:  {missing_type: unknown}

@@ -1,15 +1,17 @@
 import re
+import warnings
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Callable, Dict, Any, Tuple, List, Optional
 import json
 from sklearn.preprocessing import LabelEncoder
 from sklearn.feature_selection import f_classif, f_regression
 from Agents.BaseAgent.base_agent import BaseAgent, ToolRegistry
 from logger import AgentLogger
 from config import Config
+from preprocessing.safe_expr import safe_eval, UnsafeExpressionError
 
 
 # Whitelisted builtins for interaction-expression eval. An empty __builtins__
@@ -22,6 +24,28 @@ _SAFE_EVAL_BUILTINS: Dict[str, Any] = {
     "int": int, "float": float, "bool": bool, "str": str, "object": object,
     "abs": abs, "min": min, "max": max, "round": round, "len": len,
 }
+
+
+def _as_encoder_tokens(s: pd.Series) -> pd.Series:
+    """Stringify a column for label encoding, mapping every null to __NA__.
+
+    `s.astype(str)` alone renders a null as whatever the current dtype happens
+    to spell it: "nan" for a column read from CSV, "None" once the same column
+    has been through a parquet round-trip. The pipeline writes parquet between
+    agents, so fitting on the post-parquet frame and replaying straight from
+    the source CSV silently produced two different encodings of the same
+    missing value — and therefore two different models.
+
+    Normalising first makes the encoding depend on the data, not on how the
+    data happened to be serialised. It also makes the __NA__ sentinel that
+    `_tool_encode_categorical` adds to every fit actually reachable; before
+    this it was dead, because nulls had already become an ordinary category.
+    """
+    return s.astype(str).where(s.notna(), "__NA__")
+
+
+class FeatureContractError(ValueError):
+    """Scoring data cannot be transformed faithfully with the frozen FeatureSpec."""
 
 
 @dataclass
@@ -52,48 +76,63 @@ class FeatureSpec:
     woe_maps:          Dict[str, Dict[str, Any]]    = field(default_factory=dict)
     selected_features: Optional[List[str]]          = None
     target_column:     Optional[str]                = None
+    # Order in which the fit executed the step KINDS (first occurrence):
+    # "encode" | "interaction" | "woe". apply() replays in this order, because an
+    # interaction written on an already-encoded column must see the encoded
+    # values at replay too. Default = legacy order of specs pickled before this field.
+    step_order:        List[str]                    = field(
+        default_factory=lambda: ["interaction", "encode", "woe"])
 
-    def apply(self, df: pd.DataFrame, logger=None, name: str = "") -> pd.DataFrame:
-        """Replay every captured transform on `df` in fit-time order."""
-
-        # 1. Re-create interactions (same expression; NaN/inf filled with train median)
+    # ---- individual replay steps (each reports into `diag`) ----------------
+    def _step_interactions(self, df, diag, logger, name):
         for new_col, expression, fill_value in self.interactions:
-            safe_locals = {"df": df, "np": np}
             try:
-                df[new_col] = eval(expression, {"__builtins__": _SAFE_EVAL_BUILTINS}, safe_locals)  # noqa: S307
+                df[new_col] = safe_eval(expression, df)
                 df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
                 df[new_col] = df[new_col].fillna(fill_value)
+            except UnsafeExpressionError:
+                raise                      # a tampered / invalid spec must never degrade to a median
             except Exception as e:
+                diag["interaction_fallbacks"].append(
+                    {"feature": new_col, "error": f"{type(e).__name__}: {e}"})
                 if logger is not None:
                     logger.log(name, "Transform WARN",
                         f"interaction '{new_col}' failed on transform set: {e} — filling with train median")
                 df[new_col] = fill_value
+        return df
 
-        # 2. Label encoders — unseen categories map to __NA__ sentinel.
-        # Vectorised via Series.where on an isin() mask — about 10x faster than
-        # the equivalent .apply(lambda) on big frames (matters for 1M+ rows).
+    def _step_encode(self, df, diag):
+        # Label encoders: unseen categories map to the __NA__ sentinel (vectorised).
         for col, le in self.label_encoders.items():
             if col not in df.columns:
+                diag["missing_columns"].append(col)
                 continue
             known = set(le.classes_)
-            vals = df[col].astype(str)
-            vals = vals.where(vals.isin(known), "__NA__")
+            vals = _as_encoder_tokens(df[col])
+            unseen = ~vals.isin(known)
+            if len(vals):
+                diag["unseen_rate"][col] = round(float(unseen.mean()), 6)
+            vals = vals.where(~unseen, "__NA__")
             df[col] = le.transform(vals)
 
-        # 3. One-hot — reindex against train's dummy column list
+        # One-hot: batch-independent. Compare against TRAIN's dummy names only;
+        # get_dummies(drop_first=True) on the scoring batch drops the batch's own
+        # first level, which is wrong for any batch lacking train's baseline.
         for col, dummy_cols in self.onehot_columns.items():
             if col not in df.columns:
+                diag["missing_columns"].append(col)
                 continue
-            dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
-            dummies = dummies.reindex(columns=dummy_cols, fill_value=0)
+            tokens = df[col].astype(str)
+            prefix = f"{col}_"
+            dummies = pd.DataFrame({d: (tokens == d[len(prefix):]) for d in dummy_cols},
+                                   index=df.index)
             df = pd.concat([df.drop(columns=[col]), dummies], axis=1)
+        return df
 
-        # 4. WoE replacement — replace each value with its bin's log-odds.
-        # Train-derived bin edges + WoE table; NaN routes to the dedicated NaN
-        # bin (last index). Values outside train's [min, max] range fold into
-        # the boundary bin — safe because searchsorted clips at the ends.
+    def _step_woe(self, df, diag, on_bins):
         for col, m in self.woe_maps.items():
             if col not in df.columns:
+                diag["missing_columns"].append(col)
                 continue
             edges = np.asarray(m["edges"], dtype=np.float64)
             woe   = np.asarray(m["woe"],   dtype=np.float64)
@@ -105,17 +144,72 @@ class FeatureSpec:
             # Inner edges only; NaN routes to the reserved last bin
             bin_idx = np.searchsorted(edges[1:-1], x, side="right").astype(np.int64)
             bin_idx = np.where(nan_mask, nan_bin_idx, bin_idx)
-            # Defensive clip — searchsorted already keeps in range but
-            # protects against malformed specs after manual edits
             bin_idx = np.clip(bin_idx, 0, nan_bin_idx)
+            if on_bins is not None:
+                on_bins(col, bin_idx)
             df[col] = woe[bin_idx]
+        return df
 
-        # 5. Column selection — keep only the train-chosen features (+ target)
+    def apply(
+        self,
+        df: pd.DataFrame,
+        logger=None,
+        name: str = "",
+        on_bins: Optional[Callable[[str, np.ndarray], None]] = None,
+        strict: bool = False,
+        max_unseen_rate: Optional[float] = None,
+    ) -> pd.DataFrame:
+        """Replay every captured transform on `df`, in the order the fit ran them.
+
+        Nothing is silent: fallbacks, absent columns and unseen-category rates are
+        collected in `self.last_diagnostics` and always raised as warnings (even
+        without a logger).
+
+        strict=True (scoring / replay) raises FeatureContractError when an
+        interaction fell back to its train median, a configured column is absent,
+        or an encoder's unseen rate exceeds `max_unseen_rate`.
+
+        on_bins: optional callback on_bins(col, bin_idx) invoked during WoE with
+        the train-derived bin assignment (used by the IV-stability check); it must
+        consume the array immediately.
+        """
+        diag: Dict[str, Any] = {"interaction_fallbacks": [], "missing_columns": [],
+                                "unseen_rate": {}}
+        steps = {"interaction": lambda d: self._step_interactions(d, diag, logger, name),
+                 "encode":      lambda d: self._step_encode(d, diag),
+                 "woe":         lambda d: self._step_woe(d, diag, on_bins)}
+        order = [k for k in getattr(self, "step_order", ["interaction", "encode", "woe"]) if k in steps]  # old pickles lack the field
+        order += [k for k in steps if k not in order]
+        for kind in order:
+            df = steps[kind](df)
+
+        # Column selection: keep only the train-chosen features (+ target)
         if self.selected_features is not None:
             keep = [c for c in self.selected_features if c in df.columns]
+            diag["missing_columns"] += [c for c in self.selected_features
+                                        if c not in df.columns and c != self.target_column]
             if self.target_column and self.target_column in df.columns and self.target_column not in keep:
                 keep.append(self.target_column)
             df = df[keep]
+
+        diag["missing_columns"] = sorted(set(diag["missing_columns"]))
+        self.last_diagnostics = diag
+        problems: List[str] = []
+        if diag["interaction_fallbacks"]:
+            problems.append("interaction fell back to train median: " +
+                            ", ".join(f["feature"] for f in diag["interaction_fallbacks"][:8]))
+        if diag["missing_columns"]:
+            problems.append(f"{len(diag['missing_columns'])} configured column(s) absent: "
+                            f"{diag['missing_columns'][:8]}")
+        if max_unseen_rate is not None:
+            hot = {c: r for c, r in diag["unseen_rate"].items() if r > max_unseen_rate}
+            if hot:
+                problems.append(f"unseen-category rate above {max_unseen_rate:.0%}: {hot}")
+        if problems:
+            msg = "FeatureSpec.apply: " + " | ".join(problems)
+            if strict:
+                raise FeatureContractError(msg)
+            warnings.warn(msg, stacklevel=2)
         return df
 
     def to_dict(self) -> Dict[str, Any]:
@@ -539,10 +633,10 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         )
 
     def _tool_create_interaction(self, df: pd.DataFrame, new_col: str, expression: str) -> pd.DataFrame:
-        # Restrict eval to df/np + a safe builtins whitelist to prevent code injection
-        safe_locals = {"df": df, "np": np}
+        # Expressions are LLM-written: validated against an AST allowlist before
+        # evaluation (preprocessing.safe_expr). A builtins whitelist alone is not a sandbox.
         try:
-            df[new_col] = eval(expression, {"__builtins__": _SAFE_EVAL_BUILTINS}, safe_locals)  # noqa: S307
+            df[new_col] = safe_eval(expression, df)
             df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
             train_median = df[new_col].median()
             # Median can still be NaN if every value is NaN/inf — use 0.0 as a safe sentinel
@@ -573,7 +667,7 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             le = LabelEncoder()
             # Train values + __NA__ sentinel — guarantees transform never raises
             # on unseen valid/oot categories when we replay this encoder.
-            train_vals = df[col].astype(str)
+            train_vals = _as_encoder_tokens(df[col])
             le.fit(sorted(set(train_vals.tolist()) | {"__NA__"}))
             df[col] = le.transform(train_vals)
             self._last_label_encoder = le
@@ -726,23 +820,48 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         bin_idx = np.where(nan_mask, nan_bin_idx, bin_idx)
 
         # ── Cross-tab via bincount ────────────────────────────────────────
+        pos, neg = FeatureEngineerAgent._bin_class_counts(bin_idx, y, total_bins)
+        iv, woe = FeatureEngineerAgent._iv_from_bin_counts(pos, neg)
+        if not len(woe):
+            return 0.0, np.array([]), np.array([])
+        return iv, woe, edges
+
+    @staticmethod
+    def _bin_class_counts(
+        bin_idx: np.ndarray, y: np.ndarray, total_bins: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Per-bin (positive, negative) counts. Cheap enough to run per partition."""
         pos = np.bincount(bin_idx, weights=y.astype(np.float64), minlength=total_bins)
         total = np.bincount(bin_idx, minlength=total_bins).astype(np.float64)
-        neg = total - pos
+        return pos, total - pos
 
+    @staticmethod
+    def _iv_from_bin_counts(
+        pos: np.ndarray, neg: np.ndarray
+    ) -> Tuple[float, np.ndarray]:
+        """Laplace-smoothed IV + per-bin WoE from bin counts.
+
+        Split out from `_compute_iv_single` so the IV-stability check can score a
+        holdout partition with the exact same formula the train IV was computed
+        with — two copies of this arithmetic would make iv_train and iv_oot
+        quietly incomparable, which is the one thing that check must not do.
+
+        Returns (0.0, empty) when a partition is single-class, matching how
+        `_compute_iv_single` treats a column with no usable signal.
+        """
+        total_bins = len(pos)
         total_pos = pos.sum()
         total_neg = neg.sum()
-        if total_pos == 0 or total_neg == 0:
-            return 0.0, np.array([]), np.array([])
+        if total_bins == 0 or total_pos == 0 or total_neg == 0:
+            return 0.0, np.array([])
 
-        # ── Laplace-smoothed WoE ─────────────────────────────────────────
         # eps=0.5 per bin protects log(0) when a bin is pure-class.
         eps = 0.5
         p_pos = (pos + eps) / (total_pos + eps * total_bins)
         p_neg = (neg + eps) / (total_neg + eps * total_bins)
         woe = np.log(p_neg / p_pos)
         iv = float(np.sum((p_neg - p_pos) * woe))
-        return iv, woe, edges
+        return iv, woe
 
     def _tool_compute_iv(
         self,
@@ -1068,6 +1187,145 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             df.drop(columns=to_drop, inplace=True)
         return df
 
+    # ── IV stability (train ↔ holdout) ────────────────────────────────────
+
+    def _make_iv_stability_collector(
+        self, y: np.ndarray, spec: "FeatureSpec"
+    ) -> Tuple[Callable[[str, np.ndarray], None], Dict[str, Tuple[np.ndarray, np.ndarray]]]:
+        """Build the `on_bins` callback that accumulates per-bin class counts.
+
+        The callback folds each column's bin assignment straight into a
+        (n_bins+1,) count pair and drops the array, so peak memory is a few
+        hundred floats per column rather than one int64 array per column.
+
+        Scope is `selected_features ∩ woe_maps`: a feature only has frozen train
+        bins if it was WoE-transformed, and only matters if it survived
+        selection.
+        """
+        scope = set(spec.woe_maps)
+        if spec.selected_features is not None:
+            scope &= set(spec.selected_features)
+        counts: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+        def on_bins(col: str, bin_idx: np.ndarray) -> None:
+            if col not in scope:
+                return
+            m = spec.woe_maps.get(col) or {}
+            n_bins = len(m.get("woe", ()))
+            if n_bins == 0 or len(bin_idx) != len(y):
+                return
+            counts[col] = self._bin_class_counts(bin_idx, y, n_bins)
+
+        return on_bins, counts
+
+    def _evaluate_iv_stability(
+        self,
+        counts: Dict[str, Tuple[np.ndarray, np.ndarray]],
+        spec: "FeatureSpec",
+        tag: str,
+    ) -> Dict[str, Any]:
+        """Compare holdout IV against train IV under FROZEN train binning.
+
+        Answers the question PSI cannot: has the feature's *relationship to the
+        target* held up out of time? A feature can have a perfectly stable
+        X-distribution (PSI ~ 0) while its bin-level log-odds weaken or invert,
+        and nothing else in this pipeline would notice.
+
+        Three signals per feature:
+          iv_drop_pct    — relative IV loss vs train.
+          woe_corr       — Pearson between the train WoE vector and the holdout
+                           WoE vector over populated bins. Negative = the
+                           relationship reversed.
+          woe_sign_flips — bins whose WoE changed sign. Bins thinner than
+                           FE_IV_STABILITY_MIN_BIN_COUNT are excluded; tail bins
+                           are too noisy to read anything into.
+
+        Diagnostic only — nothing is dropped. Agent 3's PSI / SHAP+PSI prune
+        stay the only places features are removed.
+        """
+        min_cnt   = Config.FE_IV_STABILITY_MIN_BIN_COUNT
+        max_drop  = Config.FE_IV_STABILITY_MAX_DROP
+        min_corr  = Config.FE_IV_STABILITY_MIN_WOE_CORR
+        iv_key    = f"iv_{tag}"
+
+        features: Dict[str, Dict[str, Any]] = {}
+        n_skipped_weak = 0
+        for col, (pos, neg) in counts.items():
+            iv_train = float(self._last_iv_scores.get(col, 0.0))
+            if iv_train < Config.WOE_MIN_IV:
+                # Nothing to be stable about. A feature that was already in the
+                # Siddiqi "useless" band on train would show wild iv_drop_pct
+                # swings off a near-zero baseline and flag as UNSTABLE every
+                # run — noise, not a finding.
+                n_skipped_weak += 1
+                continue
+            iv_part, woe_part = self._iv_from_bin_counts(pos, neg)
+            woe_train = np.asarray(spec.woe_maps[col]["woe"], dtype=np.float64)
+            if len(woe_part) != len(woe_train):
+                continue
+
+            # Only bins with enough holdout rows are trustworthy enough to compare
+            populated = (pos + neg) >= min_cnt
+            n_pop = int(populated.sum())
+            if n_pop >= 2:
+                a, b = woe_train[populated], woe_part[populated]
+                if a.std() > 0 and b.std() > 0:
+                    woe_corr = float(np.corrcoef(a, b)[0, 1])
+                else:
+                    woe_corr = float("nan")
+                flips = int(np.sum(np.sign(a) != np.sign(b)))
+            else:
+                woe_corr = float("nan")
+                flips = 0
+
+            drop_pct = (iv_train - iv_part) / iv_train
+            reasons = []
+            if drop_pct > max_drop:
+                reasons.append("iv_drop")
+            if iv_part < Config.WOE_MIN_IV:
+                reasons.append("iv_below_floor")
+            if not np.isnan(woe_corr) and woe_corr < min_corr:
+                reasons.append("woe_reversal")
+
+            features[col] = {
+                "iv_train":       round(iv_train, 4),
+                iv_key:           round(float(iv_part), 4),
+                "iv_drop_pct":    round(float(drop_pct), 4),
+                "woe_corr":       None if np.isnan(woe_corr) else round(woe_corr, 4),
+                "woe_sign_flips": flips,
+                "n_bins_scored":  n_pop,
+                "flag":           "UNSTABLE" if reasons else "STABLE",
+                "reasons":        reasons,
+            }
+
+        unstable = {c: m for c, m in features.items() if m["flag"] == "UNSTABLE"}
+        result = {
+            "n_evaluated":      len(features),
+            "n_unstable":       len(unstable),
+            "n_skipped_weak":   n_skipped_weak,
+            "features":         features,
+        }
+
+        if unstable:
+            worst = sorted(unstable.items(),
+                           key=lambda kv: kv[1]["iv_drop_pct"], reverse=True)
+            top = worst[:Config.FE_IV_STABILITY_TOP_N]
+            detail = ", ".join(
+                f"{c}(iv {m['iv_train']:.3f}→{m[iv_key]:.3f}, "
+                f"corr={m['woe_corr']}, {'+'.join(m['reasons'])})"
+                for c, m in top
+            )
+            more = f" (+{len(worst) - len(top)} more)" if len(worst) > len(top) else ""
+            self.logger.log(self.name, f"IV stability WARN train↔{tag}",
+                f"{len(unstable)}/{len(features)} features unstable. "
+                f"Worst {len(top)}: {detail}{more}. "
+                "Diagnostic only — Agent 3's PSI / SHAP+PSI prune decide what gets dropped.")
+        else:
+            self.logger.log(self.name, f"IV stability train↔{tag}",
+                f"{len(features)} features scored, none flagged "
+                f"(max_drop={max_drop:.0%}, min_woe_corr={min_corr:.2f})")
+        return result
+
     def _setup_protected_cols(self, previous_report: Dict[str, Any]) -> None:
         """Compute self._protected_cols + self._date_col from prior agent's report.
         Idempotent — called by both fit_transform and process (single-file mode).
@@ -1144,15 +1402,23 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         target_column: str,
         valid_path: Optional[str] = None,
         oot_path: Optional[str] = None,
+        test_path: Optional[str] = None,
         create_interactions: Optional[bool] = None,
     ) -> Tuple[Dict[str, Optional[str]], Dict[str, Any]]:
-        """Pre-split mode entry point. Fit on train, transform valid/oot one at a time.
+        """Pre-split mode entry point. Fit on train, transform the holdouts one at a time.
 
         create_interactions: per-run override for the interaction step. None →
         use Config.FE_CREATE_INTERACTIONS_ENABLED; False → skip all
         create_interaction actions this run.
 
-        Returns ({"train": path, "valid": path|None, "oot": path|None}, report).
+        `test` is the random holdout single-file mode produces when there is no
+        usable date column; it replays the FeatureSpec exactly like valid/oot.
+
+        Each holdout is also scored for IV stability against train while it is
+        in memory — see `_evaluate_iv_stability`.
+
+        Returns ({"train": path, "valid": path|None, "oot": path|None,
+        "test": path|None}, report).
         """
         import gc
 
@@ -1171,24 +1437,61 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         gc.collect()
 
         out_paths: Dict[str, Optional[str]] = {
-            "train": Config.ENGINEERED_TRAIN_PATH, "valid": None, "oot": None,
+            "train": Config.ENGINEERED_TRAIN_PATH,
+            "valid": None, "oot": None, "test": None,
         }
+        # IV stability is scored during the transform pass — the bin assignment
+        # it needs is already computed there, so this costs one callback per
+        # WoE'd column and no second read of the partition.
+        stability_enabled = (
+            Config.FE_IV_STABILITY_ENABLED
+            and bool(self._last_iv_scores)
+            and bool(spec.woe_maps)
+        )
+        if Config.FE_IV_STABILITY_ENABLED and not stability_enabled:
+            self.logger.log(self.name, "IV stability skipped",
+                "no cached IV scores or no WoE maps — compute_iv / apply_woe_transform "
+                "did not run, so there is no frozen train binning to compare against")
+        iv_stability: Dict[str, Any] = {}
+
         for tag, in_path, out_path in [
             ("valid", valid_path, Config.ENGINEERED_VALID_PATH),
             ("oot",   oot_path,   Config.ENGINEERED_OOT_PATH),
+            ("test",  test_path,  Config.ENGINEERED_TEST_PATH),
         ]:
             if in_path is None:
                 continue
             self.logger.log(self.name, f"Transform {tag} start", f"path={in_path}")
             df = self.load_dataframe(in_path)
             orig = df.shape
-            df = self.transform(df, spec)
+
+            on_bins = None
+            counts: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+            if stability_enabled and self.target_column in df.columns:
+                y_part = pd.to_numeric(df[self.target_column], errors="coerce")
+                # Rows with no label carry no IV signal; bin 0 them out by
+                # treating them as negatives would skew the counts, so only
+                # score when the partition is fully labelled.
+                if y_part.notna().all() and y_part.nunique() == 2:
+                    on_bins, counts = self._make_iv_stability_collector(
+                        y_part.to_numpy(dtype=np.float64), spec)
+                else:
+                    self.logger.log(self.name, f"IV stability skipped ({tag})",
+                        f"target is not a fully-labelled binary column on this partition "
+                        f"(nulls={int(y_part.isna().sum())}, nunique={y_part.nunique()})")
+
+            df = spec.apply(df, logger=self.logger, name=self.name, on_bins=on_bins)
             df.to_parquet(out_path, compression="snappy", index=False)
             self.logger.log(self.name, f"Transform {tag} done",
                 f"shape {orig} -> {df.shape} | saved={out_path}")
             out_paths[tag] = out_path
             del df
             gc.collect()
+
+            if counts:
+                iv_stability[tag] = self._evaluate_iv_stability(counts, spec, tag)
+                del counts
+                gc.collect()
 
         report = {
             "agent": self.name,
@@ -1204,11 +1507,24 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
             "out_paths": {k: v for k, v in out_paths.items() if v is not None},
             "feature_spec": spec.to_dict(),
         }
+        if iv_stability:
+            report["iv_stability"] = {
+                "thresholds": {
+                    "max_iv_drop_pct": Config.FE_IV_STABILITY_MAX_DROP,
+                    "min_woe_corr":    Config.FE_IV_STABILITY_MIN_WOE_CORR,
+                    "min_iv":          Config.WOE_MIN_IV,
+                    "min_bin_count":   Config.FE_IV_STABILITY_MIN_BIN_COUNT,
+                },
+                "note": "Holdout IV recomputed under train-frozen bin edges. "
+                        "Diagnostic only — no feature is dropped here.",
+                **iv_stability,
+            }
         self.save_report(report, Config.FEATURE_ENGINEER_REPORT_PATH)
         self._emit_pipeline_process_script(spec)
         self.logger.log(self.name, "Process Complete",
             f"train={train_final_shape} | valid={'y' if out_paths['valid'] else '-'} "
-            f"| oot={'y' if out_paths['oot'] else '-'}")
+            f"| oot={'y' if out_paths['oot'] else '-'} "
+            f"| test={'y' if out_paths['test'] else '-'}")
         return out_paths, report
 
     def process(
@@ -1218,7 +1534,17 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
         target_column: str,
         create_interactions: Optional[bool] = None,
     ) -> Tuple[str, Dict[str, Any]]:
-        """Single-file mode. Used when no valid/oot was supplied to the pipeline.
+        """Fit and transform ONE frame. Standalone entry point — not used by the pipeline.
+
+        AutoMLPipeline always calls `process_splits` now: single-file runs are
+        split upfront so this agent only ever fits on TRAIN. This method is kept
+        for callers who hand over a single frame themselves (tests/test_agent2.py).
+
+        Note what that means: everything here — IV, WoE bin edges, feature
+        selection, interaction medians — is fitted on every row of `df`. If the
+        caller intends to carve a holdout out of the result afterwards, those
+        statistics will already have seen it. Use `process_splits` when that
+        matters.
 
         create_interactions: per-run override for the interaction step. None →
         use Config.FE_CREATE_INTERACTIONS_ENABLED; False → skip all
@@ -1270,7 +1596,7 @@ frequency encoding for high-cardinality categoricals, interaction terms between 
 
         Encoders can't be embedded as literals (they're fitted sklearn objects),
         so they go into a sidecar `.pkl` next to the script. The script itself
-        is import-free apart from pandas/numpy/joblib/sklearn.LabelEncoder.
+        delegates to FeatureSpec.apply in the repo (needs the repo on sys.path).
 
         Usage at replay time:
             python pipeline_process_feature_engineer.py <input_file> <output_parquet>
@@ -1299,98 +1625,36 @@ Usage:
     python pipeline_process_feature_engineer.py <input_file> <output_file.parquet>
 """
 
+import os
 import sys
 from pathlib import Path
-import numpy as np
 import pandas as pd
+
+
+def _add_repo_to_path() -> None:
+    """The spec is a pickle of this repo's classes, and the transform logic lives
+    in FeatureSpec.apply (single implementation, no copy to drift)."""
+    here = Path(__file__).resolve().parent
+    cands = ([Path(os.environ["AUTOML_REPO"])] if os.environ.get("AUTOML_REPO") else []) \
+        + list(here.parents[:4])
+    for c in cands:
+        if (c / "Agents").is_dir() and (c / "config.py").is_file():
+            sys.path.insert(0, str(c))
+            return
+    sys.exit("ERROR: pipeline repo not found. Set AUTOML_REPO=/path/to/multi-agent-auto-ml-v1.1")
+
+
+_add_repo_to_path()
 import joblib
+from Agents.BaseAgent.base_agent import BaseAgent
 
-_SPEC_PATH = Path(__file__).parent / "{spec_filename}"
-_spec = joblib.load(_SPEC_PATH)
-
-# Safe builtins whitelist for interaction-expression eval — mirrors the source
-# repo. Empty builtins would break casts like `.astype(int)` ("name 'int' is
-# not defined"); only value-level constructors/helpers are exposed.
-_SAFE_EVAL_BUILTINS = {{
-    "int": int, "float": float, "bool": bool, "str": str, "object": object,
-    "abs": abs, "min": min, "max": max, "round": round, "len": len,
-}}
+_spec = joblib.load(Path(__file__).parent / "{spec_filename}")
 
 
-def apply(df: pd.DataFrame) -> pd.DataFrame:
-    """Replay every captured transform in fit-time order.
-
-    Mirrors FeatureSpec.apply in the source repo so the script stays standalone.
-    """
-    # 1. Interactions — eval expression + replace inf + fill with train median
-    for new_col, expression, fill_value in _spec.interactions:
-        safe_locals = {{"df": df, "np": np}}
-        try:
-            df[new_col] = eval(expression, {{"__builtins__": _SAFE_EVAL_BUILTINS}}, safe_locals)  # noqa: S307
-            df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
-            df[new_col] = df[new_col].fillna(fill_value)
-        except Exception as e:
-            print(f"WARN: interaction {{new_col!r}} failed ({{e}}) — filling with train median",
-                  file=sys.stderr)
-            df[new_col] = fill_value
-
-    # 2. Label encoders — unseen categories map to __NA__ sentinel
-    for col, le in _spec.label_encoders.items():
-        if col not in df.columns:
-            continue
-        known = set(le.classes_)
-        vals  = df[col].astype(str)
-        vals  = vals.where(vals.isin(known), "__NA__")
-        df[col] = le.transform(vals)
-
-    # 3. One-hot — reindex against train's dummy column list
-    for col, dummy_cols in _spec.onehot_columns.items():
-        if col not in df.columns:
-            continue
-        dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
-        dummies = dummies.reindex(columns=dummy_cols, fill_value=0)
-        df = pd.concat([df.drop(columns=[col]), dummies], axis=1)
-
-    # 4. WoE replacement — log-odds substitution per train-derived bin.
-    # NaN routes to the dedicated last bin; out-of-range values fold into
-    # the boundary bin (searchsorted clips on the ends).
-    for col, m in _spec.woe_maps.items():
-        if col not in df.columns:
-            continue
-        edges = np.asarray(m["edges"], dtype=np.float64)
-        woe   = np.asarray(m["woe"],   dtype=np.float64)
-        if len(woe) == 0 or len(edges) < 2:
-            continue
-        nan_bin_idx = len(woe) - 1
-        x = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64, copy=False)
-        nan_mask = np.isnan(x)
-        bin_idx = np.searchsorted(edges[1:-1], x, side="right").astype(np.int64)
-        bin_idx = np.where(nan_mask, nan_bin_idx, bin_idx)
-        bin_idx = np.clip(bin_idx, 0, nan_bin_idx)
-        df[col] = woe[bin_idx]
-
-    # 5. Column selection — keep only train-chosen features (+ target)
-    if _spec.selected_features is not None:
-        keep = [c for c in _spec.selected_features if c in df.columns]
-        if _spec.target_column and _spec.target_column in df.columns and _spec.target_column not in keep:
-            keep.append(_spec.target_column)
-        df = df[keep]
-    return df
-
-
-def _read(path: str) -> pd.DataFrame:
-    suffix = Path(path).suffix.lower()
-    if suffix == ".parquet":
-        return pd.read_parquet(path)
-    if suffix in (".csv", ".tsv"):
-        return pd.read_csv(path, sep="\\t" if suffix == ".tsv" else ",")
-    if suffix in (".xls", ".xlsx", ".xlsm"):
-        return pd.read_excel(path)
-    if suffix == ".json":
-        return pd.read_json(path)
-    if suffix == ".feather":
-        return pd.read_feather(path)
-    raise ValueError(f"Unsupported input extension: {{suffix}}")
+def apply(df: pd.DataFrame, strict: bool = True) -> pd.DataFrame:
+    """Replay the captured transforms. strict=True raises FeatureContractError
+    instead of silently substituting train medians / dropping columns."""
+    return _spec.apply(df, strict=strict)
 
 
 if __name__ == "__main__":
@@ -1399,7 +1663,7 @@ if __name__ == "__main__":
               file=sys.stderr)
         sys.exit(1)
     src, dst = sys.argv[1], sys.argv[2]
-    df = _read(src)
+    df = BaseAgent.load_dataframe(src)      # same reader normalisation as training
     before = df.shape
     df = apply(df)
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
@@ -1567,6 +1831,14 @@ if __name__ == "__main__":
             spec = FeatureSpec(target_column=self.target_column)
         self.logger.log(self.name, "LLM Decision", "Parsing feature engineering decisions")
         actions_taken: List[str] = []
+        fit_order: List[str] = []
+
+        def _note_step(kind: str) -> None:
+            # Record the order the fit really ran the step kinds in; apply() replays it.
+            if kind not in fit_order:
+                fit_order.append(kind)
+            spec.step_order = fit_order + [k for k in ("interaction", "encode", "woe")
+                                           if k not in fit_order]
 
         try:
             decisions = json.loads(self._extract_json(llm_response))
@@ -1580,6 +1852,7 @@ if __name__ == "__main__":
 
                 try:
                     if action_type == "create_interaction":
+                        _note_step("interaction")
                         new_col = action_spec.get("new_col")
                         expression = action_spec.get("expression", "")
                         # Master switch: skip the whole interaction step when disabled
@@ -1601,6 +1874,7 @@ if __name__ == "__main__":
                         actions_taken.append(f"Created feature '{new_col}': {reason}")
 
                     elif action_type == "encode_all_categorical":
+                        _note_step("encode")
                         method = action_spec.get("method", "label")
                         self._batch_label_encoders = {}
                         self._batch_onehot_cols = {}
@@ -1610,6 +1884,7 @@ if __name__ == "__main__":
                         actions_taken.append(f"Encoded all categorical columns with {method}: {reason}")
 
                     elif action_type == "encode_categorical":
+                        _note_step("encode")
                         column = action_spec.get("column")
                         if column in self._protected_cols:
                             self.logger.log(self.name, f"SKIP {action_type}",
@@ -1646,6 +1921,7 @@ if __name__ == "__main__":
                         self.logger.log(self.name, "IV Results", result[:1000])
 
                     elif action_type == "apply_woe_transform":
+                        _note_step("woe")
                         min_iv = float(action_spec.get("min_iv", Config.WOE_MIN_IV))
                         self._last_applied_woe = {}
                         self.df = self.execute_tool("apply_woe_transform",

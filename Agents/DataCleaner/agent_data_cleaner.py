@@ -9,6 +9,34 @@ from logger import AgentLogger
 from config import Config
 
 
+def _stratified_sample_positions_static(
+    df: pd.DataFrame, target_col: Optional[str], ratio: float, rs: int
+) -> np.ndarray:
+    """SORTED row positions for a stratified sample of `df`.
+
+    Module-level so both DataCleanerAgent (at fit time) and CleaningSpec
+    (at replay time) run the identical draw — same rng seed, same per-class
+    loop order, same sort. Two copies of this would silently hand a replay
+    a different training set.
+    """
+    rng = np.random.default_rng(rs)
+    n_rows = len(df)
+    if target_col is None or target_col not in df.columns or df[target_col].nunique() < 2:
+        n = max(1, int(n_rows * ratio))
+        pos = rng.choice(n_rows, n, replace=False)
+        pos.sort()
+        return pos
+    target_arr = df[target_col].to_numpy()
+    chunks = []
+    for cls in np.unique(target_arr):
+        cls_pos = np.where(target_arr == cls)[0]
+        n_cls = max(1, int(len(cls_pos) * ratio))
+        chunks.append(rng.choice(cls_pos, n_cls, replace=False))
+    positions = np.concatenate(chunks)
+    positions.sort()
+    return positions
+
+
 def _safe_str_map(series: pd.Series, fn) -> pd.Series:
     """Apply a string method elementwise, leaving non-strings (NaN, None,
     numbers, dicts, ...) untouched.
@@ -34,6 +62,13 @@ class CleaningSpec:
     drops:        List[str]                       = field(default_factory=list)
     dtype_fixes:  List[Tuple[str, str]]           = field(default_factory=list)
     clip_bounds:  Dict[str, Tuple[float, float]]  = field(default_factory=dict)
+    # Train-only row operations, in execution order. NOT replayed by apply() —
+    # valid/oot must keep every original row or their metrics stop being
+    # comparable. Recorded purely so a replay run can rebuild the exact TRAIN
+    # frame this model was fitted on; without them, replaying the spec on train
+    # would hand training more rows than the original run saw.
+    # Each entry: {"op": "stratified_sample"|"drop_duplicates"|"deduplicate_by_key", ...}
+    row_ops:      List[Dict[str, Any]]            = field(default_factory=list)
 
     def apply(self, df: pd.DataFrame, logger=None, name: str = "") -> pd.DataFrame:
         """Replay every captured column transform on `df` in fit-time order.
@@ -73,11 +108,49 @@ class CleaningSpec:
                 df[col] = df[col].clip(lower=lower, upper=upper)
         return df
 
+    def apply_row_ops(self, df: pd.DataFrame, target_column: Optional[str] = None,
+                      logger=None, name: str = "") -> pd.DataFrame:
+        """Replay the TRAIN-only row operations, in the order they originally ran.
+
+        Deliberately separate from `apply`: calling this on valid/oot would
+        silently delete holdout rows and inflate the reported metrics. Only the
+        replay driver calls it, and only on the train partition.
+
+        Every op here is deterministic given the same input frame and
+        Config.RANDOM_STATE, so a replay reproduces the original row set exactly.
+        """
+        for spec_op in self.row_ops:
+            op = spec_op.get("op")
+            before = len(df)
+            if op == "stratified_sample":
+                ratio = float(spec_op["ratio"])
+                positions = _stratified_sample_positions_static(
+                    df, spec_op.get("target_column") or target_column, ratio,
+                    int(spec_op.get("random_state", Config.RANDOM_STATE)))
+                df = df.iloc[positions].reset_index(drop=True)
+            elif op == "drop_duplicates":
+                df = df.drop_duplicates().reset_index(drop=True)
+            elif op == "deduplicate_by_key":
+                cols = [c for c in spec_op.get("columns", []) if c in df.columns]
+                if not cols:
+                    continue
+                df = df.drop_duplicates(
+                    subset=cols, keep=spec_op.get("keep", "first")).reset_index(drop=True)
+            else:
+                if logger is not None:
+                    logger.log(name, "Replay WARN", f"unknown row op {op!r} — skipped")
+                continue
+            if logger is not None:
+                logger.log(name, "Replay row op",
+                    f"{op}: {before} -> {len(df)} rows")
+        return df
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "drops": list(self.drops),
             "dtype_fixes": [list(t) for t in self.dtype_fixes],
             "clip_bounds": {c: list(b) for c, b in self.clip_bounds.items()},
+            "row_ops": [dict(o) for o in self.row_ops],
         }
 
 
@@ -672,26 +745,12 @@ class DataCleanerAgent(BaseAgent):
         caller can iloc one chunk at a time when writing to disk.
         """
         rs = Config.RANDOM_STATE
-        rng = np.random.default_rng(rs)
-        n_rows = len(df)
-        if target_col is None or target_col not in df.columns or df[target_col].nunique() < 2:
-            n = max(1, int(n_rows * ratio))
-            pos = rng.choice(n_rows, n, replace=False); pos.sort()
-            self.logger.log(self.name, "Sample positions",
-                f"random | total={len(pos)} (of {n_rows})")
-            return pos
-        target_arr = df[target_col].to_numpy()
-        chunks = []
-        summary = {}
-        for cls in np.unique(target_arr):
-            cls_pos = np.where(target_arr == cls)[0]
-            n_cls = max(1, int(len(cls_pos) * ratio))
-            chosen = rng.choice(cls_pos, n_cls, replace=False)
-            chunks.append(chosen)
-            summary[str(cls)] = (len(cls_pos), n_cls)
-        positions = np.concatenate(chunks); positions.sort()
+        positions = _stratified_sample_positions_static(df, target_col, ratio, rs)
+        stratified = (target_col is not None and target_col in df.columns
+                      and df[target_col].nunique() >= 2)
         self.logger.log(self.name, "Sample positions",
-            f"stratified | per-class={summary} | total={len(positions)}")
+            f"{'stratified' if stratified else 'random'} | "
+            f"total={len(positions)} (of {len(df)})")
         return positions
 
     # ── FIT / TRANSFORM API ───────────────────────────────────────────────
@@ -718,17 +777,28 @@ class DataCleanerAgent(BaseAgent):
         original_shape = self.df.shape
 
         # ── Optional stratified sampling (memory mitigation) ─────────────
+        _sampled_row_op = None
         if train_sample_ratio is not None and 0 < train_sample_ratio < 1:
             self.logger.log(self.name, "Sample start",
                 f"ratio={train_sample_ratio:.2f} | input rows={len(self.df)}")
             positions = self._stratified_sample_positions(
                 self.df, self._target_column, train_sample_ratio)
             self.df = self.df.iloc[positions].reset_index(drop=True)
+            _sampled_row_op = {
+                "op": "stratified_sample",
+                "ratio": float(train_sample_ratio),
+                "target_column": self._target_column,
+                "random_state": Config.RANDOM_STATE,
+            }
             self.logger.log(self.name, "Sample done",
                 f"sampled rows={len(self.df)} (from {original_shape[0]})")
 
         # ── Pre-filter (deterministic column drops) ──────────────────────
         spec = CleaningSpec()
+        if _sampled_row_op is not None:
+            # Sampling ran before the spec existed; record it first so replay
+            # reproduces the row set in the same order it was built.
+            spec.row_ops.append(_sampled_row_op)
         if prefilter:
             protected = self._pk_protected_cols
             prefilter_drops, drop_stats = self._scan_prefilter_drops(self.df, protected)
@@ -768,12 +838,17 @@ class DataCleanerAgent(BaseAgent):
         train_path: str,
         valid_path: Optional[str] = None,
         oot_path: Optional[str] = None,
+        test_path: Optional[str] = None,
         prefilter: bool = True,
         train_sample_ratio: Optional[float] = None,
     ) -> Tuple[Dict[str, Optional[str]], Dict[str, Any]]:
-        """Pre-split mode entry point. Fit on train, transform valid/oot one at a time.
+        """Pre-split mode entry point. Fit on train, transform the holdouts one at a time.
 
-        Returns ({"train": path, "valid": path|None, "oot": path|None}, report).
+        Returns ({"train": path, "valid": path|None, "oot": path|None,
+        "test": path|None}, report).
+
+        `test` is the random holdout single-file mode produces when there is no
+        usable date column; it replays the CleaningSpec exactly like valid/oot.
 
         Memory profile: only ONE partition lives in pandas at any moment.
         Train is cleaned + saved, then released before valid is loaded.
@@ -794,13 +869,14 @@ class DataCleanerAgent(BaseAgent):
         self.df = None
         gc.collect()
 
-        # ── Transform valid + oot independently ──────────────────────────
+        # ── Transform each holdout independently ─────────────────────────
         out_paths: Dict[str, Optional[str]] = {
-            "train": Config.CLEAN_TRAIN_PATH, "valid": None, "oot": None,
+            "train": Config.CLEAN_TRAIN_PATH, "valid": None, "oot": None, "test": None,
         }
         for tag, in_path, out_path in [
             ("valid", valid_path, Config.CLEAN_VALID_PATH),
             ("oot",   oot_path,   Config.CLEAN_OOT_PATH),
+            ("test",  test_path,  Config.CLEAN_TEST_PATH),
         ]:
             if in_path is None:
                 continue
@@ -834,7 +910,8 @@ class DataCleanerAgent(BaseAgent):
         self._emit_pipeline_process_script(spec, mode="split")
         self.logger.log(self.name, "Process Complete",
             f"train={train_final_shape} | valid={'y' if out_paths['valid'] else '-'} "
-            f"| oot={'y' if out_paths['oot'] else '-'}")
+            f"| oot={'y' if out_paths['oot'] else '-'} "
+            f"| test={'y' if out_paths['test'] else '-'}")
         return out_paths, report
 
     def process(self, input_path: str) -> Tuple[str, Dict[str, Any]]:
@@ -878,7 +955,16 @@ class DataCleanerAgent(BaseAgent):
         Usage at replay time:
             python pipeline_process_data_cleaner.py <input_file> <output_parquet>
         """
+        import joblib
         from datetime import datetime
+
+        # Pickle the live spec next to the script. The script below is
+        # standalone (literals only) and replays COLUMN ops; the pickle also
+        # carries spec.row_ops, which only replay_pipeline.py uses and only on
+        # the train partition.
+        Path(Config.PIPELINE_PROCESS_DC_SPEC_PATH).parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(spec, Config.PIPELINE_PROCESS_DC_SPEC_PATH)
+
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         drops_repr       = json.dumps(spec.drops, indent=4)
         dtype_fixes_repr = json.dumps([list(t) for t in spec.dtype_fixes], indent=4)
@@ -893,6 +979,11 @@ Clip bounds : {len(spec.clip_bounds)} cols
 
 Replay the column-level cleaning decisions captured during the original
 pipeline run. Pure pandas — no agent/LLM dependency.
+
+Column ops only. The {len(spec.row_ops)} TRAIN-only row op(s) recorded for this
+run (sampling / dedup) are NOT replayed here, because valid/oot must keep every
+original row. To rebuild the exact TRAIN frame the model was fitted on, use
+replay_pipeline.py, which reads cleaning_spec.pkl and applies spec.row_ops.
 
 Usage:
     python pipeline_process_data_cleaner.py <input_file> <output_file.parquet>
@@ -1335,6 +1426,7 @@ if __name__ == "__main__":
                     elif action_type == "drop_duplicates":
                         # ROW op — applies to train only, not recorded in spec.
                         self.df = self.execute_tool("drop_duplicates", df=self.df)
+                        spec.row_ops.append({"op": "drop_duplicates"})
                         actions_taken.append(f"Dropped duplicate rows (TRAIN-only): {reason}")
 
                     elif action_type == "clip_outliers":
@@ -1358,6 +1450,8 @@ if __name__ == "__main__":
                                 f"Target column '{self._target_column}' must not be a dedup key — blocked")
                             continue
                         self.df = self.execute_tool("deduplicate_by_key", df=self.df, key_cols=key_cols, keep=keep)
+                        spec.row_ops.append({"op": "deduplicate_by_key",
+                                             "columns": list(key_cols), "keep": keep})
                         actions_taken.append(f"Deduplicated by key {key_cols} (keep={keep}, TRAIN-only): {reason}")
 
                     elif action_type == "fix_column_dtype":

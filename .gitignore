@@ -33,3 +33,14 @@ data/bank+marketing/
 .ipynb_checkpoints/
 Temp/
 check.ipynb
+
+# Per-run output dirs (models, parquet copies of the data, logs)
+outputs/20*/
+outputs/charts/
+outputs/*.png
+outputs/shap_*.csv
+
+# Overnight driver output, legacy run artifacts
+outputs/overnight_*/
+outputs/overnight_driver*
+outputs/_legacy_*/

@@ -1,3 +1,4 @@
+import time
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -11,11 +12,13 @@ from sklearn.metrics import roc_auc_score
 from Agents.BaseAgent.base_agent import BaseAgent
 from logger import AgentLogger
 from config import Config
+import splitting
 
 
-# Marker column used in pre-split mode (set by AutoMLPipeline._build_combined_input).
+# Marker column used in pre-split mode (set by TrainModelAgent.process_splits).
 # When present in self.df, _tool_split_data uses it to reconstruct exact
 # user-defined splits instead of running the temporal / random auto-split.
+# Values: "train" | "valid" | "oot" | "test".
 _SPLIT_MARKER = "_split_"
 
 
@@ -31,6 +34,35 @@ def _smallest_int_dtype(n_classes: int) -> np.dtype:
     if n_classes <= 32_767:
         return np.int16
     return np.int32
+
+
+def _auc_se(auc: float, n_pos: int, n_neg: int) -> float:
+    """Hanley-McNeil (1982) standard error of an AUC estimate."""
+    if n_pos < 2 or n_neg < 2 or not (0.0 < auc < 1.0):
+        return 0.0
+    q1, q2 = auc / (2 - auc), 2 * auc ** 2 / (1 + auc)
+    var = (auc * (1 - auc) + (n_pos - 1) * (q1 - auc ** 2) + (n_neg - 1) * (q2 - auc ** 2)) / (n_pos * n_neg)
+    return float(np.sqrt(max(var, 0.0)))
+
+
+def _adopt_retuned(old_auc: Optional[float], new_auc: Optional[float], min_gain: float) -> bool:
+    """Adopt re-tuned hyperparameters only when they actually score better."""
+    if new_auc is None:
+        return False
+    if old_auc is None:
+        return True
+    return (new_auc - old_auc) >= min_gain
+
+
+class SigmoidCalibrator:
+    """Platt scaling wrapper. Module-level so joblib can pickle it (a class defined
+    inside _fit_calibrator is not picklable and crashed _save_model)."""
+
+    def __init__(self, clf):
+        self.clf = clf
+
+    def predict(self, x):
+        return self.clf.predict_proba(np.asarray(x).reshape(-1, 1))[:, 1]
 
 
 class TrainModelAgent(BaseAgent):
@@ -367,6 +399,7 @@ class TrainModelAgent(BaseAgent):
         X_tr: pd.DataFrame, y_tr: pd.Series,
         X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None,
         rounds: Optional[int] = None,
+        deadline: Optional[float] = None,
     ) -> Any:
         """Fit `model` with early stopping when a validation set is supplied.
 
@@ -396,12 +429,19 @@ class TrainModelAgent(BaseAgent):
         try:
             if estimator_name in ("lgbm", "LightGBM"):
                 import lightgbm as lgb
+                cbs = [lgb.early_stopping(rounds, verbose=False), lgb.log_evaluation(0)]
+                if deadline is not None:
+                    def _deadline_cb(env, _d=deadline):
+                        if time.monotonic() > _d:
+                            import optuna
+                            raise optuna.TrialPruned("trial wall-clock cap reached")
+                    _deadline_cb.order = 30
+                    cbs.append(_deadline_cb)
                 model.fit(
                     X_tr, y_tr,
                     eval_set=[(X_val, y_val)],
                     eval_metric="auc",
-                    callbacks=[lgb.early_stopping(rounds, verbose=False),
-                               lgb.log_evaluation(0)],
+                    callbacks=cbs,
                 )
             elif estimator_name in ("xgboost", "XGBoost"):
                 import xgboost as xgb
@@ -413,11 +453,21 @@ class TrainModelAgent(BaseAgent):
                     # "Must have at least 1 validation dataset for early stopping"
                     # and failing every CV fold. Always reset it after the fit.
                     model.set_params(early_stopping_rounds=rounds)
-                    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+                    if deadline is not None:
+                        class _XgbDeadline(xgb.callback.TrainingCallback):
+                            def after_iteration(self, model_, epoch, evals_log, _d=deadline):
+                                if time.monotonic() > _d:
+                                    import optuna
+                                    raise optuna.TrialPruned("trial wall-clock cap reached")
+                                return False
+                        model.set_params(callbacks=[_XgbDeadline()])
                     try:
-                        model.set_params(early_stopping_rounds=None)
-                    except Exception:
-                        pass
+                        model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+                    finally:
+                        try:
+                            model.set_params(early_stopping_rounds=None, callbacks=None)
+                        except Exception:
+                            pass
                 else:
                     model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)],
                               early_stopping_rounds=rounds, verbose=False)
@@ -427,6 +477,8 @@ class TrainModelAgent(BaseAgent):
             else:
                 model.fit(X_tr, y_tr)
         except Exception as e:
+            if type(e).__name__ == "TrialPruned":
+                raise                       # the per-trial cap must reach Optuna, not become a plain fit
             self.logger.log(self.name, "EarlyStop WARN",
                 f"ES fit failed for {estimator_name} ({e}) → plain fit")
             try:
@@ -514,11 +566,11 @@ class TrainModelAgent(BaseAgent):
     @staticmethod
     def _stratified_split(df: pd.DataFrame, target: str, test_size: float, rs: int):
         """Stratified split with automatic fallback to unstratified when a class is too small."""
-        from sklearn.model_selection import train_test_split as _split
-        try:
-            return _split(df, test_size=test_size, stratify=df[target], random_state=rs)
-        except ValueError:
-            return _split(df, test_size=test_size, stratify=None, random_state=rs)
+        return splitting.stratified_split(df, target, test_size, rs)
+
+    def _split_log(self, stage: str, message: str) -> None:
+        """Adapter so `splitting` can log through this agent's logger."""
+        self.logger.log(self.name, stage, message)
 
     def _resolve_period_freq(self, dt_series: pd.Series) -> Tuple[str, str]:
         """Resolve (pandas period freq, human unit) from temporal_freq.
@@ -528,34 +580,24 @@ class TrainModelAgent(BaseAgent):
         common weekday present in date_col. Everything else → ("M", "month").
         Weekly is opt-in only (never auto-inferred) to avoid mis-detection.
         """
-        mode = (self.temporal_freq or "auto").lower()
-        if mode != "weekly":
-            return "M", "month"
-        valid = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
-        anchor = (self.week_closing_day or "").strip().upper()
-        if anchor not in valid:
-            wd = dt_series.dropna().dt.day_name().str[:3].str.upper()
-            anchor = wd.mode().iloc[0] if not wd.empty else "SUN"
-            self.logger.log(self.name, "Temporal freq",
-                f"weekly cadence — week_closing_day auto-detected = {anchor} "
-                "(most common weekday in date_col; set week_closing_day to override)")
-        return f"W-{anchor}", "week"
+        return splitting.resolve_period_freq(
+            dt_series, self.temporal_freq, self.week_closing_day, self._split_log)
 
     def _tool_split_data(
         self, df: pd.DataFrame, provided_oot: Optional[pd.DataFrame] = None
     ) -> Dict[str, pd.DataFrame]:
         target = self.target_column
         rs = Config.RANDOM_STATE
-        total = len(df)
 
         # ── Pre-split mode: reconstruct train/valid/oot from `_split_` marker ──
-        # AutoMLPipeline._build_combined_input writes the marker whenever the
-        # caller supplies valid_path or oot_path. Agents 1+2 protected the
-        # column so it survived cleaning + feature engineering. Honour it
-        # exactly. Three sub-cases by which marker values are present:
-        #   {train, valid, oot} → use all three as marked.
-        #   {train, valid}      → no OOT; use train/valid as marked.
-        #   {train, oot}        → split train 80/20 into train+valid; oot as marked.
+        # process_splits writes the marker whenever the caller supplies any of
+        # valid_path / oot_path / test_path. Agents 1+2 protected the column so
+        # it survived cleaning + feature engineering. Honour it exactly.
+        # Sub-cases by which marker values are present:
+        #   {train, valid, oot}  → use all three as marked.
+        #   {train, valid, test} → non-temporal auto-split; `test` is the holdout.
+        #   {train, valid}       → no holdout; use train/valid as marked.
+        #   {train, oot}         → split train 80/20 into train+valid; oot as marked.
         if _SPLIT_MARKER in df.columns:
             marker = df[_SPLIT_MARKER].astype(str)
             feat_df = df.drop(columns=[_SPLIT_MARKER])
@@ -564,6 +606,11 @@ class TrainModelAgent(BaseAgent):
             train_marked = feat_df[marker == "train"].reset_index(drop=True)
             valid_marked = feat_df[marker == "valid"].reset_index(drop=True)
             oot_marked   = feat_df[marker == "oot"].reset_index(drop=True)
+            # Single-file mode with no usable date column produces a random
+            # holdout instead of a temporal one. It stays labelled `test` so PSI
+            # and the OOT metrics never claim a temporal guarantee that the
+            # split never made.
+            test_marked  = feat_df[marker == "test"].reset_index(drop=True)
 
             has_explicit_valid = len(valid_marked) > 0
             if has_explicit_valid:
@@ -571,7 +618,7 @@ class TrainModelAgent(BaseAgent):
                 valid_df = valid_marked
                 self.logger.log(self.name, "Split (pre-split marker)",
                     f"train={len(train_df)} | valid={len(valid_df)} | "
-                    f"oot={len(oot_marked)} (all from marker)")
+                    f"oot={len(oot_marked)} | test={len(test_marked)} (all from marker)")
             else:
                 # valid missing — auto-split 80/20 from the train portion
                 train_df, valid_df = self._stratified_split(train_marked, target, 0.20, rs)
@@ -579,7 +626,7 @@ class TrainModelAgent(BaseAgent):
                 valid_df = valid_df.reset_index(drop=True)
                 self.logger.log(self.name, "Split (pre-split marker, auto-valid)",
                     f"train={len(train_df)} | valid={len(valid_df)} (auto 20% of train) | "
-                    f"oot={len(oot_marked)} (from marker)")
+                    f"oot={len(oot_marked)} | test={len(test_marked)} (from marker)")
 
             return {
                 "train":          train_df,
@@ -587,7 +634,7 @@ class TrainModelAgent(BaseAgent):
                 "valid_random":   empty.copy(),
                 "valid":          valid_df,
                 "oot":            oot_marked,
-                "test":           empty.copy(),
+                "test":           test_marked,
             }
 
         empty = pd.DataFrame(columns=df.columns)
@@ -608,220 +655,24 @@ class TrainModelAgent(BaseAgent):
                 "test":           empty.copy(),
             }
 
-        if self.date_col and self.date_col in df.columns:
-            # Bucket each row into a period (month or week) as a standalone Series —
-            # avoids df.copy() and the later .drop(columns=["_ym"]) which each
-            # allocate a full copy of the frame. Frequency is resolved from
-            # temporal_freq: monthly by default, weekly only when opted in.
-            _dt = pd.to_datetime(df[self.date_col], errors="coerce")
-            self.period_freq, self.period_unit = self._resolve_period_freq(_dt)
-            ym  = _dt.dt.to_period(self.period_freq)
-
-            nat_count = int(_dt.isna().sum())
-            if nat_count:
-                self.logger.log(self.name, "WARN",
-                    f"{nat_count} rows have unparseable dates in '{self.date_col}' — "
-                    "treated as non-OOT (assigned to train pool)")
-            sorted_months = sorted(ym.dropna().unique())   # periods (month or week)
-            valid_rows = total - nat_count
-
-            # ── Detect temporal cadence on the FULL series (authoritative) ──────
-            # "*_snapshot": exactly one distinct calendar date per period (e.g.
-            # every row stamped 2023-01-31, or every Friday) → the model operates
-            # at that granularity, so every temporal slice (OOT, valid_temporal,
-            # stability) must move in whole-period steps. Otherwise "intra_month" /
-            # "weekly" (multiple dates per period). Recorded so the report is
-            # explicit about the granularity rather than a blind row-count split.
-            n_dates_total = int(_dt.dropna().nunique())
-            n_periods_total = len(sorted_months)
-            is_snapshot = (n_dates_total == n_periods_total)
-            if self.period_unit == "week":
-                self.date_cadence = "weekly_snapshot" if is_snapshot else "weekly"
-            else:
-                self.date_cadence = "monthly_snapshot" if is_snapshot else "intra_month"
-            self.temporal_meta = {
-                "cadence": self.date_cadence,
-                "period_unit": self.period_unit,
-                "period_freq": self.period_freq,
-                "date_col": self.date_col,
-                "n_periods_total": n_periods_total,
-                "n_distinct_dates": n_dates_total,
-                "first_period": str(sorted_months[0]) if sorted_months else None,
-                "last_period": str(sorted_months[-1]) if sorted_months else None,
-            }
-            if n_periods_total >= 2:
-                runs_at = self.period_unit.upper()
-                self.logger.log(self.name, "Temporal cadence",
-                    f"{self.date_cadence} | {n_periods_total} {self.period_unit}s "
-                    f"[{self.temporal_meta['first_period']}..{self.temporal_meta['last_period']}] "
-                    f"| {n_dates_total} distinct dates"
-                    + (f" — model runs {runs_at}LY; all temporal splits snap to whole {self.period_unit}s"
-                       if is_snapshot else ""))
-
-            # B2 fix: need >= 2 distinct periods to create a meaningful OOT set
-            if len(sorted_months) < 2:
-                self.logger.log(self.name, "WARN",
-                    f"Only {len(sorted_months)} distinct {self.period_unit}(s) in '{self.date_col}' — "
-                    "cannot create OOT split, falling back to simple split")
-                # fall through to simple split below
-                ym = None
-            else:
-                # Step 1: find minimum trailing months to reach OOT_MIN_RATIO (start from 1)
-                n_oot = 1
-                while n_oot < len(sorted_months):
-                    if ym.isin(sorted_months[-n_oot:]).sum() / valid_rows >= Config.OOT_MIN_RATIO:
-                        break
-                    n_oot += 1
-
-                # Step 2: floor — always include at least OOT_INIT_MONTHS
-                n_oot = max(n_oot, Config.OOT_INIT_MONTHS)
-
-                # Clamp to leave at least 1 month for pool
-                n_oot = min(n_oot, len(sorted_months) - 1)
-
-                # Step 3: ceiling — shrink if OOT exceeds OOT_MAX_RATIO
-                oot_ratio = ym.isin(sorted_months[-n_oot:]).sum() / valid_rows
-                if oot_ratio > Config.OOT_MAX_RATIO:
-                    while n_oot > 1:
-                        candidate_ratio = ym.isin(sorted_months[-(n_oot - 1):]).sum() / valid_rows
-                        if candidate_ratio <= Config.OOT_MAX_RATIO:
-                            n_oot -= 1
-                            break
-                        n_oot -= 1
-                    oot_ratio = ym.isin(sorted_months[-n_oot:]).sum() / valid_rows
-                    self.logger.log(self.name, "WARN",
-                        f"OOT exceeded cap {Config.OOT_MAX_RATIO:.0%} — "
-                        f"reduced to {n_oot} {self.period_unit}(s) = {oot_ratio:.1%}. "
-                        f"Data may have coarse {self.period_unit} granularity or heavy recency bias.")
-
-                mask_oot  = ym.isin(set(sorted_months[-n_oot:])).values
-                mask_pool = ~mask_oot
-                pool_size = int(mask_pool.sum())
-
-                # B2 fix: guard against empty pool after OOT split
-                if pool_size == 0:
-                    self.logger.log(self.name, "WARN",
-                        "Pool is empty after OOT split — falling back to simple split")
-                    ym = None
-                else:
-                    # Materialise oot_df first (smaller subset)
-                    oot_df = df[mask_oot].reset_index(drop=True)
-
-                    # Valid-temporal: pool rows closest to the OOT boundary.
-                    # Selection is snapped to WHOLE PERIOD boundaries (month or
-                    # week), not a raw row-count slice. Without snapping, snapshot
-                    # data (all rows in a period share the same date, e.g.
-                    # 2023-01-31 or a Friday) would have valid_temporal and train
-                    # contain rows from the SAME snapshot period — no real temporal
-                    # separation. Whole-period snapping is safe for any cadence: it
-                    # picks the minimum trailing pool periods whose combined row
-                    # count covers n_temporal, keeping period boundaries intact.
-                    valid_size = max(1, int(round(pool_size * Config.TRAIN_TEST_SPLIT_SIZE)))
-                    n_temporal = max(1, int(round(valid_size * Config.VALID_TEMPORAL_RATIO)))
-
-                    pool_ym_s   = ym[mask_pool]          # Series: pool rows → Period
-                    pool_months = sorted(pool_ym_s.dropna().unique())
-
-                    # Cadence already detected on the full series above. For a
-                    # snapshot cadence, snapping valid_temporal to whole periods is
-                    # what prevents train + valid_temporal sharing the same snapshot
-                    # period (within-period leakage).
-                    if self.date_cadence in ("monthly_snapshot", "weekly_snapshot"):
-                        self.logger.log(self.name, "Split temporal",
-                            f"{self.date_cadence} — snapping valid_temporal to "
-                            f"whole {self.period_unit}s to avoid within-{self.period_unit} leakage")
-
-                    n_val_months = 1
-                    while n_val_months < len(pool_months):
-                        covered = int(pool_ym_s.isin(pool_months[-n_val_months:]).sum())
-                        if covered >= n_temporal:
-                            break
-                        n_val_months += 1
-                    # Always leave at least 1 pool period for train
-                    n_val_months = min(n_val_months, max(1, len(pool_months) - 1))
-
-                    temporal_orig_idx = set(
-                        pool_ym_s[pool_ym_s.isin(set(pool_months[-n_val_months:]))].index
-                    )
-                    self.logger.log(self.name, "Split temporal",
-                        f"valid_temporal = {n_val_months} whole {self.period_unit}(s) | "
-                        f"rows={len(temporal_orig_idx)} | target_rows={n_temporal}")
-                    del _dt, ym  # free temporary Series before creating large DataFrames
-
-                    mask_temp_orig = pd.Series(False, index=df.index)
-                    mask_temp_orig[list(temporal_orig_idx)] = True
-
-                    # Materialise each split from the original df using boolean masks
-                    valid_temp_df = df[mask_temp_orig.values].reset_index(drop=True)
-                    mask_remain   = mask_pool & ~mask_temp_orig.values
-                    remain_df     = df[mask_remain].reset_index(drop=True)
-
-                    # Valid-random: stratified from remaining pool (B3 fix: fallback)
-                    n_rand     = valid_size - len(valid_temp_df)
-                    rand_ratio = n_rand / len(remain_df) if len(remain_df) > 0 else 0.0
-                    if 0 < rand_ratio < 1:
-                        train_df, valid_rand_df = self._stratified_split(remain_df, target, rand_ratio, rs)
-                        train_df      = train_df.reset_index(drop=True)
-                        valid_rand_df = valid_rand_df.reset_index(drop=True)
-                    else:
-                        train_df      = remain_df
-                        valid_rand_df = empty.copy()
-
-                    valid_df = pd.concat([valid_temp_df, valid_rand_df], ignore_index=True)
-
-                    # Degenerate-split warning — usually means date_col is a
-                    # mislabelled feature (e.g. days_birth coerced as
-                    # nanoseconds-since-epoch). The downstream eval_set / CV
-                    # paths will fall back to `valid` or skip ES entirely,
-                    # but the user almost certainly wants to know.
-                    target_in = lambda d: target in d.columns and len(d) > 0
-                    bad_temp = (target_in(valid_temp_df)
-                                and pd.to_numeric(valid_temp_df[target], errors="coerce").nunique() < 2)
-                    bad_oot  = (target_in(oot_df)
-                                and pd.to_numeric(oot_df[target], errors="coerce").nunique() < 2)
-                    if bad_temp or bad_oot or len(valid_temp_df) < 10 or len(oot_df) < 10:
-                        self.logger.log(self.name, "SPLIT WARN",
-                            f"Degenerate temporal split — valid_temp={len(valid_temp_df)} rows "
-                            f"(bad_classes={bad_temp}), oot={len(oot_df)} rows "
-                            f"(bad_classes={bad_oot}). date_col='{self.date_col}' may not be a "
-                            "real snapshot column; downstream will fall back to `valid` for ES.")
-
-                    # Record how many whole periods each temporal split spans so
-                    # the report states the cadence (monthly/weekly) explicitly.
-                    self.temporal_meta.update({
-                        "oot_periods": int(n_oot),
-                        "valid_temporal_periods": int(n_val_months),
-                        "train_periods": int(len(pool_months) - n_val_months),
-                    })
-
-                    self.logger.log(self.name, "Split (OOT)",
-                        f"oot_{self.period_unit}s={n_oot} | oot_ratio={len(oot_df)/total:.1%} | "
-                        f"train={len(train_df)} | valid_temp={len(valid_temp_df)} | "
-                        f"valid_rand={len(valid_rand_df)} | oot={len(oot_df)}")
-                    return {
-                        "train": train_df, "valid_temporal": valid_temp_df,
-                        "valid_random": valid_rand_df, "valid": valid_df,
-                        "oot": oot_df, "test": empty.copy(),
-                    }
-
-        # Fallback: no date col or fell through from OOT path. No temporal OOT was
-        # produced, so the splits are NOT month-based — mark cadence accordingly
-        # (overrides any cadence detected before the fall-through).
-        self.temporal_meta = {"cadence": "non_temporal"}
-        self.date_cadence = "non_temporal"
-        # 3-way stratified split: 60% train / 20% valid / 20% test (no temporal OOT)
-        train_valid_df, test_df = self._stratified_split(df, target, 0.20, rs)
-        train_df, valid_df      = self._stratified_split(train_valid_df, target, 0.25, rs)
-        self.logger.log(self.name, "Split (simple)",
-            f"train={len(train_df)} | valid={len(valid_df)} | test={len(test_df)} | no OOT")
-        return {
-            "train":          train_df.reset_index(drop=True),
-            "valid_temporal": empty.copy(),
-            "valid_random":   empty.copy(),
-            "valid":          valid_df.reset_index(drop=True),
-            "oot":            empty.copy(),
-            "test":           test_df.reset_index(drop=True),
-        }
+        # ── Auto-split: delegate to the shared splitter ────────────────────
+        # `splitting.auto_split` is the single source of truth for how this
+        # pipeline cuts partitions — AutoMLPipeline calls the same function in
+        # single-file mode so Agents 1+2 fit on exactly the TRAIN rows this
+        # agent later evaluates against.
+        res = splitting.auto_split(
+            df,
+            target_column=target,
+            date_col=self.date_col,
+            temporal_freq=self.temporal_freq,
+            week_closing_day=self.week_closing_day,
+            log=self._split_log,
+        )
+        self.temporal_meta = res.temporal_meta
+        self.date_cadence  = res.date_cadence
+        self.period_freq   = res.period_freq
+        self.period_unit   = res.period_unit
+        return res.as_splits_dict()
 
     # ── Step 2: FLAML AutoML ──────────────────────────────────────────────────
 
@@ -911,7 +762,8 @@ class TrainModelAgent(BaseAgent):
             # often +0.3-1% AUC on credit data because it regularises tail
             # bins where gbdt overfits. ES is incompatible with DART (it
             # rebuilds dropped trees each round) — handled in _fit_with_early_stopping.
-            boosting_type = trial.suggest_categorical("boosting_type", ["gbdt", "dart"])
+            boosting_type = (trial.suggest_categorical("boosting_type", ["gbdt", "dart"])
+                             if Config.OPTUNA_ENABLE_DART else "gbdt")
             params = {
                 "boosting_type": boosting_type,
                 "n_estimators": trial.suggest_int("n_estimators", Config.N_ESTIMATORS_MIN, Config.N_ESTIMATORS_MAX, step=50),
@@ -971,9 +823,13 @@ class TrainModelAgent(BaseAgent):
                     "scale_pos_weight", max(1.0, lo), max(1.01, hi), log=True
                 )
             return params
-        # rf / extra_tree / RandomForest / ExtraTrees — no GPU support
+        # rf / extra_tree / RandomForest / ExtraTrees — no GPU support. Not interruptible
+        # mid-fit, so the tree count is bounded (TREE_ENSEMBLE_MAX_ESTIMATORS).
         return {
-            "n_estimators": trial.suggest_int("n_estimators", Config.N_ESTIMATORS_MIN, Config.N_ESTIMATORS_MAX, step=50),
+            "n_estimators": trial.suggest_int(
+                "n_estimators", Config.N_ESTIMATORS_MIN,
+                max(Config.N_ESTIMATORS_MIN, min(Config.N_ESTIMATORS_MAX, Config.TREE_ENSEMBLE_MAX_ESTIMATORS)),
+                step=50),
             "max_depth": trial.suggest_int("max_depth", Config.MAX_DEPTH_MIN, Config.MAX_DEPTH_MAX),
             "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
             "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 15),
@@ -1001,6 +857,9 @@ class TrainModelAgent(BaseAgent):
             self.logger.log(self.name, "Optuna", "No validation set → skip")
             return base_params
 
+        self._last_optuna_best = None
+        total_timeout = timeout if timeout is not None else Config.OPTUNA_TIMEOUT
+        trial_cap = Config.OPTUNA_TRIAL_TIMEOUT or max(120, int(total_timeout / 8))
         ModelClass = self._get_model_class(estimator_name)
         _estimator_name = estimator_name
         _self = self
@@ -1034,7 +893,8 @@ class TrainModelAgent(BaseAgent):
             params.update(class_weight_params)
             model = ModelClass(**params)
             _self._fit_with_early_stopping(
-                model, _estimator_name, X_train, y_train, X_valid, y_valid
+                model, _estimator_name, X_train, y_train, X_valid, y_valid,
+                deadline=time.monotonic() + trial_cap,
             )
             return roc_auc_score(y_valid, model.predict_proba(X_valid)[:, 1])
 
@@ -1054,12 +914,32 @@ class TrainModelAgent(BaseAgent):
             full_best_params = self._build_optuna_params(
                 estimator_name, FixedTrial(study.best_params), pos_weight_range
             )
+            self._last_optuna_best = float(study.best_value)
+            states = [t.state.name for t in study.trials]
             self.logger.log(self.name, "Optuna",
-                f"best_AUC={study.best_value:.4f} | params={json.dumps(study.best_params)[:200]}")
+                f"best_AUC={study.best_value:.4f} | trials: complete={states.count('COMPLETE')} "
+                f"pruned={states.count('PRUNED')} (per-trial cap {trial_cap}s) | "
+                f"params={json.dumps(study.best_params)[:200]}")
             return full_best_params
         except Exception as e:
             self.logger.log(self.name, "Optuna", f"No completed trials ({e}) → fallback to base_params")
             return base_params
+
+    def _eval_params(self, estimator_name: str, params: Dict,
+                     X_train: pd.DataFrame, y_train: pd.Series,
+                     X_valid: pd.DataFrame, y_valid: pd.Series) -> Optional[float]:
+        """Valid AUC of `params` on the given feature matrices — same recipe as an Optuna trial
+        (class weights + early stopping on valid), so scores are comparable with study values."""
+        try:
+            cw = self._compute_class_weight_params(y_train, estimator_name)
+            if "scale_pos_weight" in params:
+                cw.pop("scale_pos_weight", None)
+            model = self._get_model_class(estimator_name)(**{**self._safe_params(estimator_name, params), **cw})
+            self._fit_with_early_stopping(model, estimator_name, X_train, y_train, X_valid, y_valid)
+            return float(roc_auc_score(y_valid, model.predict_proba(X_valid)[:, 1]))
+        except Exception as e:
+            self.logger.log(self.name, "Eval params WARN", f"{type(e).__name__}: {e}")
+            return None
 
     # ── Step 4: RFE ───────────────────────────────────────────────────────────
 
@@ -1413,6 +1293,225 @@ class TrainModelAgent(BaseAgent):
 
         return best_features, pd.DataFrame(records)
 
+    # ── Step 4b / 7b: single-fit ranking + batch prune with AUC tolerance ─────
+
+    def _validate_selection_config(self) -> None:
+        """Unknown option values fall back to the default instead of failing a long run."""
+        allowed = {
+            "FEATURE_RANK_METHOD": ("importance", "rfe"),
+            "FEATURE_RANK_IMPORTANCE": ("gain", "shap"),
+            "PRUNE_METHOD": ("batch_tolerance", "one_by_one"),
+            "FEATURE_CAP_POLICY": ("auc_first", "cap_first"),
+        }
+        defaults = {"FEATURE_RANK_METHOD": "importance", "FEATURE_RANK_IMPORTANCE": "gain",
+                    "PRUNE_METHOD": "batch_tolerance", "FEATURE_CAP_POLICY": "cap_first"}
+        for key, ok in allowed.items():
+            val = getattr(Config, key)
+            if val not in ok:
+                self.logger.log(self.name, "Config WARN",
+                    f"{key}='{val}' is not one of {ok} — using '{defaults[key]}'")
+                setattr(Config, key, defaults[key])
+
+    def _selection_model(self, estimator_name: str, params: Dict, y_train: pd.Series):
+        """Model used for ranking and batch pruning: the given params with a fixed tree budget,
+        a learning-rate floor, no DART, and the usual class weighting."""
+        ModelClass = self._get_model_class(estimator_name)
+        p = dict(self._safe_params(estimator_name, params or {}))
+        p[self._get_n_estimators_key(estimator_name)] = Config.FEATURE_RANK_N_ESTIMATORS
+        if "learning_rate" in p:
+            p["learning_rate"] = max(float(p["learning_rate"]), Config.FEATURE_RANK_LEARNING_RATE)
+        if p.get("boosting_type") == "dart":
+            p["boosting_type"] = "gbdt"
+        cw = self._compute_class_weight_params(y_train, estimator_name)
+        if "scale_pos_weight" in p:
+            cw.pop("scale_pos_weight", None)
+        p.update(cw)
+        p.update(self._gpu_params(estimator_name))
+        return ModelClass(**p)
+
+    def _importance_vector(self, model, estimator_name: str, cols: List[str],
+                           X_sample: Optional[pd.DataFrame] = None) -> pd.Series:
+        """Per-feature importance of a fitted model (gain by default, mean |SHAP| on request)."""
+        if Config.FEATURE_RANK_IMPORTANCE == "shap" and X_sample is not None:
+            try:
+                import shap
+                sv = shap.TreeExplainer(model).shap_values(X_sample)
+                if isinstance(sv, list):
+                    sv = sv[1]
+                elif isinstance(sv, np.ndarray) and sv.ndim == 3:
+                    sv = sv[:, :, 1]
+                return pd.Series(np.abs(sv).mean(axis=0), index=cols)
+            except Exception as e:
+                self.logger.log(self.name, "Importance WARN",
+                    f"SHAP importance failed ({type(e).__name__}) — falling back to gain")
+        imp = None
+        try:
+            if estimator_name in ("lgbm", "LightGBM"):
+                imp = model.booster_.feature_importance(importance_type="gain")
+            elif estimator_name in ("xgboost", "XGBoost"):
+                sc = model.get_booster().get_score(importance_type="total_gain")
+                imp = np.array([sc.get(c, 0.0) for c in cols], dtype=float)
+            elif estimator_name in ("catboost", "CatBoost"):
+                imp = model.get_feature_importance()
+        except Exception:
+            imp = None
+        if imp is None:
+            imp = getattr(model, "feature_importances_", None)
+        if imp is None:
+            imp = np.ones(len(cols))
+        return pd.Series(np.asarray(imp, dtype=float), index=cols)
+
+    def _fit_selection_model(self, estimator_name, params, X_train, y_train, X_valid, y_valid):
+        model = self._selection_model(estimator_name, params, y_train)
+        has_valid = X_valid is not None and len(X_valid) > 0 and y_valid.nunique() >= 2
+        if has_valid:
+            self._fit_with_early_stopping(model, estimator_name, X_train, y_train, X_valid, y_valid)
+            try:
+                auc = float(roc_auc_score(y_valid, model.predict_proba(X_valid)[:, 1]))
+            except Exception:
+                auc = float("nan")
+        else:
+            model.fit(X_train, y_train)
+            auc = float("nan")
+        return model, auc
+
+    def _tool_rank_features(
+        self, estimator_name: str, params: Dict,
+        X_train: pd.DataFrame, y_train: pd.Series,
+        X_valid: pd.DataFrame, y_valid: pd.Series,
+        n_target: int,
+    ) -> List[str]:
+        """Replacement for RFE: one model fit -> importance ranking -> drop near-duplicates ->
+        top `n_target`. Minutes instead of hours."""
+        cols = list(X_train.columns)
+        model, auc = self._fit_selection_model(estimator_name, params, X_train, y_train, X_valid, y_valid)
+        sample = X_train.sample(min(Config.SHAP_SAMPLE_SIZE, len(X_train)), random_state=Config.RANDOM_STATE) \
+            if Config.FEATURE_RANK_IMPORTANCE == "shap" else None
+        imp = self._importance_vector(model, estimator_name, cols, sample)
+        order = [c for c in imp.sort_values(ascending=False).index if imp[c] > 0]
+        n_zero = len(cols) - len(order)
+
+        thr = Config.FEATURE_RANK_CORR_THRESHOLD
+        n_dup = 0
+        if order and 0 < thr < 1:
+            smp = X_train[order].sample(min(30000, len(X_train)), random_state=Config.RANDOM_STATE)
+            cm = smp.replace(-999, np.nan).corr().abs().to_numpy()
+            kept_idx: List[int] = []
+            for i in range(len(order)):
+                if kept_idx:
+                    row = cm[i, kept_idx]
+                    if np.isfinite(row).any() and np.nanmax(row) > thr:
+                        n_dup += 1
+                        continue
+                kept_idx.append(i)
+            order = [order[i] for i in kept_idx]
+        selected = order[:n_target]
+        if len(selected) < min(n_target, len(cols)):        # never return fewer than asked if avoidable
+            rest = [c for c in imp.sort_values(ascending=False).index if c not in set(selected)]
+            selected += rest[:n_target - len(selected)]
+        self.logger.log(self.name, "Feature rank",
+            f"{len(cols)} → {len(selected)} | method=importance({Config.FEATURE_RANK_IMPORTANCE}) | "
+            f"zero-importance={n_zero} | near-duplicates dropped (|r|>{thr})={n_dup} | "
+            f"ranking-model valid_auc={auc:.4f}")
+        return selected
+
+    def _tool_batch_prune(
+        self, estimator_name: str, params: Dict, feature_cols: List[str],
+        X_train: pd.DataFrame, y_train: pd.Series,
+        X_valid: pd.DataFrame, y_valid: pd.Series,
+        psi_df: pd.DataFrame,
+    ) -> Tuple[List[str], pd.DataFrame]:
+        """Shrink the feature set in batches and keep the smallest set whose valid AUC is within
+        PRUNE_AUC_TOLERANCE of the best seen.
+
+        Each round: fit on the current set (early stopping on valid) -> record (size, valid AUC)
+        -> remove the weakest PRUNE_BATCH_FRACTION by importance (blended with PSI when available).
+        Stops at the size floor, PRUNE_MAX_ROUNDS, or once AUC is PRUNE_STOP_DROP below the best.
+        FEATURE_CAP_POLICY=cap_first additionally guarantees <= MAX_FINAL_FEATURES.
+        """
+        has_valid = len(X_valid) > 0 and y_valid.nunique() >= 2
+        if not has_valid:
+            self.logger.log(self.name, "Batch Prune", "No validation set → skip pruning")
+            return list(feature_cols), pd.DataFrame()
+
+        min_features = max(Config.SHAP_PSI_MIN_FEATURES_FLOOR,
+                           int(Config.MAX_FINAL_FEATURES * Config.SHAP_PSI_MIN_FEATURES_RATIO))
+        frac = min(0.5, max(0.01, Config.PRUNE_BATCH_FRACTION))
+        tol = max(0.0, Config.PRUNE_AUC_TOLERANCE)
+        cap = Config.MAX_FINAL_FEATURES
+        psi_lookup: Dict[str, float] = {}
+        if not psi_df.empty and "feature" in psi_df.columns and "psi" in psi_df.columns:
+            psi_lookup = dict(zip(psi_df["feature"], psi_df["psi"]))
+
+        current = [c for c in feature_cols if c in X_train.columns and c in X_valid.columns]
+        history: List[Dict[str, Any]] = []
+        best_seen = -1.0
+        for rnd in range(Config.PRUNE_MAX_ROUNDS + 1):
+            model, auc = self._fit_selection_model(
+                estimator_name, params, X_train[current], y_train, X_valid[current], y_valid)
+            auc = 0.0 if np.isnan(auc) else auc
+            best_seen = max(best_seen, auc)
+            rec: Dict[str, Any] = {"step": rnd, "n_features": len(current),
+                                   "valid_auc": round(auc, 5), "features": list(current),
+                                   "removed_next": ""}
+            history.append(rec)
+            self.logger.log(self.name, "Batch Prune",
+                f"round {rnd}: n={len(current)} valid_auc={auc:.4f} (best so far {best_seen:.4f})")
+            if len(current) <= min_features or rnd >= Config.PRUNE_MAX_ROUNDS:
+                break
+            if best_seen - auc > Config.PRUNE_STOP_DROP:
+                self.logger.log(self.name, "Batch Prune",
+                    f"stop: AUC fell > {Config.PRUNE_STOP_DROP} below the best — smaller sets are clearly worse")
+                break
+
+            sample = X_train[current].sample(min(Config.SHAP_SAMPLE_SIZE, len(X_train)),
+                                             random_state=Config.RANDOM_STATE) \
+                if Config.FEATURE_RANK_IMPORTANCE == "shap" else None
+            imp = self._importance_vector(model, estimator_name, current, sample)
+            imp_norm = (imp - imp.min()) / (imp.max() - imp.min() + 1e-12)
+            psi_s = pd.Series({f: psi_lookup.get(f, 0.0) for f in current})
+            psi_norm = (psi_s - psi_s.min()) / (psi_s.max() - psi_s.min() + 1e-12)
+            w = 0.5 if psi_lookup else 0.0
+            removal = (1 - w) * (1 - imp_norm) + w * psi_norm
+            n_remove = max(1, int(round(len(current) * frac)))
+            n_remove = min(n_remove, len(current) - min_features)
+            drop = list(removal.sort_values(ascending=False).index[:n_remove])
+            rec["removed_next"] = ";".join(drop[:10]) + ("…" if len(drop) > 10 else "")
+            dropset = set(drop)
+            current = [f for f in current if f not in dropset]
+
+        raw = np.array([h["valid_auc"] for h in history], dtype=float)
+        win = max(1, int(Config.PRUNE_SMOOTH_WINDOW))
+        half = win // 2
+        smooth = np.array([raw[max(0, i - half): i + half + 1].mean() for i in range(len(raw))])
+        for h, sm in zip(history, smooth):
+            h["smoothed_auc"] = round(float(sm), 5)
+        n_pos = int((y_valid == y_valid.max()).sum())
+        se = _auc_se(float(raw.max()), n_pos, len(y_valid) - n_pos)
+        eff_tol = max(tol, Config.PRUNE_SE_MULTIPLIER * se)
+        best_sm = float(smooth.max())
+        best_auc = float(raw.max())
+        eligible = [h for h, sm in zip(history, smooth) if sm >= best_sm - eff_tol]
+        chosen = min(eligible, key=lambda h: h["n_features"])
+        reason = (f"smallest set whose {win}-point-smoothed AUC is within {eff_tol:.4f} of the best "
+                  f"{best_sm:.4f} (tol {tol}, SE {se:.4f} x {Config.PRUNE_SE_MULTIPLIER})")
+        if len(chosen["features"]) > cap and Config.FEATURE_CAP_POLICY == "cap_first":
+            under = [h for h in history if h["n_features"] <= cap]
+            if under:
+                chosen = max(under, key=lambda h: (h["valid_auc"], -h["n_features"]))
+                reason = f"cap_first: best AUC among sets with <= {cap} features"
+            else:
+                chosen = history[-1]
+                reason = f"cap_first: floor reached at {chosen['n_features']} features (> cap {cap})"
+        for h in history:
+            h["selected"] = h is chosen
+        self.logger.log(self.name, "Batch Prune Done",
+            f"{len(feature_cols)} → {chosen['n_features']} features | valid_auc={chosen['valid_auc']:.4f} "
+            f"(best {best_auc:.4f}, loss {best_auc - chosen['valid_auc']:.4f}) | {reason} | "
+            f"curve={[(h['n_features'], h['valid_auc']) for h in history]}")
+        prune_df = pd.DataFrame([{k: v for k, v in h.items() if k != "features"} for h in history])
+        return list(chosen["features"]), prune_df
+
     # ── Step 8: Final model training & evaluation ─────────────────────────────
 
     def _tool_train_final_model(
@@ -1665,20 +1764,15 @@ class TrainModelAgent(BaseAgent):
         """Fit a probability calibrator (raw P(positive) → calibrated P).
 
         Returns an object with a `.predict(np.ndarray) -> np.ndarray` method
-        so the artifact stays self-contained. Both branches are pure sklearn
-        classes — load anywhere sklearn is installed without custom modules.
+        so the artifact stays self-contained. Isotonic is a pure sklearn class;
+        the sigmoid wrapper is `SigmoidCalibrator` in this module (needs the repo to unpickle).
         """
         if method == "sigmoid":
             # Platt scaling — fit logistic on raw probas
             from sklearn.linear_model import LogisticRegression
             clf = LogisticRegression(C=1e6, solver="lbfgs")
             clf.fit(raw_proba.reshape(-1, 1), y)
-            # Wrap into a uniform interface
-            class _SigmoidCalibrator:
-                def __init__(self, clf): self.clf = clf
-                def predict(self, x):
-                    return self.clf.predict_proba(np.asarray(x).reshape(-1, 1))[:, 1]
-            return _SigmoidCalibrator(clf)
+            return SigmoidCalibrator(clf)
         # Default: isotonic — banking standard for non-monotonic calibration drift
         from sklearn.isotonic import IsotonicRegression
         iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
@@ -1693,7 +1787,7 @@ class TrainModelAgent(BaseAgent):
         if self.calibrator is None:
             return raw_proba
         cal = self.calibrator.predict(raw_proba)
-        return np.clip(cal, 1e-15, 1 - 1e-15)
+        return np.clip(cal, max(Config.PD_FLOOR, 1e-15), min(Config.PD_CAP, 1 - 1e-15))
 
     # ── Overfitting detection & remediation ──────────────────────────────────
 
@@ -1865,6 +1959,8 @@ class TrainModelAgent(BaseAgent):
             "ensemble_models":   models,
             "calibrator":        self.calibrator,
             "calibration_method": Config.CALIBRATION_METHOD if self.calibrator is not None else None,
+            "pd_floor":          max(Config.PD_FLOOR, 1e-15),
+            "pd_cap":            min(Config.PD_CAP, 1 - 1e-15),
             "n_seeds":           len(models),
             "feature_cols":      feature_cols,
             "cat_encoders":      self._cat_encoders,
@@ -1910,6 +2006,8 @@ _artifact      = joblib.load(_ARTIFACT_PATH)
 model            = _artifact["model"]
 ensemble_models  = _artifact.get("ensemble_models", [model])
 calibrator       = _artifact.get("calibrator", None)
+pd_floor         = _artifact.get("pd_floor", 1e-15)     # PD bounds frozen with the model
+pd_cap           = _artifact.get("pd_cap", 1 - 1e-15)
 feature_cols     = _artifact["feature_cols"]
 cat_encoders     = _artifact["cat_encoders"]
 target_column    = _artifact["target_column"]
@@ -1927,18 +2025,27 @@ if _TRAINED_VERSIONS:
         "pandas":  pd.__version__,
         "numpy":   np.__version__,
     }}
+    import importlib as _il
+    for _lib in ("xgboost", "lightgbm", "catboost"):
+        if _lib in _TRAINED_VERSIONS:
+            try:
+                _CURRENT[_lib] = _il.import_module(_lib).__version__
+            except ImportError:
+                _CURRENT[_lib] = "NOT INSTALLED"
     _mismatches = [
         f"{{k}}: trained={{_TRAINED_VERSIONS[k]}}  runtime={{_CURRENT[k]}}"
-        for k in ("python", "sklearn", "pandas", "numpy")
+        for k in _CURRENT
         if k in _TRAINED_VERSIONS and _TRAINED_VERSIONS[k] != _CURRENT[k]
     ]
     if _mismatches:
-        warnings.warn(
-            "final_model.pkl was trained with different library versions:\\n  "
-            + "\\n  ".join(_mismatches)
-            + "\\nPredictions may differ from training-time behavior. Pin requirements.txt to match.",
-            stacklevel=2,
-        )
+        import os as _os
+        _msg = ("final_model.pkl was trained with different library versions:\\n  "
+                + "\\n  ".join(_mismatches)
+                + "\\nPin the environment, or set AUTOML_ALLOW_VERSION_MISMATCH=1 to override.")
+        if _os.environ.get("AUTOML_ALLOW_VERSION_MISMATCH") == "1":
+            warnings.warn(_msg, stacklevel=2)
+        else:
+            raise RuntimeError(_msg)
 
 # ── Feature list (recorded at training time) ──────────────────────────────────
 FEATURES = {features_repr}
@@ -1958,8 +2065,10 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     than the equivalent .apply(lambda) on big batches and matches what the
     training-time _transform_X does, so behavior is consistent end-to-end.
     """
-    avail = [c for c in FEATURES if c in df.columns]
-    out = df[avail].copy()
+    absent = [c for c in FEATURES if c not in df.columns]
+    if absent:
+        raise ValueError(f"{{len(absent)}} model feature(s) missing from input, e.g. {{absent[:8]}}")
+    out = df[FEATURES].copy()
     for col in out.columns:
         if col in cat_encoders:
             le    = cat_encoders[col]
@@ -1985,7 +2094,7 @@ def predict_proba(df: pd.DataFrame) -> np.ndarray:
     raw = np.mean([m.predict_proba(X)[:, 1] for m in ensemble_models], axis=0)
     if calibrator is not None:
         cal = calibrator.predict(raw)
-        return np.clip(cal, 1e-15, 1 - 1e-15)
+        return np.clip(cal, pd_floor, pd_cap)
     return raw
 
 
@@ -2405,7 +2514,7 @@ if __name__ == "__main__":
         # Ensemble predict → calibrate
         y_score = np.mean([m.predict_proba(X_eval)[:, 1] for m in self.ensemble_models], axis=0)
         if self.calibrator is not None:
-            y_score = np.clip(self.calibrator.predict(y_score), 1e-15, 1 - 1e-15)
+            y_score = self._apply_calibrator(y_score)
         y_true = y_eval.values
 
         self.logger.log(self.name, "Charts", f"generating on split='{split_name}' | n={len(y_true)}")
@@ -2607,13 +2716,15 @@ if __name__ == "__main__":
         target_column: str,
         valid_path: Optional[str] = None,
         oot_path: Optional[str] = None,
+        test_path: Optional[str] = None,
         date_col: Optional[str] = None,
         id_col: Optional[str] = None,
         calibration: Optional[bool] = None,
         temporal_freq: Optional[str] = None,
         week_closing_day: Optional[str] = None,
+        temporal_meta: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Load 3 pre-engineered partitions, add `_split_` marker, dispatch to `process`.
+        """Load the pre-engineered partitions, add `_split_` marker, dispatch to `process`.
 
         This is the only place in the pipeline where train + valid + oot live in
         the same DataFrame — concat happens here because the downstream feature-
@@ -2621,16 +2732,33 @@ if __name__ == "__main__":
         all three slices to compute their metrics.
 
         The marker drives `_tool_split_data`'s pre-split branch to reconstruct
-        the user-supplied splits exactly as provided.
+        the supplied splits exactly as provided.
+
+        temporal_meta: cadence info from whoever did the splitting. The marker
+        branch returns before any date inspection happens, so without this the
+        report would fall back to {"cadence": "non_temporal"} even for a split
+        that was cut on whole months. Single-file mode passes what
+        `splitting.auto_split` detected; true pre-split callers pass nothing
+        (they gave us the files, we never saw the uncut series).
         """
         import gc
 
+        if temporal_meta:
+            self.temporal_meta = dict(temporal_meta)
+            self.date_cadence  = str(temporal_meta.get("cadence", "non_temporal"))
+            self.period_freq   = str(temporal_meta.get("period_freq", self.period_freq))
+            self.period_unit   = str(temporal_meta.get("period_unit", self.period_unit))
+            self.logger.log(self.name, "Temporal meta (inherited)",
+                f"cadence={self.date_cadence} | period={self.period_freq} "
+                "— split was decided upstream, not re-detected here")
+
         self.logger.log(self.name, "process_splits start",
-            f"train={train_path} | valid={valid_path} | oot={oot_path}")
+            f"train={train_path} | valid={valid_path} | oot={oot_path} | test={test_path}")
 
         frames: List[pd.DataFrame] = []
         sizes: Dict[str, int] = {}
-        for tag, path in [("train", train_path), ("valid", valid_path), ("oot", oot_path)]:
+        for tag, path in [("train", train_path), ("valid", valid_path),
+                          ("oot", oot_path), ("test", test_path)]:
             if path is None:
                 continue
             sub = self.load_dataframe(path)
@@ -2659,6 +2787,64 @@ if __name__ == "__main__":
             temporal_freq=temporal_freq,
             week_closing_day=week_closing_day,
         )
+
+    # ── Replay entry point ────────────────────────────────────────────────────
+
+    def replay_fit(
+        self,
+        splits: Dict[str, pd.DataFrame],
+        target_column: str,
+        estimator_name: str,
+        best_params: Dict[str, Any],
+        feature_cols: List[str],
+        date_col: Optional[str] = None,
+        calibration: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Rebuild this run's final model from recorded decisions. No search, no LLM.
+
+        Used by replay_pipeline.py to reproduce a finished run elsewhere. Every
+        choice that FLAML / Optuna / RFE / PSI / Stability / SHAP-prune made is
+        already fixed by the time we get here — they were searches over the
+        training data, and re-running them would be both slow and (for FLAML,
+        which is wall-clock budgeted) not reproducible. So the replay takes
+        `estimator_name`, `best_params` and `feature_cols` as given and only
+        re-executes the deterministic final fit.
+
+        That final fit is the SAME `_tool_train_final_model` the original run
+        called — not a copy of it — so refit-on-train+valid, multi-seed bagging
+        and OOF calibration cannot drift between the two.
+
+        Returns the per-split metrics dict, for comparison against the metrics
+        recorded in replay_manifest.json.
+        """
+        self.target_column = target_column
+        self.date_col = date_col
+        self.feature_cols = list(feature_cols)
+        self.splits = splits
+        if calibration is not None:
+            self.calibration_enabled = bool(calibration)
+
+        train_df = splits.get("train")
+        if train_df is None or len(train_df) == 0:
+            raise ValueError("replay_fit needs a non-empty 'train' split")
+
+        missing = [c for c in feature_cols if c not in train_df.columns]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} recorded feature(s) missing from the replayed train "
+                f"frame, e.g. {missing[:5]}. The feature spec did not reproduce the "
+                "same columns — check that the input file matches the original run."
+            )
+
+        # Refit the categorical encoders on the same train rows / columns the
+        # original run used. Same values in => same LabelEncoder classes out.
+        self._fit_prepare_X(train_df[list(feature_cols)])
+
+        self.logger.log(self.name, "Replay fit",
+            f"estimator={estimator_name} | features={len(feature_cols)} | "
+            f"splits={ {k: len(v) for k, v in splits.items() if len(v)} } | "
+            f"calibration={self.calibration_enabled}")
+        return self._tool_train_final_model(estimator_name, best_params, list(feature_cols))
 
     # ── Main process ──────────────────────────────────────────────────────────
 
@@ -2758,18 +2944,35 @@ if __name__ == "__main__":
             X_train, y_train, X_valid, y_valid, time_budget=flaml_budget
         )
 
-        # ── 3. Optuna ─────────────────────────────────────────────────────────
-        self.logger.log(self.name, "Optuna Start",
-            f"n_trials={Config.OPTUNA_N_TRIALS} | timeout={optuna_budget}s")
-        best_params = self._tool_run_optuna(
-            best_estimator, flaml_params, X_train, y_train, X_valid, y_valid,
-            timeout=optuna_budget,
-        )
+        self._validate_selection_config()
+        optuna_after = Config.OPTUNA_AFTER_SELECTION
 
-        # ── 4. RFE ────────────────────────────────────────────────────────────
-        self.logger.log(self.name, "RFE Start",
-            f"target={Config.MAX_FINAL_FEATURES} | rfecv={Config.ENABLE_RFECV}")
-        rfe_features = self._tool_run_rfe(best_estimator, best_params, X_train, y_train)
+        # ── 3. Optuna (legacy placement: before selection, on all features) ──
+        if optuna_after:
+            best_params = dict(flaml_params or {})
+            self.logger.log(self.name, "Optuna Deferred",
+                "OPTUNA_AFTER_SELECTION=true — ranking/pruning use FLAML's params; Optuna runs once "
+                "on the final feature set")
+        else:
+            self.logger.log(self.name, "Optuna Start",
+                f"n_trials={Config.OPTUNA_N_TRIALS} | timeout={optuna_budget}s")
+            best_params = self._tool_run_optuna(
+                best_estimator, flaml_params, X_train, y_train, X_valid, y_valid,
+                timeout=optuna_budget,
+            )
+
+        # ── 4. Candidate ranking (importance fit or legacy RFE) ──────────────
+        if Config.FEATURE_RANK_METHOD == "rfe":
+            self.logger.log(self.name, "RFE Start",
+                f"target={Config.MAX_FINAL_FEATURES} | rfecv={Config.ENABLE_RFECV}")
+            rfe_features = self._tool_run_rfe(best_estimator, best_params, X_train, y_train)
+        else:
+            n_target = min(max(Config.RFE_TARGET_FEATURES, Config.MAX_FINAL_FEATURES), X_train.shape[1])
+            self.logger.log(self.name, "Feature Rank Start",
+                f"importance={Config.FEATURE_RANK_IMPORTANCE} | target={n_target} | "
+                f"dedupe |r|>{Config.FEATURE_RANK_CORR_THRESHOLD}")
+            rfe_features = self._tool_rank_features(
+                best_estimator, best_params, X_train, y_train, X_valid, y_valid, n_target)
 
         # ── 5. PSI ────────────────────────────────────────────────────────────
         # PSI measures temporal distribution drift — only meaningful when a date
@@ -2800,7 +3003,9 @@ if __name__ == "__main__":
             X_valid[[c for c in stable_features if c in X_valid.columns]]
             if len(X_valid) > 0 else pd.DataFrame()
         )
-        final_features, prune_df = self._tool_shap_psi_prune(
+        _prune = (self._tool_batch_prune if Config.PRUNE_METHOD == "batch_tolerance"
+                  else self._tool_shap_psi_prune)
+        final_features, prune_df = _prune(
             best_estimator, best_params,
             stable_features, X_tr_stable, y_train,
             X_vl_stable, y_valid,
@@ -2830,7 +3035,21 @@ if __name__ == "__main__":
         # set when the pipeline meaningfully shrank the feature count.
         n_init = len(feat_avail)
         reduction_ratio = len(final_features) / n_init if n_init else 1.0
-        if (Config.ENABLE_RETUNE_AFTER_PRUNE
+        if optuna_after:
+            # New placement: tune ONCE, on the final feature set (no re-tune step needed).
+            X_tr_final = X_train[[c for c in final_features if c in X_train.columns]]
+            X_vl_final = (
+                X_valid[[c for c in final_features if c in X_valid.columns]]
+                if len(X_valid) > 0 else pd.DataFrame()
+            )
+            self.logger.log(self.name, "Optuna Start",
+                f"post-selection on {len(final_features)} features | "
+                f"n_trials={Config.OPTUNA_N_TRIALS} | timeout={optuna_budget}s")
+            best_params = self._tool_run_optuna(
+                best_estimator, best_params, X_tr_final, y_train, X_vl_final, y_valid,
+                timeout=optuna_budget,
+            )
+        elif (Config.ENABLE_RETUNE_AFTER_PRUNE
                 and reduction_ratio <= Config.RETUNE_FEATURE_REDUCTION_TRIGGER):
             self.logger.log(self.name, "Optuna Re-tune Start",
                 f"feature count {n_init} → {len(final_features)} "
@@ -2850,10 +3069,22 @@ if __name__ == "__main__":
             # _tool_run_optuna falls back to base_params when no trial completes
             # within the budget — only adopt when something actually came back.
             if new_best_params is not best_params:
-                best_params = new_best_params
-                self.logger.log(self.name, "Optuna Re-tune Adopted",
-                    "best_params replaced with re-tuned hyperparams")
-        elif Config.ENABLE_RETUNE_AFTER_PRUNE:
+                new_auc = self._last_optuna_best
+                old_auc = self._eval_params(best_estimator, best_params, X_tr_final, y_train,
+                                            X_vl_final, y_valid)
+                if _adopt_retuned(old_auc, new_auc, Config.RETUNE_MIN_GAIN):
+                    best_params = new_best_params
+                    self.logger.log(self.name, "Optuna Re-tune Adopted",
+                        f"re-tuned params beat the previous ones on the final features "
+                        f"(valid AUC {old_auc if old_auc is None else round(old_auc, 4)} -> "
+                        f"{round(new_auc, 4)})")
+                else:
+                    self.logger.log(self.name, "Optuna Re-tune Rejected",
+                        f"kept the original params: re-tuned valid AUC "
+                        f"{None if new_auc is None else round(new_auc, 4)} vs previous "
+                        f"{None if old_auc is None else round(old_auc, 4)} on the final features "
+                        f"(needs +{Config.RETUNE_MIN_GAIN})")
+        elif Config.ENABLE_RETUNE_AFTER_PRUNE and not optuna_after:
             self.logger.log(self.name, "Optuna Re-tune Skipped",
                 f"feature kept ratio {reduction_ratio:.0%} > trigger "
                 f"{Config.RETUNE_FEATURE_REDUCTION_TRIGGER:.0%} (not enough reduction)")
