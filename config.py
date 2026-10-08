@@ -499,6 +499,12 @@ class Config:
     # while still giving FLAML enough signal to select the best estimator type.
     FLAML_MAX_ROWS: int = int(os.getenv("FLAML_MAX_ROWS", 500_000))
 
+    # Final-model CV: early stopping picks best_iteration, but the tree ceiling comes from the tuned
+    # n_estimators, so a fold can stop AT the ceiling (ES never fired). CV folds get this multiple of
+    # the tuned tree count as headroom (boosters only; 1 = legacy behaviour, needed to reproduce
+    # bundles written before this option existed).
+    FINAL_ES_TREE_HEADROOM: float = float(os.getenv("FINAL_ES_TREE_HEADROOM", 2.0))
+
     # ── Optuna ────────────────────────────────────────────────────────────────
     # Trials raised 150 → 300 + timeout 30min → 2h to give the search room when
     # boosting_type=dart is included in the LightGBM space (DART is ~3-5x slower
@@ -562,7 +568,7 @@ class Config:
     # PRUNE_SE_MULTIPLIER x the Hanley-McNeil standard error of the valid AUC (0 = off; 0.5 is a
     # reasonable value for small / noisy validation sets).
     PRUNE_SMOOTH_WINDOW: int = int(os.getenv("PRUNE_SMOOTH_WINDOW", 3))
-    PRUNE_SE_MULTIPLIER: float = float(os.getenv("PRUNE_SE_MULTIPLIER", 0.0))
+    PRUNE_SE_MULTIPLIER: float = float(os.getenv("PRUNE_SE_MULTIPLIER", 0.5))
     PRUNE_STOP_DROP: float = float(os.getenv("PRUNE_STOP_DROP", 0.010))
     PRUNE_MAX_ROUNDS: int = int(os.getenv("PRUNE_MAX_ROUNDS", 40))
     # Optuna placement:

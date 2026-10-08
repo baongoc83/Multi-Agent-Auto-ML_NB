@@ -30,7 +30,7 @@ _LIBS = ("numpy", "pandas", "pyarrow", "scikit-learn", "scipy", "xgboost", "ligh
 _ENV_PREFIXES = ("FLAML_", "OPTUNA_", "RFE_", "PSI_", "STABILITY_", "SHAP_", "MULTI_SEED_",
                  "CALIBRATION_", "CLASS_WEIGHT_", "OOT_", "VALID_", "TEMPORAL_", "RANDOM_STATE",
                  "CV_N_SPLITS", "PD_", "NULL_", "FE_", "MAX_FINAL_", "TOP_K_", "WOE_", "IV_",
-                 "OVERFIT_", "EARLY_STOPPING", "FEATURE_", "PRUNE_", "RETUNE_", "TREE_ENSEMBLE_", "KEEP_INTERMEDIATES", "LLM_BACKEND", "TRAIN_TEST_")
+                 "OVERFIT_", "EARLY_STOPPING", "FEATURE_", "PRUNE_", "FINAL_ES_", "RETUNE_", "TREE_ENSEMBLE_", "KEEP_INTERMEDIATES", "LLM_BACKEND", "TRAIN_TEST_")
 
 
 def sha256_file(path: Any, max_bytes: Optional[int] = None) -> Optional[str]:

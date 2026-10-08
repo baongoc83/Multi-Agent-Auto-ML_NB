@@ -11,6 +11,10 @@ from pathlib import Path
 
 class BaseAgent:
 
+    # Actions some models emit that are notes, not transforms (e.g. Haiku's "flag_for_review").
+    # Logged as an audit note instead of an "unknown action" warning.
+    NOTE_ACTIONS = frozenset({"flag_for_review", "note", "comment", "review", "observation"})
+
     # Root folder for all agent prompt templates (Agents/BaseAgent/ → Agents/)
     _PROMPTS_ROOT: Path = Path(__file__).parent.parent
 

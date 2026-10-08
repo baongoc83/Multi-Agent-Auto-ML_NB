@@ -644,6 +644,7 @@ class AutoMLPipeline:
         # Capture the loaded descriptions before agent2 is released so Agent 3
         # can reuse them for the SHAP-explain step without reloading.
         col_descriptions_loaded = dict(agent2._col_descriptions) if agent2._col_descriptions else {}
+        agent2.null_context = getattr(self, "_null_context", None)
         eng_paths, report2 = agent2.process_splits(
             train_path=clean_paths["train"],
             previous_report=report1,
@@ -762,6 +763,14 @@ class AutoMLPipeline:
                 del df
             gc.collect()
         del train
+        # Handed to Agent 2 so it knows which NULLs are gone and which indicators exist.
+        self._null_context = {
+            "imputed": {c: r.missing_strategy for c, r in proc.rules_.items()
+                        if r.missing_strategy not in ("none", "missing_indicator_only")},
+            "kept_nan": [c for c, r in proc.rules_.items()
+                         if r.missing_strategy in ("none", "missing_indicator_only")],
+            "indicators": list(proc.indicator_columns_),
+        }
         return {"file": Path(Config.NULL_PROCESSOR_PATH).name, "sha256": sha,
                 "n_rules": len(rules), "n_indicators": len(proc.indicator_columns_),
                 "llm": llm_call is not None}

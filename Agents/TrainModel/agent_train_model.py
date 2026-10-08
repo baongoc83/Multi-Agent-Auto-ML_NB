@@ -1618,8 +1618,15 @@ class TrainModelAgent(BaseAgent):
             n_splits = max(2, min(Config.CV_N_SPLITS, int(y_fin.value_counts().min())))
             skf = StratifiedKFold(n_splits=n_splits, shuffle=True,
                                   random_state=Config.RANDOM_STATE)
+            cv_params = _base_params(Config.RANDOM_STATE)
+            cv_ceiling = cv_params.get(n_est_key)
+            es_capable = (estimator_name not in ("rf", "RandomForest", "extra_tree", "ExtraTrees")
+                          and cv_params.get("boosting_type") != "dart")
+            if es_capable and cv_ceiling and Config.FINAL_ES_TREE_HEADROOM > 1:
+                cv_ceiling = int(cv_ceiling * Config.FINAL_ES_TREE_HEADROOM)
+                cv_params[n_est_key] = cv_ceiling
             for f_tr, f_va in skf.split(X_fin, y_fin):
-                fm = ModelClass(**_base_params(Config.RANDOM_STATE))
+                fm = ModelClass(**cv_params)
                 self._fit_with_early_stopping(
                     fm, estimator_name,
                     X_fin.iloc[f_tr], y_fin.iloc[f_tr],
@@ -1638,6 +1645,10 @@ class TrainModelAgent(BaseAgent):
                 "iteration and skip OOF calibration")
 
         best_iteration = int(np.median(best_iters)) if best_iters else None
+        if best_iters and cv_ok and cv_ceiling and max(best_iters) >= 0.98 * cv_ceiling:
+            self.logger.log(self.name, "CV WARN",
+                f"{sum(b >= 0.98 * cv_ceiling for b in best_iters)} fold(s) stopped at the tree ceiling "
+                f"{cv_ceiling}: early stopping did not fire — raise FINAL_ES_TREE_HEADROOM")
         self.logger.log(self.name, "Best iteration (CV on train+valid)",
             f"folds={best_iters or 'n/a (no ES)'} → median={best_iteration} "
             f"({n_est_key}) | cv_folds={len(fold_aucs)}")
@@ -1713,6 +1724,8 @@ class TrainModelAgent(BaseAgent):
             "best_iteration":       best_iteration,
             "calibration_method":   Config.CALIBRATION_METHOD if self.calibrator is not None else None,
             "calibration_split":    calibration_split_used,
+            # valid_* are scored on rows the final model was refit on: in-sample, never a holdout.
+            "valid_metrics_in_sample": True,
         }
         # CV AUC is now the honest in-time estimate: out-of-fold on train+valid.
         if fold_aucs:
@@ -3230,8 +3243,9 @@ if __name__ == "__main__":
 
         self.logger.log(self.name, "Process Complete",
             f"best={best_estimator} | features={len(final_features)} | "
-            f"oot_auc={metrics.get('oot_auc', 'N/A')} | "
-            f"valid_auc={metrics.get('valid_auc', 'N/A')}")
+            f"oot_auc={metrics.get('oot_auc', 'N/A')} | test_auc={metrics.get('test_auc', 'N/A')} | "
+            f"cv_auc={metrics.get('cv_auc_mean', 'N/A')} | "
+            f"(valid_auc={metrics.get('valid_auc', 'N/A')} is IN-SAMPLE, not a holdout)")
         return metrics, report
 
     # ── LLM summary ───────────────────────────────────────────────────────────
@@ -3274,7 +3288,10 @@ if __name__ == "__main__":
             SHAP_PSI_DROPPED=shap_psi_dropped,
             N_FINAL=n_final,
             ESTIMATOR_NAME=estimator_name,
-            METRICS_JSON=json.dumps({k: v for k, v in metrics.items() if k not in ("best_params",)}, indent=2),
+            # In-sample valid_* metrics are withheld: the LLM previously "explained" the
+            # valid-vs-test gap as a distribution effect when it is simply the refit.
+            METRICS_JSON=json.dumps({k: v for k, v in metrics.items()
+                                     if k != "best_params" and not k.startswith("valid_")}, indent=2),
             HYPERPARAMS_JSON=json.dumps({k: v for k, v in list(best_params.items())[:6]}, indent=2),
             OVERFIT_INFO=overfit_str,
         )

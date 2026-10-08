@@ -1808,6 +1808,21 @@ if __name__ == "__main__":
             "Use the group names above to identify same-group vs cross-group interaction candidates.\n"
             if col_desc_block else ""
         )
+        nc = getattr(self, "null_context", None)
+        if nc:
+            imputed = sorted(nc.get("imputed", {}))
+            inds = list(nc.get("indicators", []))
+            kept = sorted(nc.get("kept_nan", []))
+            col_desc_section += (
+                "\nNULL HANDLING ALREADY APPLIED (Stage 1b, fitted on train, replayed at scoring):\n"
+                f"- {len(imputed)} columns had their NULLs imputed (median / zero / category). "
+                "`isna()` on them is always False: do NOT create missing-flag features for them.\n"
+                f"- Missing indicators already exist ({len(inds)}), e.g. {inds[:60]} — reuse these "
+                "instead of re-deriving missingness.\n"
+                f"- Columns that still carry NaN by design ({len(kept)}): {kept[:40]}.\n"
+                "- Ratios / aggregates built from imputed columns use the imputed values; prefer "
+                "combining them with the matching `<col>_missing` indicator when missingness matters.\n"
+            )
         return self._load_prompt(
             self._PROMPTS_ROOT / "FeatureEngineer" / "prompts" / "user.txt",
             PREVIOUS_SUMMARY=previous_report.get("summary", "Data cleaning completed"),
@@ -1867,6 +1882,18 @@ if __name__ == "__main__":
                             self.logger.log(self.name, f"SKIP {action_type}",
                                 f"Expression references a protected column — skipped: {expression}")
                             continue
+                        # Missing-flag on a column Stage 1b already imputed is constant:
+                        # skip it and point at the indicator that carries the signal instead.
+                        imputed = (getattr(self, "null_context", None) or {}).get("imputed", {})
+                        if imputed:
+                            hits = [c for c in re.findall(
+                                r"df\[\s*['\"]([^'\"]+)['\"]\s*\]\s*\.\s*(?:isna|isnull|notna|notnull)\s*\(",
+                                expression) if c in imputed]
+                            if hits:
+                                self.logger.log(self.name, f"SKIP {action_type}",
+                                    f"'{new_col}': NULLs of {hits} were already imputed by the null "
+                                    f"processor (use {[h + '_missing' for h in hits]} if present)")
+                                continue
                         self._last_interaction_fill = 0.0
                         self.df = self.execute_tool("create_interaction", df=self.df,
                                                     new_col=new_col, expression=expression)
@@ -1960,6 +1987,9 @@ if __name__ == "__main__":
                         spec.selected_features = list(self.df.columns)
                         actions_taken.append(f"Selected top {k} features (criterion={criterion}): {reason}")
 
+                    elif action_type in BaseAgent.NOTE_ACTIONS:
+                        self.logger.log(self.name, "LLM Note",
+                            f"{action_type} (column={action_spec.get('column')}): {reason}")
                     else:
                         self.logger.log(self.name, "WARN",
                             f"Unknown or missing action_type '{action_type}' — skipped")

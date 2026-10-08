@@ -1464,6 +1464,9 @@ if __name__ == "__main__":
                         spec.dtype_fixes.append((column, fix_type))
                         actions_taken.append(f"Fixed format of '{column}' ({fix_type}): {reason}")
 
+                    elif action_type in BaseAgent.NOTE_ACTIONS:
+                        self.logger.log(self.name, "LLM Note",
+                            f"{action_type} (column={action_spec.get('column')}): {reason}")
                     else:
                         self.logger.log(self.name, "WARN",
                             f"Unknown or missing action_type '{action_type}' — skipped")
