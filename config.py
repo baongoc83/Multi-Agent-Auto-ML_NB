@@ -565,10 +565,11 @@ class Config:
     # The AUC-vs-size curve is noisy on small valid sets, and "smallest set within tolerance of the
     # peak" would latch onto a lucky spike. The rule is therefore applied to a moving average of
     # PRUNE_SMOOTH_WINDOW neighbouring sizes (odd; 1 = raw curve), and the tolerance can be widened to
-    # PRUNE_SE_MULTIPLIER x the Hanley-McNeil standard error of the valid AUC (0 = off; 0.5 is a
-    # reasonable value for small / noisy validation sets).
+    # PRUNE_SE_MULTIPLIER x the Hanley-McNeil standard error of the valid AUC (0 = off, default:
+    # on Home Credit 0.5 cut 98 -> 52 features and cost ~0.003 test AUC; use 0.5 only for
+    # small / noisy validation sets).
     PRUNE_SMOOTH_WINDOW: int = int(os.getenv("PRUNE_SMOOTH_WINDOW", 3))
-    PRUNE_SE_MULTIPLIER: float = float(os.getenv("PRUNE_SE_MULTIPLIER", 0.5))
+    PRUNE_SE_MULTIPLIER: float = float(os.getenv("PRUNE_SE_MULTIPLIER", 0.0))
     PRUNE_STOP_DROP: float = float(os.getenv("PRUNE_STOP_DROP", 0.010))
     PRUNE_MAX_ROUNDS: int = int(os.getenv("PRUNE_MAX_ROUNDS", 40))
     # Optuna placement:
