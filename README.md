@@ -3,9 +3,9 @@
 LLM-driven AutoML pipeline gồm 3 agent chuyên trách chạy tuần tự, được tối ưu cho các bài toán **credit risk**, **propensity**, và **fraud detection** trong ngân hàng — nhưng hoạt động được với bất kỳ dataset binary classification nào.
 
 ```
-Raw data  ─►  Agent 1: DataCleaner  ─►  Agent 2: FeatureEngineer  ─►  Agent 3: TrainModel  ─►  Trained model + reports
-              audit + clean             encode + interact +           FLAML → Optuna → RFE →
-                                        select features              PSI → Stability → SHAP+PSI
+Raw data ─► Stage 0: split ─► Agent 1: DataCleaner ─► Stage 1b: NullProcessor ─► Agent 2: FeatureEngineer ─► Agent 3: TrainModel ─► model + replay bundle
+            (OOT / test)      audit + clean            NULL policy, fit on train   encode + interact + select    FLAML → rank → PSI → Stability →
+                                                                                                                  batch prune → Optuna → refit
 ```
 
 ---
@@ -14,19 +14,22 @@ Raw data  ─►  Agent 1: DataCleaner  ─►  Agent 2: FeatureEngineer  ─►
 
 - **2 chế độ chạy**:
   - **Split mode** (khi có `--valid` hoặc `--oot`): mỗi agent FIT trên train, capture spec, REPLAY lên valid/oot — không bao giờ load cả 3 partition cùng lúc → peak RAM bằng partition lớn nhất
-  - **Single-file mode**: Agent 3 tự auto-split (temporal OOT hoặc 60/20/20)
+  - **Single-file mode**: Stage 0 chia ngay từ dữ liệu thô (temporal OOT nếu có cột ngày, nếu không thì 60/20/20 với `test` ngẫu nhiên), rồi chạy y như split mode — Agent 1/2 không bao giờ thấy holdout
 - **3 agent độc lập** với prompt, tool registry và logic riêng
 - **CleaningSpec / FeatureSpec dataclasses** capture mọi transform từ train, replay deterministic lên valid/oot — không re-run LLM, không leakage
+- **Stage 1b — NullProcessor** (`preprocessing/`): chính sách xử lý NULL theo từng cột (median / zero / constant / category / indicator), fit trên train, replay mọi nơi; rule do LLM gợi ý sau guardrail tự động, không cần duyệt tay; có guard đổi đơn vị (scale) và artifact JSON có hash
 - **Stage 0 safety checks** (split mode): schema validation (fail-fast) + PSI distribution drift (advisory)
-- **LLM fallback 3 lớp** (legacy backend): LiteLLM proxy → OpenAI direct → Claude direct
-- **Gateway backend** cho mạng nội bộ — single source, gateway tự handle failover
+- **LLM backend linh hoạt**: proxy / gateway doanh nghiệp / server on-prem chuẩn OpenAI (vLLM, SGLang, Ollama — Qwen, DeepSeek, GLM); `LLM_ALLOW_EXTERNAL_FALLBACK=false` để không bao giờ gọi API public; tự bỏ phần `<think>` của model suy luận trước khi đọc JSON
+- **Gateway backend** cho mạng nội bộ (chuẩn Anthropic) — single source, gateway tự handle failover
 - **OOT temporal split tự động** từ cột date — tự cân bằng `OOT_MIN_RATIO` / `OOT_MAX_RATIO`
-- **Pipeline feature selection 5 tầng**: RFE → PSI drift → Stability Gini → SHAP+PSI iterative pruning → top-N cut
-- **Refit-on-train+valid**: sau feature/hyperparam selection, model deploy được refit trên train+valid gộp (CV tìm `best_iteration` ổn định + calibration trên OOF, không leakage); OOT/test giữ nguyên làm holdout sạch
+- **Chọn feature nhanh và có kiểm soát**: xếp hạng một lần theo importance + loại feature gần trùng → PSI drift → Stability Gini → prune theo lô với dung sai AUC, trần `MAX_FINAL_FEATURES` (mặc định 100). Optuna chạy một lần trên tập feature cuối, mỗi trial có giới hạn thời gian. Cách cũ (RFE, prune từng feature, re-tune) vẫn chọn được qua config
+- **Refit-on-train+valid**: sau feature/hyperparam selection, model deploy được refit trên train+valid gộp (CV tìm `best_iteration` ổn định + calibration trên OOF, không leakage); OOT/test giữ nguyên làm holdout sạch. Metric `valid_*` là in-sample và được gắn nhãn rõ
+- **PD floor / cap** (`PD_FLOOR=0.0003`, `PD_CAP=0.9999`) lưu cùng model, áp dụng cả lúc scoring
+- **Replay bundle** cho môi trường khác: manifest có provenance (git SHA, code fingerprint, snapshot config, hash dữ liệu đầu vào, phiên bản thư viện) + SHA-256 từng artifact được kiểm trước khi `joblib.load`; scoring chế độ strict (dừng khi thiếu cột, sai kiểu, quá nhiều category lạ, lệch phiên bản thư viện)
+- **An toàn biểu thức**: biểu thức feature do LLM viết được kiểm bằng AST allowlist trước khi chạy (thay `eval` trần)
 - **Overfitting detection + LLM-guided retrain** khi gap CV-OOF/holdout (`ref_auc` vs `oot`/`test`) vượt ngưỡng
 - **GPU auto-detect** cho LightGBM, XGBoost, CatBoost
 - **Smart Excel reader**: magic-byte detection cho file `.xls/.xlsx` bị đặt sai extension
-- **Sinh code inference standalone** (`outputs/final_model_code.py`) — chạy độc lập với pipeline
 
 ---
 
@@ -36,16 +39,18 @@ Raw data  ─►  Agent 1: DataCleaner  ─►  Agent 2: FeatureEngineer  ─►
 # 1. Clone repo & vào thư mục
 cd multi-agent-auto-ml-v1.1
 
-# 2. Tạo virtualenv (khuyến nghị)
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+# 2. Tạo virtualenv Python 3.12 (khuyến nghị venv/container sạch cho production)
+py -3.12 -m venv .venv            # Linux: python3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1      # Linux: source .venv/bin/activate
 
-# 3. Cài dependencies
+# 3. Cài dependencies (đã pin chính xác theo các run tham chiếu)
 pip install -r requirements.txt
 
-# 4. (Tuỳ chọn) cài LiteLLM nếu dùng legacy backend với proxy
-pip install litellm
+# 4. (Tuỳ chọn) chỉ khi host LiteLLM proxy trên chính máy này — nên dùng venv riêng
+pip install -r requirements-proxy.txt
 ```
+
+Mọi đường dẫn trong code đều tương đối: `OUTPUT_DIR` dạng tương đối được neo vào thư mục gốc repo, dữ liệu truyền qua CLI hoặc biến môi trường (`AUTOML_DATA_ROOT`, `AUTOML_TEST_DATA`).
 
 ### Cấu hình LLM endpoint
 
@@ -122,7 +127,27 @@ Nếu dùng phương án A (proxy local), khởi động proxy ở terminal khá
 .\start_litellm.ps1
 ```
 
-Nếu chỉ dùng phương án B hoặc C (OpenAI/Claude trực tiếp), không cần chạy `start_litellm.ps1` — pipeline tự fallback xuống provider trực tiếp.
+Nếu chỉ dùng phương án B hoặc C (OpenAI/Claude trực tiếp), không cần chạy `start_litellm.ps1` — pipeline tự fallback xuống provider trực tiếp. Đặt `LLM_SKIP_PROXY=true` để bỏ hẳn bước thử proxy (tiết kiệm ~14 giây mỗi lời gọi khi không host proxy).
+
+---
+
+#### Backend `legacy` với model on-prem / enterprise cloud — dùng cho **production**
+
+Backend `legacy` dùng API chat chuẩn OpenAI, nên `LITELLM_URL` có thể trỏ vào LiteLLM proxy, gateway doanh nghiệp, hoặc thẳng server vLLM / SGLang / Ollama (thêm `/v1`). Ví dụ cấu hình model trong proxy: xem cuối `config.yaml`.
+
+```env
+LLM_BACKEND=legacy
+LITELLM_URL=http://llm-gw.internal:4000        # hoặc http://gpu-node:8000/v1 (vLLM)
+API_KEY=<key của gateway / server>
+LOCAL_MODEL=qwen3-8b                           # prompt ngắn (< MODEL_ROUTING_THRESHOLD ký tự)
+CLOUD_MODEL=deepseek-v3                        # prompt dài — cần context >= 64k (Agent 2 ~28k token)
+LLM_ALLOW_EXTERNAL_FALLBACK=false              # không bao giờ gọi OpenAI / Anthropic public
+TIMEOUT=300
+LLM_EXTRA_BODY={"chat_template_kwargs": {"enable_thinking": false}}   # Qwen3 trên vLLM/SGLang
+NO_PROXY=llm-gw.internal,gpu-node
+```
+
+Các tuỳ chọn khác cho server on-prem: `LLM_JSON_MODE_NATIVE`, `LLM_OMIT_PARAMS`, `LLM_STRIP_REASONING`, `LLM_MAX_TOKENS_LARGE` — mô tả trong [docs/config_params.md](docs/config_params.md#on-prem--enterprise-llm-endpoints).
 
 ---
 
@@ -229,7 +254,7 @@ python main.py data/train.parquet TARGET --oot data/oot.parquet
 | `--keys C1,C2` | Composite key cho dedup check + OOT temporal extraction |
 | `--valid PATH` | Valid đã tách sẵn — kích hoạt split mode |
 | `--oot PATH` | OOT đã tách sẵn — kích hoạt split mode |
-| `--sample-ratio R` | (Split mode) Stratified sample TRAIN với tỉ lệ R, valid/oot giữ nguyên. VD `--sample-ratio 0.3` |
+| `--sample-ratio R` | Stratified sample TRAIN với tỉ lệ R, valid/oot giữ nguyên. VD `--sample-ratio 0.3`. Chỉ dùng khi thiếu RAM: trên Home Credit, run dùng 10% train (kèm ngân sách rút gọn) thấp hơn run đầy đủ ~0,008 test AUC |
 | `--no-prefilter` | (Split mode) Tắt auto-drop cột rác trong Agent 1. Mặc định: bật |
 | `--no-drift-check` | (Split mode) Tắt Stage 0b PSI drift check. Mặc định: bật |
 | `--col-desc PATH` | File CSV/JSON/Parquet/Excel mô tả cột — guide LLM tạo interaction có ý nghĩa |
@@ -278,13 +303,26 @@ multi-agent-auto-ml-v1.1/
 ├── pipeline.py                      # AutoMLPipeline — orchestrator + Stage 0a/0b
 ├── splitting.py                     # Chia train/valid/oot — dùng chung pipeline + Agent 3
 ├── replay_driver.py                 # Template replay_pipeline.py cho mỗi run
+├── provenance.py                    # Git SHA, code fingerprint, config snapshot, input hash
 ├── logger.py                        # AgentLogger — log + markdown report
 ├── config.py                        # Toàn bộ config + LLM client factory
 ├── config_gateway.py                # GatewayConfig override khi LLM_BACKEND=gateway
-├── config.yaml                      # LiteLLM proxy config
-├── start_litellm.ps1                # Helper khởi động proxy
-├── requirements.txt
+├── config.yaml                      # LiteLLM proxy config (kèm ví dụ model on-prem)
+├── start_litellm.ps1                # Helper khởi động proxy (litellm trên PATH hoặc LITELLM_EXE)
+├── requirements.txt                 # Pin chính xác — pipeline
+├── requirements-proxy.txt           # Chỉ khi host LiteLLM proxy
+├── .python-version                  # 3.12
 ├── _e2e_check.py                    # 6-test end-to-end smoke suite (mock LLM)
+│
+├── preprocessing/
+│   ├── null_processor.py            # Stage 1b — NullProcessor (sklearn transformer, artifact JSON)
+│   ├── null_rule_advisor.py         # LLM gợi ý rule NULL + guardrail tự động
+│   ├── safe_expr.py                 # AST allowlist cho biểu thức feature do LLM viết
+│   └── null_rules.example.yaml
+│
+├── tools/
+│   ├── overnight.py                 # Chạy nhiều dataset liên tiếp + tóm tắt từng run
+│   └── run_summary.py               # run_summary.md: metric trung thực + smoke test bundle
 │
 ├── Agents/
 │   ├── BaseAgent/
@@ -306,13 +344,15 @@ multi-agent-auto-ml-v1.1/
 ├── docs/
 │   ├── architecture.md              # Visual walkthrough + mermaid diagrams
 │   ├── awareness-pattern.md         # Agentic pattern reference
-│   └── config_params.md             # Reference đầy đủ mọi config param
+│   ├── config_params.md             # Reference đầy đủ mọi config param
+│   ├── replay.md                    # Replay bundle — chạy lại / scoring ở môi trường khác
+│   └── sequence_flow.md             # Sequence diagrams
 │
-├── outputs/                         # Tất cả output của pipeline (auto-tạo)
+├── outputs/                         # Tất cả output của pipeline (auto-tạo, không commit)
 └── tests/
-    ├── test_agent1.py               # Test riêng Agent 1
-    ├── test_agent2.py
-    └── test_agent3.py
+    ├── test_agent1.py ... test_agent3.py   # Test từng agent (gọi LLM thật)
+    └── test_*.py                    # Test offline: replay, null processor, scoring contract,
+                                     # security, chọn feature, Optuna guard, on-prem LLM ...
 ```
 
 ---
@@ -329,18 +369,23 @@ outputs/
     │   ├── data_cleaner_report.json
     │   ├── feature_engineer_report.json
     │   ├── model_trainer_report.json
-    │   ├── psi_report.csv
-    │   ├── stability_report.csv
-    │   ├── shap_psi_prune_log.csv
-    │   ├── shap_summary.png                          ← NEW: bar plot top features final model
-    │   ├── shap_feature_explanations.csv             ← NEW: LLM-narrated top N features
-    │   ├── final_report.md                              (đã nhúng SHAP section + image)
-    │   ├── final_model.pkl
+    │   ├── psi_report.csv / stability_report.csv     (chỉ khi có OOT / cột ngày)
+    │   ├── shap_psi_prune_log.csv                     đường AUC theo số feature của bước prune
+    │   ├── shap_summary.png / shap_beeswarm.png
+    │   ├── shap_feature_explanations.csv / final_model_shap_report.md
+    │   ├── charts/                                    ROC, PR, KS, lift, gain, decile, calibration
+    │   ├── final_report.md
+    │   ├── run_summary.md                             (khi chạy qua tools/overnight.py)
+    │   │   ── replay bundle (mang sang môi trường khác) ──
+    │   ├── replay_manifest.json                       provenance + SHA-256 từng artifact + metric kỳ vọng
+    │   ├── replay_pipeline.py                         retrain / score lại run này
+    │   ├── split_assignment.parquet                   key → partition + thứ tự dòng
+    │   ├── cleaning_spec.pkl
+    │   ├── null_processor.json                        Stage 1b (JSON, có hash)
+    │   ├── feature_spec.pkl
+    │   ├── final_model.pkl                            ensemble + calibrator + PD floor/cap + versions
     │   ├── final_model_code.py
-    │   ├── pipeline_process_data_cleaner.py        ← NEW: replay Agent 1
-    │   ├── pipeline_process_feature_engineer.py    ← NEW: replay Agent 2
-    │   ├── feature_spec.pkl                        ← NEW: sidecar cho Agent 2
-    │   └── pipeline_process_train_model.py         ← NEW: replay Agent 3
+    │   └── pipeline_process_{data_cleaner,feature_engineer,train_model}.py
     ├── run_02/                          ← lần chạy 2 của hôm nay
     └── run_03/
 └── 2026-06-09/                          ← sang ngày mới → counter reset
@@ -359,15 +404,19 @@ Counter `run_NN` đếm dựa trên `max(NN) + 1` của các thư mục `run_*` 
 | `model_trainer_report.json` | JSON Agent 3 — best model, params, metrics |
 | `psi_report.csv` | PSI drift train↔OOT từng feature |
 | `stability_report.csv` | Mean / std Gini theo tháng |
-| `shap_psi_prune_log.csv` | Log từng step SHAP+PSI pruning |
+| `shap_psi_prune_log.csv` | Đường cong của bước prune: số feature, valid AUC (thô + làm mượt), tập được chọn |
+| `replay_manifest.json` | Thông tin để chạy lại run: split, spec, tham số, metric kỳ vọng, `provenance` (git SHA, code fingerprint, config snapshot, hash input, phiên bản thư viện), `artifacts` (SHA-256 từng file) |
+| `replay_pipeline.py` | Driver replay: `--mode retrain` (tái lập) hoặc `--mode score` (chấm điểm dữ liệu mới) |
+| `null_processor.json` | Stage 1b: rule NULL từng cột + thống kê train + giá trị imputation; có hash nội dung |
+| `split_assignment.parquet` / `cleaning_spec.pkl` | Phân vùng từng dòng (theo key) / spec làm sạch |
 | `shap_summary.png` | Bar plot top (`2 × TOP_N`) features của **final model** bằng mean \|SHAP\| |
 | `shap_feature_explanations.csv` | Rank + SHAP importance + `description` + LLM-narrated `meaning` / `why_matters` cho top `SHAP_FINAL_EXPLAIN_TOP_N` (default 20) features |
 | `final_report.md` | Markdown report tổng hợp — nhúng `shap_summary.png` + table top features |
-| `final_model.pkl` | Model + encoders + feature list (joblib) |
-| `final_model_code.py` | Code inference standalone |
-| `pipeline_process_data_cleaner.py` | Script replay Agent 1 trên data mới — embed `CleaningSpec` (drops + dtype_fixes + clip_bounds) inline, no agent/LLM dependency |
-| `pipeline_process_feature_engineer.py` + `feature_spec.pkl` | Script replay Agent 2 — load `feature_spec.pkl` sidecar (chứa fitted LabelEncoders) + apply interactions / encoders / one-hot / selected_features |
-| `pipeline_process_train_model.py` | Script replay Agent 3 — content giống `final_model_code.py` (inference dùng artifact đã train) |
+| `final_model.pkl` | Ensemble multi-seed + calibrator + PD floor/cap + encoders + feature list + versions (joblib) |
+| `final_model_code.py` | Inference trên dữ liệu **đã qua Agent 1 + Stage 1b + Agent 2**; dừng khi thiếu feature hoặc lệch phiên bản thư viện (`AUTOML_ALLOW_VERSION_MISMATCH=1` để bỏ qua) |
+| `pipeline_process_data_cleaner.py` | Script replay Agent 1 trên data mới — embed `CleaningSpec` (drops + dtype_fixes + clip_bounds) inline |
+| `pipeline_process_feature_engineer.py` + `feature_spec.pkl` | Script replay Agent 2 — gọi thẳng `FeatureSpec.apply(strict=True)` của repo (cần repo trên `sys.path` hoặc `AUTOML_REPO`) |
+| `pipeline_process_train_model.py` | Giống `final_model_code.py` |
 
 ### Intermediate files KHÔNG còn lưu mặc định
 
@@ -381,7 +430,21 @@ KEEP_INTERMEDIATES=true
 
 → intermediate files ghi thẳng vào `run_NN/` cùng với các artifact khác.
 
-### Sử dụng replay script
+### Chấm điểm / tái lập ở môi trường khác (khuyến nghị)
+
+Cách chuẩn là dùng replay bundle — chạy đủ chuỗi Agent 1 → Stage 1b → Agent 2 → model, kiểm hash và phiên bản trước khi load:
+
+```powershell
+# Chấm điểm dữ liệu thô mới (strict: dừng nếu thiếu cột, sai kiểu, đổi đơn vị, quá nhiều category lạ)
+python outputs/2026-10-08/run_03/replay_pipeline.py new_raw.parquet --mode score --out scores.parquet
+
+# Tái lập toàn bộ run (train lại từ quyết định đã đóng băng) và so metric với run gốc
+python outputs/2026-10-08/run_03/replay_pipeline.py original_input.csv --mode retrain
+```
+
+Cần repo cùng phiên bản (spec là pickle của class trong repo): driver tự tìm repo, hoặc truyền `--repo` / đặt `AUTOML_REPO`. Lệch phiên bản thư viện thì dừng, trừ khi thêm `--allow-version-mismatch`. Chi tiết: [docs/replay.md](docs/replay.md).
+
+### Sử dụng replay script từng agent
 
 ```powershell
 # Apply lại Agent 1 transforms (drops + dtype fixes + clip) lên data mới
@@ -402,13 +465,15 @@ python outputs/2026-06-08/run_01/pipeline_process_train_model.py
 ```python
 import pandas as pd
 import sys
-sys.path.append("outputs")
+sys.path.append("outputs/2026-10-08/run_03")
 from final_model_code import predict_proba, predict
 
-df = pd.read_csv("new_data.csv")
-scores = predict_proba(df)          # xác suất class dương
+df = pd.read_parquet("engineered.parquet")   # dữ liệu ĐÃ qua Agent 1 + Stage 1b + Agent 2
+scores = predict_proba(df)          # PD đã calibrate, chặn trong [PD_FLOOR, PD_CAP]
 preds  = predict(df, threshold=0.5)
 ```
+
+Với dữ liệu thô, dùng `replay_pipeline.py --mode score` ở trên.
 
 ---
 
@@ -430,16 +495,46 @@ Tests cover:
 
 ---
 
-## Test từng agent riêng
+## Test offline (không gọi LLM)
+
+```powershell
+# Các test tự tạo run dir khi import → trỏ OUTPUT_DIR sang thư mục tạm để không làm bẩn outputs/
+$env:OUTPUT_DIR = "$env:TEMP\automl_tests"
+Get-ChildItem tests -Filter "test_*.py" | Where-Object Name -notmatch "^test_agent\d" |
+    ForEach-Object { py -3.12 $_.FullName }
+```
+
+| Test | Kiểm tra |
+|---|---|
+| `test_replay_reproducibility.py`, `test_replay_diagnosis.py`, `test_reader_normalization.py` | Replay tái lập chính xác, chẩn đoán khi không tái lập, chuẩn hoá đầu đọc CSV/parquet/Excel/SQL |
+| `test_null_processor.py` | Stage 1b: fit-on-train, indicator, scale guard, artifact JSON + hash, guardrail rule LLM |
+| `test_feature_contract.py` | `FeatureSpec.apply` không im lặng: strict mode, category lạ, one-hot không phụ thuộc batch, thứ tự replay |
+| `test_security.py` | AST allowlist cho biểu thức, hash artifact trong replay, calibrator sigmoid lưu được |
+| `test_feature_selection.py`, `test_optuna_guard.py` | Xếp hạng + prune theo lô, giới hạn thời gian từng trial, quy tắc chấp nhận re-tune |
+| `test_provenance_pd.py`, `test_review_fixes.py` | Provenance, PD floor/cap, CV tree headroom, nhãn metric in-sample |
+| `test_llm_onprem.py` | Đầu ra model suy luận, tham số server on-prem, không gọi API public khi tắt fallback, không có đường dẫn máy, import đúng hoa/thường cho Linux |
+
+## Chạy nhiều dataset liên tiếp
+
+```powershell
+py -3.12 tools/overnight.py --only home_credit_application_train --data-root D:\datasets `
+    --env LLM_SKIP_PROXY=true OPTUNA_N_TRIALS=60
+```
+
+Kết quả: `outputs/overnight_<timestamp>/OVERNIGHT_SUMMARY.md` + `<run>.summary.md` (metric trung thực trên OOT/test, funnel feature, sự kiện chính, provenance, smoke test chấm điểm qua bundle). Script chặn máy ngủ khi để không, nhưng không chặn được Modern Standby khi gập máy — với run dài nên cắm sạc và tắt sleep.
+
+## Test từng agent riêng (gọi LLM thật)
+
+> Đây là script thử nghiệm cũ, đọc/ghi file trực tiếp trong `outputs/` (không qua `run_NN/`). Để kiểm thử toàn trình nên dùng `python main.py ...` hoặc `_e2e_check.py`.
 
 ```powershell
 # Agent 1 — sẽ tự sinh sample data
 python tests/test_agent1.py
 
-# Agent 2 — cần outputs/clean_data.parquet (chạy Agent 1 trước)
+# Agent 2 — cần outputs/clean_data.csv (chạy Agent 1 trước)
 python tests/test_agent2.py
 
-# Agent 3 — cần outputs/engineered_data.parquet (chạy Agent 2 trước)
+# Agent 3 — cần outputs/engineered_data.csv (chạy Agent 2 trước)
 python tests/test_agent3.py
 ```
 
@@ -451,35 +546,42 @@ python tests/test_agent3.py
 
 - [docs/architecture.md](docs/architecture.md) — Visual walkthrough + mermaid diagrams cho từng agent
 - [docs/awareness-pattern.md](docs/awareness-pattern.md) — Agentic pattern reference (Plan-Execute + Awareness)
-- [docs/config_params.md](docs/config_params.md) — Reference đầy đủ ~75 config param (override qua `.env`)
+- [docs/config_params.md](docs/config_params.md) — Reference đầy đủ config param (override qua `.env`), gồm phần on-prem LLM, Stage 1b, chọn feature
+- [docs/replay.md](docs/replay.md) — Replay bundle: tái lập và chấm điểm ở môi trường khác
+- [docs/sequence_flow.md](docs/sequence_flow.md) — Sequence diagrams
 
 **Flow chi tiết từng agent** (step-by-step + mermaid + no-leakage rules + config knobs)
 
 - [docs/agent-1-data-cleaner.md](docs/agent-1-data-cleaner.md) — DataCleaner: prefilter → real-stats → LLM → canonical-ordered execute → spec replay
 - [docs/agent-2-feature-engineer.md](docs/agent-2-feature-engineer.md) — FeatureEngineer: domain-aware interactions, label/onehot encoders, top-K selection, FeatureSpec replay
-- [docs/agent-3-train-model.md](docs/agent-3-train-model.md) — TrainModel 11 bước: split → encode → FLAML → Optuna → RFE → PSI → Stability → SHAP+PSI prune → final train → overfit-aware retrain
+- [docs/agent-3-train-model.md](docs/agent-3-train-model.md) — TrainModel: split → encode → FLAML → rank → PSI → Stability → batch prune → Optuna → refit → overfit-aware retrain
 
 ---
 
-## Pipeline chi tiết — Agent 3
+## Pipeline chi tiết — Agent 3 (mặc định)
 
 ```
-Train data  ─►  FLAML        ─►  estimator + base hyperparams (AutoML)
-            ─►  Optuna       ─►  fine-tune hyperparams (TPE, valid_temporal split)
-            ─►  RFE          ─►  cắt xuống RFE_TARGET_FEATURES
-            ─►  PSI filter   ─►  loại feature drift > PSI_THRESHOLD (train vs OOT)
-            ─►  Stability    ─►  loại feature có std Gini theo tháng > threshold
-            ─►  SHAP+PSI     ─►  iterative prune về ~MAX_FINAL_FEATURES (FEATURE_CAP_POLICY)
-            ─►  Refit         ─►  gộp train+valid, CV best_iteration, calibrate trên OOF
+Train data  ─►  FLAML         ─►  estimator + base hyperparams (AutoML, time-budgeted)
+            ─►  Rank          ─►  1 lần fit, xếp hạng importance, loại feature gần trùng → RFE_TARGET_FEATURES
+            ─►  PSI filter    ─►  loại feature drift > PSI_THRESHOLD (train vs OOT; bỏ qua nếu không có OOT)
+            ─►  Stability     ─►  loại feature có std Gini theo tháng > threshold (cần cột ngày)
+            ─►  Batch prune   ─►  bỏ 10% yếu nhất mỗi vòng, chọn tập nhỏ nhất trong dung sai AUC, ≤ MAX_FINAL_FEATURES
+            ─►  Optuna        ─►  tune một lần trên tập cuối (giới hạn thời gian từng trial, DART tắt)
+            ─►  Refit         ─►  gộp train+valid, CV best_iteration (có headroom cây), calibrate trên OOF, PD floor/cap
             ─►  Eval          ─►  OOT (temporal) / test (holdout) — giữ sạch, không gộp
-            ─►  Overfit check ─► gap ref_auc(CV-OOF) vs holdout → LLM-guided retrain
+            ─►  Overfit check ─►  gap ref_auc(CV-OOF) vs holdout → LLM-guided retrain
 ```
+
+Luồng cũ (Optuna trước → RFE → prune từng feature → re-tune) vẫn bật được: `OPTUNA_AFTER_SELECTION=false`, `FEATURE_RANK_METHOD=rfe`, `PRUNE_METHOD=one_by_one`.
+
+Kết quả tham chiếu trên Home Credit (test ngẫu nhiên, không có OOT): mặc định hiện tại cho 79 feature, test AUC 0,7801, CV 0,7795; một run cùng luồng mới không bị máy ngủ mất ~2 giờ. Luồng cũ cho 149 feature, test AUC 0,7804, 5,9 giờ.
 
 ---
 
 ## Yêu cầu môi trường
 
-- Python 3.12 (pinned in `.python-version`; numpy 2.3 needs >= 3.11 and the reference runs used 3.12)
+- Python 3.12 (ghi trong `.python-version`; numpy 2.3 cần ≥ 3.11, các run tham chiếu dùng 3.12)
+- LLM: endpoint chuẩn OpenAI (proxy / gateway / vLLM / SGLang / Ollama) hoặc gateway chuẩn Anthropic; model nhận prompt dài (`CLOUD_MODEL`) cần context ≥ 64k token
 - Windows / macOS / Linux
 - GPU (tuỳ chọn) — auto-detect qua `nvidia-smi`
 - RAM khuyến nghị (sau dtype-downcast tại Agent 3):

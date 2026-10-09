@@ -6,14 +6,14 @@
 
 | Mode | Function | Input |
 |---|---|---|
-| Split mode | `process_splits()` ([line 759](../Agents/DataCleaner/agent_data_cleaner.py#L759)) | `train_path` + tùy chọn `valid_path`, `oot_path` |
-| Single mode | `process()` ([line 833](../Agents/DataCleaner/agent_data_cleaner.py#L833)) | 1 file đầu vào |
+| Split mode | `process_splits()` | `train_path` + tùy chọn `valid_path`, `oot_path` |
+| Single mode | `process()` | 1 file đầu vào |
 
-Cả 2 đều gọi `fit_transform()` ([line 692](../Agents/DataCleaner/agent_data_cleaner.py#L692)) cho TRAIN. Split mode sau đó replay spec lên valid/oot từng partition (memory profile = 1 partition tại 1 thời điểm).
+Cả 2 đều gọi `fit_transform()` cho TRAIN. Split mode sau đó replay spec lên valid/oot từng partition (memory profile = 1 partition tại 1 thời điểm).
 
 ---
 
-## Step 0 — Setup ([line 79-95](../Agents/DataCleaner/agent_data_cleaner.py#L79-L95))
+## Step 0 — Setup
 
 ```
 self._entity_id_col       ← từ constructor (override auto-detect)
@@ -24,7 +24,7 @@ self.tool_registry        ← register 12 tools
 
 ---
 
-## Step 1 — Load TRAIN ([line 709-721](../Agents/DataCleaner/agent_data_cleaner.py#L709-L721))
+## Step 1 — Load TRAIN
 
 ```
 self.df = BaseAgent.load_dataframe(train_path)
@@ -35,7 +35,7 @@ Hỗ trợ CSV, Parquet, Excel, JSON, Feather, ORC, S3 (auto-detect format + mag
 
 ---
 
-## Step 2 — Optional stratified sample ([line 714-721, 660-688](../Agents/DataCleaner/agent_data_cleaner.py#L714-L721))
+## Step 2 — Optional stratified sample
 
 Khi `train_sample_ratio ∈ (0, 1)`:
 
@@ -50,7 +50,7 @@ self.df = self.df.iloc[positions].reset_index(drop=True)
 
 ---
 
-## Step 3 — Pre-filter cột ([line 723-735, 632-658](../Agents/DataCleaner/agent_data_cleaner.py#L723-L735))
+## Step 3 — Pre-filter cột
 
 Khi `prefilter=True` (default), scan train + drop cột rõ ràng vô dụng (không gọi LLM):
 
@@ -66,7 +66,7 @@ Drop list được record vào `spec.drops` → replay deterministic xuống val
 
 ---
 
-## Step 4 — Collect real stats ([line 737-744](../Agents/DataCleaner/agent_data_cleaner.py#L737-L744))
+## Step 4 — Collect real stats
 
 Trước khi gọi LLM, compute stats THỰC từ data (không để LLM tự đoán):
 
@@ -79,11 +79,11 @@ Trước khi gọi LLM, compute stats THỰC từ data (không để LLM tự đ
 | `_collect_outlier_stats` | IQR 3× outlier count (top `OUTLIER_NUMERIC_COLS_LIMIT=10` numeric cols) |
 | `_collect_temporal_stats` | date range, future dates, leakage suspect column names |
 
-Metadata được **compress** ([line 1177-1217](../Agents/DataCleaner/agent_data_cleaner.py#L1177-L1217)) trước khi đưa vào prompt — chỉ giữ cột có null > threshold + dtype histogram để tránh overflow context với dataset 500+ cột.
+Metadata được **compress** trước khi đưa vào prompt — chỉ giữ cột có null > threshold + dtype histogram để tránh overflow context với dataset 500+ cột.
 
 ---
 
-## Step 5 — Call LLM ([line 745-751](../Agents/DataCleaner/agent_data_cleaner.py#L745-L751))
+## Step 5 — Call LLM
 
 ```
 prompt = build_analysis_prompt(metadata, format, outlier, label, temporal, pk)
@@ -106,9 +106,9 @@ LLM trả về JSON:
 
 ---
 
-## Step 6 — Execute LLM decisions ([line 1255-1356](../Agents/DataCleaner/agent_data_cleaner.py#L1255-L1356))
+## Step 6 — Execute LLM decisions
 
-Actions được **reorder theo canonical bucket** trước khi execute ([`_ACTION_ORDER`](../Agents/DataCleaner/agent_data_cleaner.py#L1246-L1254)) để train match `CleaningSpec.apply()` trên valid/oot:
+Actions được **reorder theo canonical bucket** trước khi execute (`_ACTION_ORDER`) để train match `CleaningSpec.apply()` trên valid/oot:
 
 ```
 LLM order:  clip A → dtype B → drop C → clip D → dedup
@@ -118,7 +118,7 @@ After sort: drop C → dtype B → dedup → clip A → clip D
 
 Python stable sort giữ thứ tự LLM trong cùng bucket. Log "Action Reorder" chỉ xuất hiện khi thực sự cần reorder.
 
-### 6 action types
+### Action types
 
 | Action | Vào spec? | Guard |
 |---|---|---|
@@ -127,6 +127,7 @@ Python stable sort giữ thứ tự LLM trong cùng bucket. Log "Action Reorder"
 | `drop_duplicates` | ❌ row-op, train only | — |
 | `deduplicate_by_key` | ❌ row-op, train only | Target không được làm dedup key |
 | `clip_outliers` | `spec.clip_bounds` (Q1/Q3 từ train) | PK/composite/target protected |
+| `flag_for_review`, `note`, `comment`, `review`, `observation` | ❌ chỉ ghi log (`BaseAgent.NOTE_ACTIONS`) | Không transform — pipeline tự động, không chờ duyệt |
 
 Mỗi action có try/except riêng — 1 action fail không kill toàn pipeline.
 
@@ -134,7 +135,7 @@ Nếu LLM response không parse được → fallback `_fallback_cleaning` chỉ
 
 ---
 
-## Step 7 — Save train + transform valid/oot (split mode) ([line 776-810](../Agents/DataCleaner/agent_data_cleaner.py#L776-L810))
+## Step 7 — Save train + transform valid/oot (split mode)
 
 ```
 1. train_df.to_parquet(CLEAN_TRAIN_PATH)  ← TMP_DIR (handoff)
@@ -148,7 +149,7 @@ Nếu LLM response không parse được → fallback `_fallback_cleaning` chỉ
 
 **Memory profile**: chỉ 1 partition trong RAM tại 1 thời điểm.
 
-`spec.apply()` ([line 38-67](../Agents/DataCleaner/agent_data_cleaner.py#L38-L67)):
+`spec.apply()`:
 1. `df = df.copy()` ← caller's df **không bao giờ** bị mutate
 2. Drop cột theo `spec.drops`
 3. Apply `spec.dtype_fixes` (mỗi cột)
@@ -166,7 +167,9 @@ RUN_DIR/
 └── pipeline_process_data_cleaner.py    ← script standalone replay (embed CleaningSpec inline)
 ```
 
-Intermediate parquet (`clean_train/valid/oot.parquet` hoặc `clean_data.parquet`) ghi vào `TMP_DIR` (system tempdir), xoá khi pipeline kết thúc.
+Intermediate parquet (`clean_train/valid/oot.parquet`) ghi vào `TMP_DIR` (system tempdir), xoá khi pipeline kết thúc. `cleaning_spec.pkl` được ghi vào run dir như một phần của replay bundle ([replay.md](replay.md)).
+
+> Sau Agent 1, **Stage 1b — NullProcessor** (`preprocessing/null_processor.py`) fit rule NULL trên `clean_train` (LLM gợi ý + guardrail tự động), transform cả 3 partition và ghi `null_processor.json`. Agent 1 vì vậy **không** impute NULL; nó chỉ drop cột NULL quá cao.
 
 ---
 
@@ -196,9 +199,9 @@ flowchart TD
 
 | Rule | Cơ chế |
 |---|---|
-| Clip bounds tính trên train | `_tool_clip_outliers` line 314-319 |
-| Pre-filter drops record vào spec | line 730 |
-| Encoders fit on train only | `spec.apply` replay không refit |
+| Clip bounds tính trên train | `_tool_clip_outliers` lưu Q1/Q3 của train vào spec |
+| Pre-filter drops record vào spec | `spec.drops` |
+| Spec fit on train only | `spec.apply` replay không refit |
 | Row-ops không vào spec | valid/oot giữ nguyên row count |
 | Action ordering canonical | train sequence match `spec.apply` |
 | PK/composite/target protected | `_pk_protected_cols` set, check trước mọi action |
