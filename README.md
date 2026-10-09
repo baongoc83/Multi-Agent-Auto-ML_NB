@@ -377,7 +377,8 @@ outputs/
     │   ├── shap_summary.png / shap_beeswarm.png
     │   ├── shap_feature_explanations.csv / final_model_shap_report.md
     │   ├── charts/                                    ROC, PR, KS, lift, gain, decile, calibration
-    │   ├── final_report.md
+    │   ├── final_report.md                            mở đầu bằng bảng "Data quality warnings"
+    │   ├── data_quality_report.json                   cảnh báo dữ liệu của mọi bước (PSI, scale, NULL, ...)
     │   ├── run_summary.md                             (khi chạy qua tools/overnight.py)
     │   │   ── replay bundle (mang sang môi trường khác) ──
     │   ├── replay_manifest.json                       provenance + SHA-256 từng artifact + metric kỳ vọng
@@ -405,6 +406,7 @@ Counter `run_NN` đếm dựa trên `max(NN) + 1` của các thư mục `run_*` 
 | `data_cleaner_report.json` | JSON Agent 1 — bao gồm `cleaning_spec` |
 | `feature_engineer_report.json` | JSON Agent 2 — bao gồm `feature_spec` |
 | `model_trainer_report.json` | JSON Agent 3 — best model, params, metrics |
+| `data_quality_report.json` | Cảnh báo dữ liệu của mọi bước: PSI drift (Stage 0b), đổi đơn vị / lệch phân phối / tỉ lệ NULL / giá trị không parse được (Stage 1b), WARN / SKIP của các agent. Mỗi mục có `severity` (`critical` / `warn`), danh sách cột và gợi ý cần kiểm tra. Với `DATA_GUARD_ACTION=warn` (mặc định) run không dừng — người dùng tự đánh giá theo ngưỡng của domain |
 | `psi_report.csv` | PSI drift train↔OOT từng feature |
 | `stability_report.csv` | Mean / std Gini theo tháng |
 | `shap_psi_prune_log.csv` | Đường cong của bước prune: số feature, valid AUC (thô + làm mượt), tập được chọn |

@@ -420,8 +420,9 @@ Cộng dồn 3 lớp + `JOBLIB_TEMP_FOLDER` đủ chạy 500k × 1500 cols dư�
 | `NULL_PROCESSOR_USE_LLM` | `true` | Rules proposed by the LLM behind deterministic guardrails (stats only, no row values); `false` = heuristic only. No human review step. |
 | `NULL_DRIFT_WARN_THRESHOLD` | `0.10` | Absolute missing-rate gap vs train that triggers a warning. |
 
-| `NULL_SCALE_WARN_RATIO` | `3.0` | Unit-change guard: median / p95 of \|x\| of a batch vs the frozen train value; ratio (either direction) ≥ this warns. |
-| `NULL_SCALE_FAIL_RATIO` | `10.0` | Same ratio ≥ this raises `NullContractError` (×1000 VND→thousand-VND shifts are caught). `0` disables. Batches under 100 non-null rows are never judged. |
+| `NULL_SCALE_WARN_RATIO` | `3.0` | Unit-change guard: median / p95 of the non-zero \|x\| of a batch vs the frozen train value; any single ratio (either direction) ≥ this warns (`distribution shifted`). |
+| `NULL_SCALE_FAIL_RATIO` | `10.0` | `critical` only when median **and** p95 shift the same way by ≥ this (a real unit change rescales every quantile; ×1000 VND→thousand-VND is caught). One quantile moving alone — heavy-tailed / sparse columns — is a `warn`. `0` disables. Batches under 100 non-null rows are never judged. |
+| `DATA_GUARD_ACTION` | `warn` | What a `critical` data-quality finding does (scale / unit change, unparseable values in a numeric column). `warn`: the run continues; every finding of every stage (Stage 0b PSI drift, Stage 1b scale / missing-rate / unparseable, agents' WARN / SKIP notices) goes to `data_quality_report.json` and the **Data quality warnings** table at the top of `final_report.md`, each with a hint of what to check. `fail`: stop with `NullContractError` (also at scoring, since the choice is stored in `null_processor.json`). Structural errors — absent required column, tampered artifact, unsafe expression — always stop. |
 
 ## Feature ranking / pruning (Agent 3)
 

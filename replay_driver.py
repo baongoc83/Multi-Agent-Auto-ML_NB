@@ -268,7 +268,17 @@ def _apply_nulls(df: pd.DataFrame, manifest: dict) -> pd.DataFrame:
         return df
     from preprocessing import NullProcessor
     proc = NullProcessor.load(_HERE / info["file"], expected_sha256=info.get("sha256"))
-    return proc.transform(df)
+    out = proc.transform(df)
+    issues = proc.report_.get("issues", [])
+    if issues:
+        crit = [i for i in issues if i["severity"] == "critical"]
+        print(f"[data quality] {len(crit)} critical / {len(issues) - len(crit)} warning issue(s) "
+              f"vs the training data (guard_action={proc.guard_action}):")
+        for i in (crit + [i for i in issues if i["severity"] != "critical"])[:15]:
+            print(f"  [{i['severity']}] {i['message']}")
+        if len(issues) > 15:
+            print(f"  ... {len(issues) - 15} more")
+    return out
 
 
 def _replay_specs(df: pd.DataFrame, manifest: dict, is_train: bool) -> pd.DataFrame:

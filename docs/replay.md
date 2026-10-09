@@ -43,8 +43,11 @@ Score mode không cần `split_assignment.parquet`.
 
 `--mode score` áp: CleaningSpec → NullProcessor → FeatureSpec (`strict=True`) → model:
 
-- Thiếu cột bắt buộc, cột số chứa giá trị không parse được, hoặc cột số đổi cỡ độ lớn
-  ≥ 10 lần so với train (đổi đơn vị) → dừng (`NullContractError`).
+- Thiếu cột bắt buộc → dừng (`NullContractError`).
+- Cột số chứa giá trị không parse được, hoặc median **và** p95 cùng đổi ≥ 10 lần so với
+  train (nghi đổi đơn vị) → `critical`. Run train với `DATA_GUARD_ACTION=warn` (mặc định)
+  thì khi score chỉ in danh sách cảnh báo `[data quality]` rồi chấm tiếp; với `fail` thì dừng.
+  Lựa chọn này được lưu trong `null_processor.json` của bundle.
 - Interaction phải điền median vì thiếu nguồn, cột cấu hình bị thiếu, hoặc tỉ lệ
   category lạ > 20% → dừng (`FeatureContractError`).
 - Thiếu feature của model → dừng (không còn "scoring on what is present").

@@ -19,9 +19,12 @@ Per-feature rule (see `FeatureRule`):
 NULL is never turned into 0 unless the rule says `zero`.
 
 Scale guard (unit changes): for numerical columns the batch's magnitude
-(median and p95 of |x|) is compared with the TRAIN statistics frozen at fit.
-A ratio beyond `scale_warn_ratio` warns, beyond `scale_fail_ratio` raises
-(a VND -> thousand-VND switch is a x1000 shift that otherwise scores silently).
+(median and p95 of the non-zero |x|) is compared with the TRAIN statistics
+frozen at fit. It is `critical` (raises with guard_action="raise", otherwise
+reported in `report_["issues"]`) only when BOTH move the same way by >= `scale_fail_ratio`
+(a VND -> thousand-VND switch rescales every quantile and otherwise scores
+silently); any single ratio beyond `scale_warn_ratio` — e.g. a heavy-tailed
+column whose median moves while p95 holds — only warns as a distribution shift.
 Only batches with >= `min_rows_for_distribution` non-null values are judged,
 so single-row online scoring is never rejected on distribution grounds.
 
@@ -193,6 +196,12 @@ class NullProcessor(BaseEstimator, TransformerMixin):
     scale_warn_ratio, scale_fail_ratio : float
         Magnitude ratio (batch / train, either direction) that warns / raises.
         scale_fail_ratio <= 0 disables the guard.
+    guard_action : "raise" | "warn"
+        What a data-quality guard does when tripped (scale shift >= scale_fail_ratio,
+        unparseable share > max_coerce_rate). "raise" stops with NullContractError;
+        "warn" records a `critical` issue in `report_["issues"]`, emits a warning and
+        carries on (thresholds are domain-specific, the user decides). Structural
+        contract errors (absent required column, tampered artifact) always raise.
     min_rows_for_distribution : int
         Minimum non-null rows before a batch is judged on distribution.
     max_indicators : int
@@ -208,7 +217,9 @@ class NullProcessor(BaseEstimator, TransformerMixin):
                  max_coerce_rate: float = 0.0, drift_warn_threshold: float = 0.10,
                  strict: bool = True, scale_warn_ratio: float = 3.0,
                  scale_fail_ratio: float = 10.0, min_rows_for_distribution: int = 100,
-                 max_indicators: int = 300):
+                 max_indicators: int = 300, guard_action: str = "raise"):
+        if guard_action not in ("raise", "warn"):
+            raise ValueError(f"guard_action must be 'raise' or 'warn', got {guard_action!r}")
         self.config = config
         self.on_unconfigured = on_unconfigured
         self.indicator_suffix = indicator_suffix
@@ -220,6 +231,7 @@ class NullProcessor(BaseEstimator, TransformerMixin):
         self.scale_fail_ratio = scale_fail_ratio          # <= 0 disables the guard
         self.min_rows_for_distribution = min_rows_for_distribution
         self.max_indicators = max_indicators              # <= 0: unlimited
+        self.guard_action = guard_action
 
     # ---- helpers -----------------------------------------------------------
     @staticmethod
@@ -397,9 +409,19 @@ class NullProcessor(BaseEstimator, TransformerMixin):
             res[key] = {"ratio": round(ratio, 6), "train": ref, "now": now}
         if not res:
             return {}
-        worst = max(max(v["ratio"], 1.0 / max(v["ratio"], 1e-12)) for v in res.values())
+        ratios = [v["ratio"] for v in res.values()]
+        fold = lambda r: max(r, 1.0 / max(r, 1e-12))
+        worst = max(fold(r) for r in ratios)
+        # A unit change rescales EVERY quantile by the same factor, so median and p95
+        # must move together in the same direction. Only that common shift can fail;
+        # one quantile moving alone (heavy-tailed / sparse columns) is a shape drift.
+        if all(r > 1 for r in ratios) or all(r < 1 for r in ratios):
+            unit = min(fold(r) for r in ratios)
+        else:
+            unit = 1.0
         res["worst_factor"] = round(worst, 3)
-        res["level"] = ("fail" if worst >= self.scale_fail_ratio
+        res["unit_factor"] = round(unit, 3)
+        res["level"] = ("fail" if unit >= self.scale_fail_ratio
                         else "warn" if worst >= self.scale_warn_ratio else "ok")
         return res
 
@@ -416,10 +438,18 @@ class NullProcessor(BaseEstimator, TransformerMixin):
                 f"{len(missing_cols)} required column(s) absent from input, e.g. {missing_cols[:8]}")
 
         out = X.copy()
-        report: Dict[str, Any] = {"columns": {}, "alerts": [], "missing_columns": missing_cols,
-                                  "scale": {}}
+        # issues: structured, one entry per (column, check) — what reports render.
+        # alerts: the same messages as plain strings (kept for older callers).
+        report: Dict[str, Any] = {"columns": {}, "alerts": [], "issues": [],
+                                  "missing_columns": missing_cols, "scale": {},
+                                  "guard_action": self.guard_action}
         indicators: Dict[str, pd.Series] = {}
         scale_fail: List[str] = []
+
+        def issue(column: str, check: str, severity: str, msg: str) -> None:
+            report["issues"].append({"column": column, "check": check,
+                                     "severity": severity, "message": msg})
+            report["alerts"].append(msg)
 
         for name in self.configured_columns_:
             if name not in out.columns:           # strict=False path
@@ -430,9 +460,12 @@ class NullProcessor(BaseEstimator, TransformerMixin):
             nonnull = int((~out[name].isna()).sum())
             coerce_rate = (n_coerced / nonnull) if nonnull else 0.0
             if coerce_rate > self.max_coerce_rate:
-                raise NullContractError(
-                    f"{name}: {n_coerced} unparseable value(s) ({coerce_rate:.1%}) in a "
-                    f"{rule.group} column; max_coerce_rate={self.max_coerce_rate:.1%}")
+                msg = (f"{name}: {n_coerced} unparseable value(s) ({coerce_rate:.1%}) in a "
+                       f"{rule.group} column; max_coerce_rate={self.max_coerce_rate:.1%}")
+                if self.guard_action == "raise":
+                    raise NullContractError(msg)
+                issue(name, "unparseable", "critical", msg + " — treated as NULL")
+                warnings.warn(f"NullProcessor: {msg}", stacklevel=2)
 
             is_missing = s.isna()                  # BEFORE imputation
             rate = float(is_missing.mean()) if len(s) else 0.0
@@ -442,7 +475,7 @@ class NullProcessor(BaseEstimator, TransformerMixin):
             if len(s) and abs(rate - train_rate) > self.drift_warn_threshold:
                 msg = (f"{name}: missing rate {rate:.1%} vs train {train_rate:.1%} "
                        f"(|delta| > {self.drift_warn_threshold:.0%})")
-                report["alerts"].append(msg)
+                issue(name, "missing_rate_drift", "warn", msg)
                 warnings.warn(f"NullProcessor drift: {msg}", stacklevel=2)
             report["columns"][name] = info
 
@@ -451,14 +484,18 @@ class NullProcessor(BaseEstimator, TransformerMixin):
                 if sc:
                     report["scale"][name] = sc
                     if sc["level"] != "ok":
-                        msg = (f"{name}: magnitude shifted x{sc['worst_factor']:g} vs train "
-                               f"(p95|x| non-zero {sc['abs_nz_p95']['train']:.4g} -> {sc['abs_nz_p95']['now']:.4g})"
-                               if "abs_nz_p95" in sc else
-                               f"{name}: magnitude shifted x{sc['worst_factor']:g} vs train")
-                        report["alerts"].append(msg)
+                        kind = "magnitude shifted" if sc["level"] == "fail" else "distribution shifted"
+                        detail = ", ".join(
+                            f"{lbl} {sc[k]['train']:.4g} -> {sc[k]['now']:.4g}"
+                            for k, lbl in (("abs_nz_median", "median"), ("abs_nz_p95", "p95"))
+                            if k in sc)
+                        msg = (f"{name}: {kind} x{sc['unit_factor'] if sc['level'] == 'fail' else sc['worst_factor']:g} "
+                               f"vs train (non-zero |x|: {detail})")
                         if sc["level"] == "fail":
+                            issue(name, "scale_unit_change", "critical", msg)
                             scale_fail.append(msg)
                         else:
+                            issue(name, "scale_distribution_shift", "warn", msg)
                             warnings.warn(f"NullProcessor scale: {msg}", stacklevel=2)
 
             if rule.add_missing_indicator:
@@ -471,10 +508,12 @@ class NullProcessor(BaseEstimator, TransformerMixin):
                 out[name] = s.fillna(fill)
 
         if scale_fail:
-            self.report_ = report
-            raise NullContractError(
-                f"{len(scale_fail)} column(s) changed scale beyond x{self.scale_fail_ratio:g} "
-                f"(unit change?): " + "; ".join(scale_fail[:6]))
+            head = (f"{len(scale_fail)} column(s) changed scale beyond x{self.scale_fail_ratio:g} "
+                    f"(unit change?): " + "; ".join(scale_fail[:6]))
+            if self.guard_action == "raise":
+                self.report_ = report
+                raise NullContractError(head)
+            warnings.warn(f"NullProcessor: {head}", stacklevel=2)
 
         for col in self.indicator_columns_:        # stable schema even if strict=False
             base = col[: -len(self.indicator_suffix)]
@@ -516,7 +555,8 @@ class NullProcessor(BaseEstimator, TransformerMixin):
                          "scale_warn_ratio": self.scale_warn_ratio,
                          "scale_fail_ratio": self.scale_fail_ratio,
                          "min_rows_for_distribution": self.min_rows_for_distribution,
-                         "max_indicators": self.max_indicators},
+                         "max_indicators": self.max_indicators,
+                         "guard_action": self.guard_action},
             "columns_in": self.columns_in_,
             "configured_columns": self.configured_columns_,
             "passthrough_columns": self.passthrough_columns_,
