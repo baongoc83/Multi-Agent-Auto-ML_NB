@@ -12,17 +12,20 @@ Tài liệu mô tả trực quan từng phần của pipeline. Mọi sơ đồ d
 multi-agent-auto-ml-v1.1/
 │
 ├── main.py                  ◄── CLI entry point
-├── pipeline.py              ◄── AutoMLPipeline orchestrator + Stage 0a/0b
+├── pipeline.py              ◄── AutoMLPipeline orchestrator + Stage 0a/0b + Stage 1b + replay bundle
 ├── splitting.py             ◄── Chia train/valid/oot (dùng chung pipeline + Agent 3)
+├── replay_driver.py         ◄── Template replay_pipeline.py (copy vào mỗi run)
+├── provenance.py            ◄── Git SHA, code fingerprint, config snapshot, hash input, versions
 ├── logger.py                ◄── AgentLogger (log + markdown report)
 ├── config.py                ◄── Config + LLM client factory
 ├── config_gateway.py        ◄── GatewayConfig override khi LLM_BACKEND=gateway
-├── config.yaml              ◄── LiteLLM proxy config
+├── config.yaml              ◄── LiteLLM proxy config (kèm ví dụ model on-prem)
+├── requirements.txt / requirements-proxy.txt / .python-version
 ├── _e2e_check.py            ◄── 6-test end-to-end smoke suite
 │
 ├── Agents/
 │   ├── BaseAgent/
-│   │   └── base_agent.py                ◄── LLM call + load_dataframe + smart Excel reader
+│   │   └── base_agent.py                ◄── LLM call (proxy / on-prem / gateway) + JSON extraction + load_dataframe
 │   ├── DataCleaner/
 │   │   ├── agent_data_cleaner.py        ◄── Agent 1 + CleaningSpec dataclass
 │   │   └── prompts/{system,user}.txt
@@ -33,6 +36,15 @@ multi-agent-auto-ml-v1.1/
 │       ├── agent_train_model.py         ◄── Agent 3
 │       └── prompts/{llm_summary_*}.txt
 │
+├── preprocessing/
+│   ├── null_processor.py                ◄── Stage 1b NullProcessor (sklearn transformer, JSON artifact)
+│   ├── null_rule_advisor.py             ◄── LLM gợi ý rule NULL + guardrail tự động
+│   └── safe_expr.py                     ◄── AST allowlist cho biểu thức feature do LLM viết
+│
+├── tools/
+│   ├── overnight.py                     ◄── Chạy nhiều dataset liên tiếp
+│   └── run_summary.py                   ◄── run_summary.md + smoke test bundle
+│
 ├── data/
 │   ├── process_home_data.py             ◄── Script chuẩn bị HomeCredit
 │   └── HomeCredit_columns_description.csv
@@ -40,24 +52,21 @@ multi-agent-auto-ml-v1.1/
 ├── docs/
 │   ├── architecture.md                  ◄── (file này)
 │   ├── awareness-pattern.md             ◄── Agentic pattern reference
-│   └── config_params.md                 ◄── Reference ~75 config params
+│   ├── config_params.md                 ◄── Reference config params
+│   ├── replay.md                        ◄── Replay bundle
+│   └── sequence_flow.md                 ◄── Sequence diagrams
 │
-├── outputs/                             ◄── Auto-tạo
-│   └── YYYY-MM-DD/                          ◄── 1 thư mục / ngày
-│       └── run_NN/                              ◄── 1 thư mục / lần chạy (counter reset mỗi ngày)
-│           ├── agent_execution.log
-│           ├── data_cleaner_report.json, feature_engineer_report.json, model_trainer_report.json
-│           ├── psi_report.csv, stability_report.csv, shap_psi_prune_log.csv
-│           ├── final_report.md
-│           ├── final_model.pkl, final_model_code.py
-│           ├── pipeline_process_data_cleaner.py        ◄── replay Agent 1 (embed CleaningSpec)
-│           ├── pipeline_process_feature_engineer.py    ◄── replay Agent 2
-│           ├── feature_spec.pkl                            ◄── sidecar (fitted LabelEncoders)
-│           └── pipeline_process_train_model.py         ◄── replay Agent 3 (= inference code)
+├── outputs/                             ◄── Auto-tạo (không commit)
+│   └── YYYY-MM-DD/run_NN/                   ◄── 1 thư mục / lần chạy (counter reset mỗi ngày)
+│       ├── agent_execution.log, *_report.json, final_report.md
+│       ├── psi_report.csv, stability_report.csv, shap_psi_prune_log.csv, shap_*, charts/
+│       ├── replay_manifest.json, replay_pipeline.py, split_assignment.parquet   ◄── replay bundle
+│       ├── cleaning_spec.pkl, null_processor.json, feature_spec.pkl, final_model.pkl
+│       ├── final_model_code.py
+│       └── pipeline_process_{data_cleaner,feature_engineer,train_model}.py
 └── tests/
-    ├── test_agent1.py
-    ├── test_agent2.py
-    └── test_agent3.py
+    ├── test_agent1.py ... test_agent3.py   ◄── gọi LLM thật
+    └── test_*.py                           ◄── test offline (replay, null processor, contract, security, ...)
 ```
 
 Intermediate `clean_*.parquet` / `engineered_*.parquet` (handoff giữa agents) **không lưu vào `run_NN/`** — ghi vào system tempdir và xoá sau khi pipeline kết thúc (try/finally). Set `KEEP_INTERMEDIATES=true` trong `.env` nếu muốn giữ để debug.
@@ -71,16 +80,19 @@ flowchart TD
     Pipe --> A2[FeatureEngineerAgent + FeatureSpec]
     Pipe --> A3[TrainModelAgent]
     Pipe --> SP[splitting.auto_split<br/>chia train/valid/oot]
+    Pipe --> NP[preprocessing.NullProcessor<br/>Stage 1b]
+    Pipe --> RB[replay bundle<br/>manifest + provenance + hashes]
+    A2 --> SE[preprocessing.safe_expr<br/>AST allowlist]
 
     A1 -.kế thừa.-> Base[BaseAgent]
     A2 -.kế thừa.-> Base
     A3 -.kế thừa.-> Base
 
     Base --> LLM{LLM Endpoint}
-    LLM --> Proxy[LiteLLM Proxy]
-    LLM --> OAI[OpenAI Direct]
-    LLM --> CLD[Claude Direct]
-    LLM --> GW[Gateway]
+    LLM --> Proxy[Proxy / gateway / on-prem<br/>vLLM · SGLang · Ollama]
+    LLM -.chỉ khi LLM_ALLOW_EXTERNAL_FALLBACK.-> OAI[OpenAI Direct]
+    LLM -.chỉ khi LLM_ALLOW_EXTERNAL_FALLBACK.-> CLD[Claude Direct]
+    LLM --> GW[Gateway chuẩn Anthropic]
 
     A1 --> Logger
     A2 --> Logger
@@ -120,7 +132,8 @@ flowchart LR
     S0a[Stage 0a<br/>Schema validation<br/>fail-fast] --> S0b
     S0b[Stage 0b<br/>PSI drift check<br/>warn only] --> A1
 
-    A1[Agent 1<br/>fit on train<br/>capture CleaningSpec<br/>replay on valid+oot] -->|3x clean_*.parquet| A2
+    A1[Agent 1<br/>fit on train<br/>capture CleaningSpec<br/>replay on valid+oot] -->|3x clean_*.parquet| NP
+    NP[Stage 1b NullProcessor<br/>fit on train<br/>rewrite 3x clean_*.parquet] --> A2
     A2[Agent 2<br/>fit on train<br/>capture FeatureSpec<br/>replay on valid+oot] -->|3x engineered_*.parquet| A3
     A3[Agent 3<br/>concat 3 file<br/>add _split_ marker<br/>train + eval]
     A3 --> Outs[(final_model.pkl<br/>+ inference code<br/>+ reports)]
@@ -130,13 +143,14 @@ flowchart LR
     style A3 fill:#dcedc1
 ```
 
-### Single-file mode — Agent 3 tự auto-split
+### Single-file mode — Stage 0 chia trước, rồi chạy như split mode
 
 ```mermaid
 flowchart LR
     Raw[(Raw data)] --> SP[Stage 0<br/>splitting.auto_split]
     SP -->|"train / valid / oot or test"| A1
-    A1[Agent 1<br/>fit on train<br/>replay on holdouts] -->|clean_*.parquet<br/>+ report1| A2
+    A1[Agent 1<br/>fit on train<br/>replay on holdouts] -->|clean_*.parquet<br/>+ report1| NP1[Stage 1b<br/>NullProcessor]
+    NP1 --> A2
     A2[Agent 2<br/>fit on train<br/>replay on holdouts] -->|engineered_*.parquet<br/>+ report2| A3
     A3[Agent 3<br/>train + eval<br/>theo split đã chia] --> Outs[(final_model.pkl<br/>+ replay bundle<br/>+ reports)]
 
@@ -450,15 +464,20 @@ class FeatureSpec:
     interactions:      List[Tuple[str, str, float]] # (new_col, expression, train_median_fill)
     label_encoders:    Dict[str, LabelEncoder]      # fitted on train, with __NA__ sentinel
     onehot_columns:    Dict[str, List[str]]         # col → train dummy column names
+    woe_maps:          Dict[str, Dict[str, Any]]    # col → {edges, woe} từ train
     selected_features: Optional[List[str]]          # if select_top_features was called
     target_column:     Optional[str]
+    step_order:        List[str]                    # thứ tự fit thực tế: interaction / encode / woe
 ```
 
-**Replay** (`spec.apply(df)`):
-1. **Re-create interactions**: same `eval(expression)`, fill NaN/inf bằng `train_median` đã captured (không phải median của valid/oot — leakage-free)
-2. **Label encoders**: `Series.where(isin(known), "__NA__")` rồi `le.transform` — vectorised, ~10× nhanh hơn `.apply(lambda)`
-3. **One-hot**: `pd.get_dummies` rồi `reindex(columns=train_dummies, fill_value=0)` — bỏ cols mới, fill 0 cho cols mất
-4. **Column selection**: keep only `spec.selected_features` + target
+**Replay** (`spec.apply(df, strict=...)`) theo `step_order`:
+1. **Interactions**: `safe_eval(expression)` (AST allowlist), fill NaN/inf bằng `train_median` đã captured (không phải median của valid/oot — leakage-free)
+2. **Label encoders**: `Series.where(isin(known), "__NA__")` rồi `le.transform` — vectorised
+3. **One-hot**: độc lập với batch — mỗi dummy của train = `(giá trị == level)`, không gọi `get_dummies` trên batch chấm điểm
+4. **WoE**: bin theo edges của train, NaN có bin riêng
+5. **Column selection**: keep only `spec.selected_features` + target
+
+Bất thường (interaction rơi về median, cột thiếu, unseen rate cao) nằm trong `spec.last_diagnostics`; `strict=True` (replay/scoring) raise `FeatureContractError`.
 
 ### Domain guidance — inject vào system prompt
 
@@ -506,7 +525,7 @@ Intermediate `engineered_*.parquet` ghi vào `TMP_DIR` và xoá sau khi pipeline
 
 ## 7. Agent 3 — TrainModel
 
-**Vai trò**: AutoML pipeline đầy đủ — chọn estimator, fine-tune, lọc feature theo 5 tầng, train final + đánh giá đa split, detect overfit.
+**Vai trò**: AutoML pipeline đầy đủ — chọn estimator, chọn feature, tune, train final + đánh giá đa split, detect overfit. Chi tiết từng bước và giá trị mặc định: [agent-3-train-model.md](agent-3-train-model.md).
 
 ### Entry points
 
@@ -545,14 +564,13 @@ flowchart TD
 
     Encode --> Budget[Compute time budget<br/>scale theo n_rows × n_cols]
     Budget --> Flaml[Step 2: FLAML AutoML<br/>chọn best estimator]
-    Flaml --> Optuna[Step 3: Optuna fine-tune<br/>TPE sampler trên valid_temporal]
+    Flaml --> RFE[Step 3: Rank<br/>1 fit, importance, loại gần trùng<br/>→ RFE_TARGET_FEATURES]
+    RFE --> PSI["Step 4: PSI filter<br/>drop drift>threshold giữa train và OOT"]
+    PSI --> Stab[Step 5: Stability check<br/>drop std Gini theo tháng cao]
+    Stab --> SHAP[Step 6: Batch prune<br/>tập nhỏ nhất trong dung sai AUC<br/>≤ MAX_FINAL_FEATURES]
+    SHAP --> Optuna[Step 7: Optuna 1 lần<br/>trên tập cuối, giới hạn từng trial]
 
-    Optuna --> RFE[Step 4: RFE<br/>cắt xuống MAX_FINAL_FEATURES]
-    RFE --> PSI["Step 5: PSI filter<br/>drop drift>threshold giữa train và OOT"]
-    PSI --> Stab[Step 6: Stability check<br/>drop std Gini theo tháng cao]
-    Stab --> SHAP[Step 7: SHAP+PSI iterative prune<br/>cho đến khi AUC ngừng tăng]
-
-    SHAP --> Final[Step 8: Train final model<br/>+ eval trên CV, valid, OOT, test]
+    Optuna --> Final[Step 8: Refit train+valid<br/>CV + multi-seed + calibration + PD floor/cap<br/>eval trên OOT / test]
 
     Final --> Over{"Overfit detected?<br/>gap > OVERFIT_THRESHOLD"}
     Over -->|no| Save
@@ -619,70 +637,47 @@ flowchart TD
     style M3 fill:#a8d8ea
 ```
 
-### Steps 2-3 — FLAML → Optuna
+### Steps 2-7 — FLAML → chọn feature → Optuna (mặc định)
 
 ```mermaid
 flowchart LR
     X_train --> FL[FLAML AutoML<br/>time_budget scaled]
-    FL --> Est[best_estimator<br/>vd: xgboost, lgbm, ...]
-    FL --> P0[base_params]
-
-    Est --> OP[Optuna TPE<br/>n_trials=50, timeout scaled]
-    P0 --> OP
-    X_valid[X_valid_temporal] --> OP
-
-    OP --> BP[best_params đầy đủ<br/>FixedTrial replay]
-
-    style FL fill:#a8d8ea
-    style OP fill:#a8d8ea
-```
-
-### Steps 4-7 — Feature Selection 5 tầng
-
-```mermaid
-flowchart LR
-    All[All features<br/>~n_init] --> RFE
-    RFE[Step 4 RFE<br/>cắt xuống MAX_FINAL_FEATURES] --> PSI
-    PSI[Step 5 PSI<br/>train vs OOT drift] --> Stab
-    Stab[Step 6 Stability<br/>monthly Gini std] --> SHAP
-    SHAP[Step 7 SHAP+PSI<br/>iterative prune] --> Final[Final features]
+    FL --> Est[best_estimator + base_params]
+    Est --> RK[Rank<br/>1 fit · gain/SHAP · bỏ |r|>0.90]
+    RK --> PSI[PSI<br/>train vs OOT]
+    PSI --> Stab[Stability<br/>monthly Gini std]
+    Stab --> BP[Batch prune<br/>10%/vòng · dung sai AUC · cap]
+    BP --> OP[Optuna TPE 1 lần<br/>per-trial cap · DART tắt]
+    OP --> BP2[best_params]
 
     PSI -.skip nếu.-> NoOOT[no date_col<br/>or no OOT]
     Stab -.skip nếu.-> Few["< STABILITY_MIN_MONTHS"]
-    SHAP -.skip nếu.-> NoVal[no validation set]
+    BP -.skip nếu.-> NoVal[no validation set]
 
-    style RFE fill:#dcedc1
-    style PSI fill:#dcedc1
-    style Stab fill:#dcedc1
-    style SHAP fill:#dcedc1
+    style FL fill:#a8d8ea
+    style OP fill:#a8d8ea
+    style RK fill:#dcedc1
+    style BP fill:#dcedc1
 ```
 
-### Step 7 — SHAP+PSI Iterative Prune chi tiết
+Luồng cũ (`OPTUNA_AFTER_SELECTION=false`, `FEATURE_RANK_METHOD=rfe`, `PRUNE_METHOD=one_by_one`): Optuna trên toàn bộ feature → RFE → PSI → Stability → SHAP+PSI prune từng feature → re-tune (chỉ nhận nếu hơn ≥ `RETUNE_MIN_GAIN`).
+
+### Step 6 — Batch prune chi tiết
 
 ```mermaid
 flowchart TD
-    Start([Features after Stability]) --> Base[Compute baseline<br/>valid AUC]
-    Base --> Iter{"len(features)<br/>> min_features?"}
+    Start([Features after Stability]) --> Fit[Fit model chọn feature<br/>ES trên valid → ghi n, valid AUC]
+    Fit --> Stop{"chạm sàn / MAX_ROUNDS /<br/>AUC < đỉnh − PRUNE_STOP_DROP?"}
+    Stop -->|no| Drop["bỏ PRUNE_BATCH_FRACTION yếu nhất<br/>score = importance (+ PSI nếu có OOT)"]
+    Drop --> Fit
+    Stop -->|yes| Smooth[Làm mượt đường AUC<br/>PRUNE_SMOOTH_WINDOW]
+    Smooth --> Pick["Tập NHỎ NHẤT có AUC ≥ đỉnh − tol<br/>tol = max(PRUNE_AUC_TOLERANCE, k × SE)"]
+    Pick --> Cap{"> MAX_FINAL_FEATURES<br/>và cap_first?"}
+    Cap -->|yes| Best[Tập AUC cao nhất trong các tập ≤ trần]
+    Cap -->|no| End([final features])
+    Best --> End
 
-    Iter -->|yes| Fit[Fit model fast<br/>SHAP_N_ESTIMATORS]
-    Fit --> Shap[Compute SHAP importance<br/>+ PSI lookup]
-    Shap --> Score["removal_score =<br/>0.5×(1-shap_norm) + 0.5×psi_norm"]
-    Score --> Worst[Pick worst feature]
-    Worst --> Try[Train without it<br/>compute candidate AUC]
-    Try --> Improve{"candidate_auc<br/>>= best_auc?"}
-
-    Improve -->|yes| Update[best_features = candidate<br/>reset streak]
-    Improve -->|no| Streak[no_improve_streak++]
-
-    Update --> Iter
-    Streak --> Stop{"streak >=<br/>MAX_NO_IMPROVE?"}
-    Stop -->|yes| End
-    Stop -->|no| Iter
-
-    Iter -->|no| End([Return best_features])
-
-    style Improve fill:#ffcccc
-    style Stop fill:#ffcccc
+    style Pick fill:#ffcccc
 ```
 
 ### Step 8 — Overfitting Detection & Retrain
@@ -690,7 +685,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     Train[Train final model] --> Eval[Eval trên CV + valid +<br/>oot/test]
-    Eval --> Check["gap = (valid_auc - holdout_auc) / valid_auc"]
+    Eval --> Check["gap = (cv_auc_mean - holdout_auc) / cv_auc_mean<br/>(valid_* là in-sample sau refit)"]
     Check --> Detect{"gap > 12%?"}
 
     Detect -->|no| Done([Save model])
@@ -723,23 +718,25 @@ flowchart TD
 | `_tool_split_data` | Split (pre-split marker / provided OOT / OOT temporal / 60-20-20 fallback) |
 | `_tool_run_flaml` | FLAML AutoML chọn estimator |
 | `_tool_run_optuna` | Fine-tune hyperparams |
-| `_tool_run_rfe` | RFE / RFECV feature selection |
+| `_tool_rank_features` | Xếp hạng 1 lần + loại feature gần trùng (mặc định) |
+| `_tool_run_rfe` | RFE / RFECV (luồng cũ) |
+| `_tool_batch_prune` | Prune theo lô với dung sai AUC + trần (mặc định) |
 | `_tool_run_psi_filter` | Drop feature theo PSI drift |
 | `_tool_run_stability_check` | Drop feature theo monthly Gini std |
-| `_tool_shap_psi_prune` | Iterative SHAP+PSI prune |
+| `_tool_shap_psi_prune` | Prune SHAP+PSI từng feature (luồng cũ) |
 | `_tool_train_final_model` | Train final + eval đa split |
 
 ### Output (persisted vào `RUN_DIR` = `outputs/YYYY-MM-DD/run_NN/`)
 
 | File | Mô tả |
 |---|---|
-| `final_model.pkl` | model + cat_encoders + feature_cols + target |
-| `final_model_code.py` | Standalone inference code |
+| `final_model.pkl` | ensemble + calibrator + pd_floor/pd_cap + cat_encoders + feature_cols + versions |
+| `final_model_code.py` | Inference trên dữ liệu đã engineered; dừng khi thiếu feature / lệch phiên bản |
 | `pipeline_process_train_model.py` | Bản copy của `final_model_code.py` dưới naming `pipeline_process_*` cho consistent với Agent 1+2 |
 | `model_trainer_report.json` | JSON report đầy đủ |
 | `psi_report.csv` | PSI score từng feature |
 | `stability_report.csv` | Mean + std Gini theo tháng |
-| `shap_psi_prune_log.csv` | Log từng step pruning |
+| `shap_psi_prune_log.csv` | Đường AUC theo số feature của bước prune |
 | `final_report.md` + `agent_execution.log` | Markdown report tổng + execution log |
 
 ---
@@ -830,7 +827,8 @@ Benchmark (50k × 1400 mixed): 1.82 GB → 190 MB (≈9.6×). Cho case 100k × 1
 
 ## 9. Replay bundle — chạy lại một run ở môi trường khác
 
-Mỗi run ghi 6 file đủ để tái lập toàn trình (split → transform → retrain | score).
+Mỗi run ghi 7 file đủ để tái lập toàn trình (split → transform → retrain | score), kèm
+provenance và SHA-256 từng artifact; driver kiểm hash + phiên bản thư viện trước khi load.
 Chi tiết đầy đủ: [replay.md](replay.md).
 
 ```mermaid
@@ -847,14 +845,15 @@ sequenceDiagram
     R->>S: join theo key + _key_occ_<br/>sort theo _split_pos_
     Note over R,S: dựng lại ĐÚNG partition + ĐÚNG thứ tự dòng
     R->>SP: CleaningSpec.apply (mọi partition)<br/>+ apply_row_ops (chỉ train)
-    R->>SP: FeatureSpec.apply
-    R->>A3: replay_fit(...) — bỏ FLAML/Optuna/RFE/PSI/SHAP
+    R->>SP: NullProcessor.transform (null_processor.json)
+    R->>SP: FeatureSpec.apply (strict)
+    R->>A3: replay_fit(...) — bỏ FLAML/Optuna/rank/PSI/prune
     A3-->>R: metrics
     R->>M: so với expected_metrics
     R-->>U: "Reproduced exactly" hoặc chỉ ra chặng nào sai
 ```
 
-`--mode score` bỏ bước split và `replay_fit`, chỉ load `final_model.pkl` để chấm điểm dữ liệu mới.
+`--mode score` bỏ bước split và `replay_fit`: CleaningSpec → NullProcessor → FeatureSpec (strict) → `final_model.pkl`, PD chặn trong `[pd_floor, pd_cap]`.
 
 ---
 
@@ -865,7 +864,7 @@ Project hỗ trợ **2 backend** chọn qua env var `LLM_BACKEND`. Mỗi backend
 ```mermaid
 flowchart LR
     Env[LLM_BACKEND env var] --> L{legacy?}
-    L -->|yes default| Legacy[3-tier app-level fallback<br/>proxy + OpenAI + Claude]
+    L -->|yes default| Legacy[OpenAI-compatible endpoint<br/>proxy / gateway / on-prem<br/>+ fallback public tuỳ chọn]
     L -->|no - gateway| Gateway[Single source<br/>LiteLLM gateway only<br/>gateway tự xử lý failover]
 
     style Legacy fill:#ffd3b6
@@ -899,7 +898,7 @@ flowchart TD
 
 ### Legacy backend (`LLM_BACKEND=legacy`, default)
 
-Mỗi `call_llm()` đi qua chain 4 bước:
+Mỗi `call_llm()` đi qua chain dưới đây. Với `LLM_ALLOW_EXTERNAL_FALLBACK=false` (khuyến nghị on-prem) hai bước OpenAI/Claude direct bị tắt: lỗi kết nối được retry trên proxy, hết lượt thì raise lỗi rõ ràng. `LLM_SKIP_PROXY=true` bỏ hẳn bước proxy (chỉ khi cho phép fallback public).
 
 ```mermaid
 flowchart TD
@@ -939,6 +938,8 @@ flowchart TD
 ```
 
 Mỗi attempt còn có **retry exponential backoff** cho lỗi rate-limit (429) và server (5xx), với `LLM_MAX_RETRIES=3`, base delay `LLM_RETRY_DELAY=2s`.
+
+Mọi câu trả lời (cả hai backend) đi qua `_strip_reasoning` (bỏ `<think>…</think>` của Qwen3 / DeepSeek-R1, token box của GLM) rồi `_extract_json` (bộ giải mã JSON thật, chịu được dấu ngoặc trong phần suy luận hoặc văn bản kèm theo). Tham số riêng của server on-prem: `LLM_EXTRA_BODY`, `LLM_OMIT_PARAMS`, `LLM_JSON_MODE_NATIVE`. Xem [config_params.md](config_params.md#on-prem--enterprise-llm-endpoints).
 
 ---
 
@@ -1000,55 +1001,18 @@ flowchart TD
 
 ## 13. Output Folder Map
 
-Sau khi pipeline chạy xong, `outputs/` chứa **các file phụ thuộc mode**:
+Mọi output nằm trong `outputs/YYYY-MM-DD/run_NN/` (xem cây ở mục 1). File trung gian
+`autosplit_*`, `clean_*`, `engineered_*.parquet` nằm trong tempdir và bị xoá cuối run
+(kể cả khi lỗi), trừ khi `KEEP_INTERMEDIATES=true` — khi đó chúng nằm cùng run dir.
 
-### Split mode (`--valid` / `--oot` được set)
-
-```
-outputs/
-├── clean_train.parquet              ◄── Agent 1: train fit + LLM + spec capture
-├── clean_valid.parquet              ◄── Agent 1: spec replay, no row drop
-├── clean_oot.parquet                ◄── Agent 1: spec replay, no row drop
-│
-├── engineered_train.parquet         ◄── Agent 2: train fit
-├── engineered_valid.parquet         ◄── Agent 2: FeatureSpec replay
-├── engineered_oot.parquet           ◄── Agent 2: FeatureSpec replay
-│
-├── data_cleaner_report.json         ◄── Agent 1 + cleaning_spec serialized
-├── feature_engineer_report.json     ◄── Agent 2 + feature_spec serialized
-├── model_trainer_report.json        ◄── Agent 3 metrics + feature pipeline
-│
-├── psi_report.csv                   ◄── PSI drift per feature (Agent 3 step 5)
-├── stability_report.csv             ◄── Monthly Gini stats
-├── shap_psi_prune_log.csv           ◄── Pruning step-by-step log
-│
-├── final_model.pkl                  ◄── Model + encoders (joblib)
-├── final_model_code.py              ◄── Standalone inference script
-│
-├── final_report.md                  ◄── Full markdown report
-└── agent_execution.log              ◄── Plain-text execution log
-```
-
-### Single-file mode (no `--valid` / `--oot`)
-
-```
-outputs/
-├── clean_data.parquet               ◄── Agent 1 output (1 file)
-├── engineered_data.parquet          ◄── Agent 2 output (1 file)
-│
-├── data_cleaner_report.json
-├── feature_engineer_report.json
-├── model_trainer_report.json
-│
-├── psi_report.csv                   (chỉ nếu Agent 3 split có OOT)
-├── stability_report.csv             (chỉ nếu Agent 3 split có date_col)
-├── shap_psi_prune_log.csv
-│
-├── final_model.pkl
-├── final_model_code.py
-├── final_report.md
-└── agent_execution.log
-```
+| Nhóm | File | Khi nào có |
+|---|---|---|
+| Log + báo cáo | `agent_execution.log`, `*_report.json`, `final_report.md`, `run_summary.md` | luôn có (`run_summary.md` khi chạy qua `tools/overnight.py`) |
+| Chọn feature | `shap_psi_prune_log.csv` | luôn có khi có valid |
+| | `psi_report.csv`, `stability_report.csv` | chỉ khi có OOT / cột ngày |
+| Giải thích | `shap_summary.png`, `shap_beeswarm.png`, `shap_feature_explanations.csv`, `final_model_shap_report.md`, `charts/` | khi `SHAP_FINAL_EXPLAIN_ENABLED=true` |
+| Replay bundle | `replay_manifest.json`, `replay_pipeline.py`, `split_assignment.parquet`, `cleaning_spec.pkl`, `null_processor.json`, `feature_spec.pkl`, `final_model.pkl` | luôn có (`null_processor.json` khi Stage 1b bật) |
+| Script từng agent | `final_model_code.py`, `pipeline_process_*.py` | luôn có |
 
 ---
 
@@ -1069,12 +1033,16 @@ outputs/
 python _e2e_check.py
 ```
 
+Ngoài ra có bộ test offline `tests/test_*.py` (replay tái lập, chẩn đoán, chuẩn hoá đầu đọc, NullProcessor, scoring contract, security, chọn feature, Optuna guard, provenance/PD, on-prem LLM) — danh sách và cách chạy trong [README.md](../README.md#test-offline-không-gọi-llm).
+
 ---
 
 ## 15. Tham chiếu nhanh
 
 - [README.md](../README.md) — Quick start + CLI examples
 - [docs/awareness-pattern.md](awareness-pattern.md) — Agentic pattern (Plan-Execute + Awareness)
-- [docs/config_params.md](config_params.md) — Reference toàn bộ ~75 config params
+- [docs/config_params.md](config_params.md) — Reference toàn bộ config params
+- [docs/replay.md](replay.md) — Replay bundle
+- [docs/agent-3-train-model.md](agent-3-train-model.md) — Agent 3 chi tiết
 - [pipeline.py](../pipeline.py) — Orchestrator chính + Stage 0a/0b
 - [Agents/BaseAgent/base_agent.py](../Agents/BaseAgent/base_agent.py) — LLM call + tool execution + smart Excel reader

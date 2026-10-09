@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -77,8 +78,10 @@ def main():
     # df.to_csv(test_data_path, index=False)
     
     Path("outputs").mkdir(exist_ok=True)
-    # test_data_path = "D:/Ngoc/AI Project/Test_1st_version/multi-agent-auto-ml-v2/outputs/sample_data.csv"
-    test_data_path = r"D:\Ngoc\AI Project\Test_1st_version\multi-agent-auto-ml-v2\data\home-credit-default-risk\application_train_processed.csv"
+    # Dataset path: $AUTOML_TEST_DATA, else the repo-relative Home Credit file.
+    test_data_path = os.environ.get(
+        "AUTOML_TEST_DATA",
+        str(Path(__file__).resolve().parent / "data" / "home-credit-default-risk" / "application_train_processed.csv"))
     # test_data_path = "outputs/test_employee_data.csv"
     
     print(f"Test dataset sample: {test_data_path}")
@@ -106,7 +109,7 @@ def main():
         # final_metrics = pipeline.run(
         #     input_path=test_data_path,
         #     target_column="label",
-        #     col_descriptions_path="D:/Ngoc/AI Project/Test_1st_version/multi-agent-auto-ml-v2/data/col_descriptions.json",
+        #     col_descriptions_path="data/col_descriptions.json",
         #     # col_descriptions_kwargs=dict(
         #     #     col_name_field="Row",
         #     #     col_desc_field="Description",

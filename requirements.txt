@@ -1,13 +1,18 @@
+# Python 3.12 (see .python-version). Every direct dependency is pinned to the exact version
+# the reference runs were produced with: pickled specs / boosters are version-sensitive and
+# replay_pipeline.py refuses to load them on mismatched versions.
+
 # Core data
 numpy==2.3.3
 pandas==2.3.3
-pyarrow>=14.0.0   # parquet/feather/orc + S3FileSystem with custom credentials
+pyarrow==21.0.0          # parquet / feather / orc + S3FileSystem
+scipy==1.16.2            # used by scikit-learn / shap; pinned so isotonic + stats match
 
 # Excel engines — BaseAgent._read_excel_smart auto-routes by file magic:
 #   .xlsx / .xlsm (ZIP)  → openpyxl
 #   .xls (OLE2 binary)   → xlrd
-openpyxl>=3.1.0
-xlrd>=2.0.1
+openpyxl==3.1.5
+xlrd==2.0.2
 
 # ML / model training
 scikit-learn==1.7.2
@@ -16,13 +21,18 @@ xgboost==3.2.0
 catboost==1.2.10
 FLAML==2.6.0
 optuna==4.8.0
-shap>=0.46.0
+shap==0.51.0
+matplotlib==3.10.6       # SHAP / diagnostic charts
+joblib==1.5.2
 
-# LLM backends
+# LLM clients (OpenAI-compatible: LiteLLM proxy, vLLM, SGLang, Ollama, enterprise gateways)
 openai==2.24.0
-anthropic==0.104.1
+anthropic==0.104.1       # only for LLM_BACKEND=gateway or the Claude direct fallback
 
 # Utilities
 python-dotenv==1.0.1
-PyYAML>=6.0          # optional: YAML rule files for preprocessing.NullProcessor
-joblib>=1.3.0
+PyYAML==6.0.3            # YAML rule files for preprocessing.NullProcessor
+
+# Not needed by the pipeline itself:
+#   litellm   — only if you run the proxy on this host (see requirements-proxy.txt)
+#   zstandard — only to read *.zst inputs

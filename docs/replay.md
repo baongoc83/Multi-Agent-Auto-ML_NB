@@ -9,21 +9,46 @@ PSI, stability và SHAP prune đều là các bước **tìm kiếm** trên dữ
 kết quả của chúng đã nằm trong bundle rồi, nên replay đọc kết quả đó thay vì
 tìm lại. Đó là lý do kết quả tái lập được chứ không chỉ "gần giống".
 
-## Bundle gồm gì — 6 file
+## Bundle gồm gì — 7 file
 
 Trong `outputs/<YYYY-MM-DD>/run_NN/`. Đây là **toàn bộ** những gì driver đọc;
-copy đúng 6 file này sang thư mục rỗng là chạy được (đã kiểm chứng).
+copy đúng các file này sang thư mục rỗng là chạy được.
 
-| File | Agent | Vai trò | retrain | score |
+| File | Bước | Vai trò | retrain | score |
 |------|-------|---------|:---:|:---:|
 | `replay_pipeline.py` | — | Driver. Chạy file này. | ✅ | ✅ |
-| `replay_manifest.json` | — | Mọi quyết định đã chốt: key chia, estimator, best_params, **final feature list**, metrics gốc để đối chiếu. | ✅ | ✅ |
+| `replay_manifest.json` | — | Mọi quyết định đã chốt (key chia, estimator, best_params, **final feature list**, metrics gốc) + `provenance` + `artifacts` (SHA-256 từng file). | ✅ | ✅ |
 | `split_assignment.parquet` | 0 (split) | Mỗi dòng gốc → partition nào, vị trí thứ mấy (`_split_pos_`), occurrence rank (`_key_occ_`). | ✅ | — |
 | `cleaning_spec.pkl` | 1 | CleaningSpec: drops, dtype fixes, clip bounds + `row_ops` train-only. | ✅ | ✅ |
-| `feature_spec.pkl` | 2 | FeatureSpec: interactions, encoders, WoE maps, selected features. | ✅ | ✅ |
-| `final_model.pkl` | 3 | Model + ensemble + calibrator + cat encoders + versions lúc train. | ✅ | ✅ |
+| `null_processor.json` | 1b | Rule NULL từng cột + thống kê train + giá trị imputation (JSON, có hash nội dung). Chỉ có ở run từ khi có Stage 1b. | ✅ | ✅ |
+| `feature_spec.pkl` | 2 | FeatureSpec: interactions, encoders, WoE maps, selected features, `step_order`. | ✅ | ✅ |
+| `final_model.pkl` | 3 | Ensemble + calibrator + PD floor/cap + cat encoders + versions lúc train. | ✅ | ✅ |
 
-Score mode không cần `split_assignment.parquet` → 5 file.
+Score mode không cần `split_assignment.parquet`.
+
+## Kiểm tra trước khi load
+
+`joblib.load` một pickle là **chạy code**, nên driver kiểm theo thứ tự:
+
+1. **Đủ file** — thiếu file nào thì liệt kê hết rồi dừng.
+2. **Hash** — SHA-256 từng artifact phải khớp `manifest["artifacts"]`; lệch thì dừng
+   ("hash mismatch"). Bundle cũ không có hash: chạy tiếp, in "integrity NOT verified".
+3. **Provenance** — in git SHA / trạng thái dirty / phiên bản Python của run gốc;
+   cảnh báo nếu `code_fingerprint` của repo hiện tại khác (spec pickle phụ thuộc code).
+4. **Phiên bản thư viện** — so python / sklearn / pandas / numpy **và booster đã pickle**
+   (xgboost / lightgbm / catboost) với `versions` trong `final_model.pkl`. Lệch thì
+   **dừng**, trừ khi thêm `--allow-version-mismatch`.
+
+## Score là strict
+
+`--mode score` áp: CleaningSpec → NullProcessor → FeatureSpec (`strict=True`) → model:
+
+- Thiếu cột bắt buộc, cột số chứa giá trị không parse được, hoặc cột số đổi cỡ độ lớn
+  ≥ 10 lần so với train (đổi đơn vị) → dừng (`NullContractError`).
+- Interaction phải điền median vì thiếu nguồn, cột cấu hình bị thiếu, hoặc tỉ lệ
+  category lạ > 20% → dừng (`FeatureContractError`).
+- Thiếu feature của model → dừng (không còn "scoring on what is present").
+- PD trả ra được chặn trong `[pd_floor, pd_cap]` lưu trong artifact.
 
 Hai thứ **không** nằm trong bundle mà bạn phải tự mang: **file input gốc** và
 **repo** (xem phần dưới). Thiếu file nào thì driver liệt kê ngay từ đầu rồi
@@ -41,10 +66,13 @@ python replay_pipeline.py <file_input_gốc> --mode retrain --repo /path/to/repo
 
 # Chỉ score dữ liệu mới bằng model đã train
 python replay_pipeline.py <file_mới> --mode score --out scores.parquet --repo /path/to/repo
+
+# Cố ý chạy trên phiên bản thư viện khác (kết quả có thể lệch)
+python replay_pipeline.py <file_mới> --mode score --out scores.parquet --allow-version-mismatch
 ```
 
 `--repo` trỏ tới thư mục repo (hoặc đặt biến môi trường `AUTOML_REPO`). Bỏ qua
-được nếu run dir vẫn nằm trong repo.
+được nếu run dir vẫn nằm trong repo. Output score gồm cột `score` + các cột key.
 
 Cuối `--mode retrain`, driver in bảng so sánh từng metric giữa replay và run gốc
 rồi kết luận một trong ba:
@@ -67,9 +95,13 @@ Hai lý do, cả hai đều cố ý:
    hai bản sẽ lệch nhau lúc nào không biết — mà đó đúng là thứ bundle này sinh
    ra để ngăn.
 
-Đổi lại: phải mang repo theo, **đúng version**. Pin thư viện theo `versions`
-trong `final_model.pkl` (driver tự cảnh báo khi lệch) — sklearn/LightGBM khác
-version có thể đổi hành vi của model đã pickle.
+Đổi lại: phải mang repo theo, **đúng version** (`provenance.code.git_sha` /
+`code_fingerprint` trong manifest cho biết là version nào). Cài thư viện bằng
+`requirements.txt` (đã pin chính xác); driver dừng khi phiên bản lệch so với
+`versions` trong `final_model.pkl`.
+
+Bundle tạo **trước** khi có `FINAL_ES_TREE_HEADROOM` (trước commit `9effb47`)
+cần đặt `FINAL_ES_TREE_HEADROOM=1` khi `--mode retrain` để ra đúng `best_iteration` cũ.
 
 ## Chuẩn hoá đầu đọc (CSV / parquet / Excel / SQL)
 
@@ -167,4 +199,9 @@ sort theo nó trước khi train.
 
 **Script `pipeline_process_*.py` khác với bundle này.** Ba script đó replay
 transform của từng agent một cách độc lập (dùng khi muốn áp transform lên dữ
-liệu mới). `replay_pipeline.py` là thứ chạy lại *cả run*.
+liệu mới) và **không** gồm Stage 1b (NullProcessor). `replay_pipeline.py` là thứ
+chạy lại *cả run* và là đường scoring khuyến nghị cho production.
+
+**Thời gian thực.** FLAML / Optuna trong run gốc đo theo giờ thực, nên chạy lại
+cả pipeline (không phải replay) trên máy khác có thể ra tham số khác. Replay không
+bị ảnh hưởng vì không tìm kiếm lại.

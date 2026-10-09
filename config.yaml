@@ -40,3 +40,29 @@ model_list:
   #   litellm_params:
   #     model: openai/gpt-4o
   #     api_key: "os.environ/OPENAI_API_KEY"
+
+  # ── On-prem model examples (OpenAI-compatible servers behind this proxy) ───
+  # Point LOCAL_MODEL / CLOUD_MODEL in .env at these aliases.
+  #
+  # - model_name: qwen3-8b
+  #   litellm_params:
+  #     model: openai/Qwen/Qwen3-8B            # name as served by vLLM / SGLang
+  #     api_base: http://gpu-node-1:8000/v1
+  #     api_key: "os.environ/ONPREM_LLM_KEY"
+  #
+  # - model_name: deepseek-v3
+  #   litellm_params:
+  #     model: openai/deepseek-ai/DeepSeek-V3
+  #     api_base: http://gpu-node-2:8000/v1
+  #     api_key: "os.environ/ONPREM_LLM_KEY"
+  #
+  # - model_name: glm-4.5
+  #   litellm_params:
+  #     model: openai/zai-org/GLM-4.5
+  #     api_base: http://gpu-node-3:8000/v1
+  #     api_key: "os.environ/ONPREM_LLM_KEY"
+  #
+  # - model_name: qwen3-8b-ollama
+  #   litellm_params:
+  #     model: ollama/qwen3:8b
+  #     api_base: http://ollama-host:11434

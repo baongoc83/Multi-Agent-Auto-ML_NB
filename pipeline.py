@@ -802,7 +802,10 @@ class AutoMLPipeline:
         manifest = {
             "schema_version": 1,
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "run_dir": Config.RUN_DIR,
+            # Relative to the repo root when inside it, so the bundle carries no machine path.
+            "run_dir": (lambda p: (str(p.relative_to(Path(__file__).resolve().parent)).replace("\\", "/")
+                                   if p.is_relative_to(Path(__file__).resolve().parent) else str(p)))(
+                Path(Config.RUN_DIR).resolve()),
             "source_input": str(input_path),
             "pipeline_mode": mode,
             "target_column": target_column,

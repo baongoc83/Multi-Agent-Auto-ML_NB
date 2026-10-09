@@ -1,0 +1,3 @@
+# Only for hosting the LiteLLM proxy on this machine (start_litellm.ps1 / `litellm --config config.yaml`).
+# The pipeline itself talks to the proxy over HTTP and does not import litellm.
+litellm==1.83.11
