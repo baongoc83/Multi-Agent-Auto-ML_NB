@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .env
 .venv/
+.venv-proxy/
 venv/
 *.log
 .DS_Store

@@ -46,8 +46,11 @@ py -3.12 -m venv .venv            # Linux: python3.12 -m venv .venv
 # 3. Cài dependencies (đã pin chính xác theo các run tham chiếu)
 pip install -r requirements.txt
 
-# 4. (Tuỳ chọn) chỉ khi host LiteLLM proxy trên chính máy này — nên dùng venv riêng
-pip install -r requirements-proxy.txt
+# 4. (Tuỳ chọn) chỉ khi host LiteLLM proxy trên chính máy này — dùng venv RIÊNG
+#    (litellm[proxy] kéo ~80 package và pin cứng pydantic; pipeline không import litellm)
+py -3.12 -m venv .venv-proxy
+.\.venv-proxy\Scripts\pip install -r requirements-proxy.txt
+$env:LITELLM_EXE = (Resolve-Path .\.venv-proxy\Scripts\litellm.exe)   # start_litellm.ps1 dùng biến này
 ```
 
 Mọi đường dẫn trong code đều tương đối: `OUTPUT_DIR` dạng tương đối được neo vào thư mục gốc repo, dữ liệu truyền qua CLI hoặc biến môi trường (`AUTOML_DATA_ROOT`, `AUTOML_TEST_DATA`).

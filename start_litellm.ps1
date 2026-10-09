@@ -32,7 +32,7 @@ if (Test-Path $envFile) {
 
 if (-not $litellm -or -not (Test-Path $litellm)) {
     Write-Error "litellm not found (set LITELLM_EXE or put litellm on PATH)"
-    Write-Host "Install it with:  pip install litellm"
+    Write-Host "Install it with:  pip install -r requirements-proxy.txt   (in a separate venv)"
     exit 1
 }
 
