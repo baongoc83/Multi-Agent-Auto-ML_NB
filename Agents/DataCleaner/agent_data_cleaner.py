@@ -317,6 +317,14 @@ class DataCleanerAgent(BaseAgent):
             return json.dumps({"column": col, "note": "All values are null, skipped"})
         q1, q3 = float(series.quantile(0.25)), float(series.quantile(0.75))
         iqr = q3 - q1
+        if iqr <= 0:
+            nonmodal = float((series != q1).mean() * 100)
+            return json.dumps({
+                "column": col, "q1": q1, "q3": q3, "iqr": 0.0,
+                "non_modal_percentage": round(nonmodal, 2),
+                "note": (f"Zero-inflated: {nonmodal:.2f}% of values differ from {q1:g}. These are the "
+                         "signal, not outliers — do NOT clip_outliers (IQR clipping is refused here)."),
+            }, indent=2)
         lower, upper = q1 - 3 * iqr, q3 + 3 * iqr
         outlier_count = int(((df[col] < lower) | (df[col] > upper)).sum())
         return json.dumps({
@@ -395,6 +403,11 @@ class DataCleanerAgent(BaseAgent):
         q1 = float(series.quantile(0.25))
         q3 = float(series.quantile(0.75))
         iqr = q3 - q1
+        if iqr <= 0:
+            # Zero-inflated column (q1 == q3, e.g. mostly 0): the bounds collapse to a
+            # single value and clipping would flatten every non-modal value — the signal.
+            raise ValueError(f"'{col}' has IQR=0 (q1=q3={q1:g}); clipping would set every "
+                             f"other value to {q1:g} — refused")
         lower, upper = q1 - factor * iqr, q3 + factor * iqr
         df[col] = df[col].clip(lower=lower, upper=upper)
         self._last_clip_bounds = (lower, upper)
@@ -1436,7 +1449,11 @@ if __name__ == "__main__":
                             continue
                         factor = float(action_spec.get("factor", 3.0))
                         self._last_clip_bounds = None
-                        self.df = self.execute_tool("clip_outliers", df=self.df, col=column, factor=factor)
+                        try:
+                            self.df = self.execute_tool("clip_outliers", df=self.df, col=column, factor=factor)
+                        except ValueError as e:
+                            self.logger.log(self.name, f"SKIP {action_type}", str(e))
+                            continue
                         if self._last_clip_bounds is not None:
                             spec.clip_bounds[column] = self._last_clip_bounds
                         actions_taken.append(f"Clipped outliers in '{column}' (factor={factor}): {reason}")

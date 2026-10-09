@@ -140,6 +140,7 @@ class Config:
     PIPELINE_PROCESS_TM_PATH: str = f"{OUTPUT_DIR}/pipeline_process_train_model.py"
     PIPELINE_PROCESS_DC_SPEC_PATH: str = f"{OUTPUT_DIR}/cleaning_spec.pkl"
     NULL_PROCESSOR_PATH: str = f"{OUTPUT_DIR}/null_processor.json"
+    DATA_QUALITY_REPORT_PATH: str = f"{OUTPUT_DIR}/data_quality_report.json"
     # End-to-end replay bundle: re-run this exact run (split -> clean -> FE ->
     # retrain / score) in another environment. See docs/replay.md.
     REPLAY_DRIVER_PATH: str = f"{OUTPUT_DIR}/replay_pipeline.py"
@@ -248,6 +249,7 @@ class Config:
         cls.PIPELINE_PROCESS_TM_PATH      = f"{rd}/pipeline_process_train_model.py"
         cls.PIPELINE_PROCESS_DC_SPEC_PATH = f"{rd}/cleaning_spec.pkl"
         cls.NULL_PROCESSOR_PATH           = f"{rd}/null_processor.json"
+        cls.DATA_QUALITY_REPORT_PATH      = f"{rd}/data_quality_report.json"
         cls.REPLAY_DRIVER_PATH            = f"{rd}/replay_pipeline.py"
         cls.REPLAY_MANIFEST_PATH          = f"{rd}/replay_manifest.json"
         cls.SPLIT_ASSIGNMENT_PATH         = f"{rd}/split_assignment.parquet"
@@ -358,9 +360,16 @@ class Config:
     # Warn when a partition's missing rate differs from train by more than this (absolute)
     NULL_DRIFT_WARN_THRESHOLD: float = float(os.getenv("NULL_DRIFT_WARN_THRESHOLD", 0.10))
     # Scale (unit-change) guard: batch magnitude vs train, either direction.
-    # >= WARN warns, >= FAIL raises; FAIL <= 0 disables. Batches under 100 rows are not judged.
+    # >= WARN is a warning, >= FAIL (median and p95 together) is critical; FAIL <= 0
+    # disables. Batches under 100 rows are not judged.
     NULL_SCALE_WARN_RATIO: float = float(os.getenv("NULL_SCALE_WARN_RATIO", 3.0))
     NULL_SCALE_FAIL_RATIO: float = float(os.getenv("NULL_SCALE_FAIL_RATIO", 10.0))
+    # What a tripped data-quality guard does (scale shift, unparseable values):
+    #   warn → record it as `critical` in data_quality_report.json + final_report.md
+    #          and keep going (thresholds differ per domain; the user judges)
+    #   fail → stop the run / scoring with NullContractError
+    # Structural errors (absent required column, tampered artifact) always stop.
+    DATA_GUARD_ACTION: str = os.getenv("DATA_GUARD_ACTION", "warn").strip().lower()
 
     # ── Feature Engineering ───────────────────────────────────────────────────
     HIGH_CORRELATION_THRESHOLD: float = float(os.getenv("HIGH_CORRELATION_THRESHOLD", 0.8))

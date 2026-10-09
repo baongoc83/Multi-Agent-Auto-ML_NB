@@ -354,6 +354,65 @@ def test_scale_guard_ignores_sparse_columns_but_catches_their_unit_change():
         pass
 
 
+def test_scale_guard_heavy_tail_median_shift_warns_not_fails():
+    # graph_* style column: non-zero values are mostly tiny counts with a huge tail.
+    # A batch with a different mix moves the non-zero median x50 while p95 stays put —
+    # a distribution shift, not a unit change: it must warn, never raise.
+    rng = np.random.default_rng(0)
+    def mix(n, small_share, scale=1.0):
+        tail = rng.lognormal(8, 0.4, n)
+        v = np.where(rng.random(n) < small_share, rng.integers(1, 3, n), tail) * scale
+        return pd.DataFrame({"g": np.where(rng.random(n) < 0.5, v, 0.0)})
+    cfg = {"features": {"g": {"group": "numerical", "missing_strategy": "median"}}}
+    p = NullProcessor(cfg).fit(mix(5000, small_share=0.8))
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p.transform(mix(5000, small_share=0.2))
+    sc = p.report_["scale"]["g"]
+    assert sc["abs_nz_median"]["ratio"] > 10 and sc["unit_factor"] < 10, sc
+    assert sc["level"] == "warn"
+    assert any("distribution shifted" in str(x.message) for x in w)
+    try:                                                              # real unit change still refused
+        p.transform(mix(5000, small_share=0.8, scale=1000))
+        raise AssertionError("x1000 must be refused")
+    except NullContractError as e:
+        assert "magnitude shifted" in str(e) and "median" in str(e)
+
+
+def test_guard_action_warn_reports_instead_of_raising():
+    p = NullProcessor(SCALE_CFG, guard_action="warn").fit(_money_frame())
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        out = p.transform(_money_frame(seed=3, scale=1000.0))        # unit change: reported, not raised
+    assert len(out) == 500 and out["amt"].notna().all()
+    crit = [i for i in p.report_["issues"] if i["severity"] == "critical"]
+    assert [i["column"] for i in crit] == ["amt"] and crit[0]["check"] == "scale_unit_change"
+    assert any("changed scale" in str(x.message) for x in w)
+    # unparseable values: NULL + critical issue instead of NullContractError
+    q = NullProcessor({"features": {"n": {"group": "numerical", "missing_strategy": "median"}}},
+                      guard_action="warn").fit(pd.DataFrame({"n": [1.0, 2.0, 3.0]}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        o = q.transform(pd.DataFrame({"n": ["1", "abc", "3"]}))
+    assert o["n"].tolist() == [1.0, 2.0, 3.0]
+    assert q.report_["issues"][0]["check"] == "unparseable"
+    # the choice survives the artifact; old artifacts (no field) keep raising
+    d = Path(tempfile.mkdtemp())
+    p.save(d / "w.json")
+    assert NullProcessor.load(d / "w.json").guard_action == "warn"
+    raw = json.loads((d / "w.json").read_text(encoding="utf-8"))
+    raw.pop("content_sha256")
+    raw["settings"].pop("guard_action")
+    raw["content_sha256"] = NullProcessor._digest(raw)
+    (d / "old.json").write_text(json.dumps(raw), encoding="utf-8")
+    assert NullProcessor.load(d / "old.json").guard_action == "raise"
+    try:
+        NullProcessor(SCALE_CFG, guard_action="ignore")
+        raise AssertionError("unknown guard_action must be rejected")
+    except ValueError:
+        pass
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -98,10 +98,60 @@ def test_llm_summary_never_sees_in_sample_metrics():
     assert "valid_auc" not in seen["p"] and "test_auc" in seen["p"]
 
 
+def test_clip_refused_on_zero_inflated_column():
+    # 2026-10-09 run: graph_1hop_* columns had q1=q3=0, the LLM clipped them and every
+    # non-zero value (the 8.5% signal) became 0 on train, valid and oot.
+    from Agents.DataCleaner.agent_data_cleaner import DataCleanerAgent, CleaningSpec
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({"g": np.where(rng.random(1000) < 0.085, rng.lognormal(10, 1, 1000), 0.0),
+                       "amt": rng.lognormal(10, 0.5, 1000)})
+    ag = DataCleanerAgent.__new__(DataCleanerAgent)
+    ag.logger, ag.name, ag.df = AgentLogger(), "DataCleaner", df.copy()
+    ag._composite_key_cols, ag._entity_id_col, ag._target_column = [], None, None
+    rep = json.loads(ag._tool_detect_outliers(df, "g"))
+    assert "outlier_count" not in rep and "do NOT clip" in rep["note"]
+    spec = CleaningSpec()
+    ag._execute_llm_decisions(json.dumps({"actions": [
+        {"action": "clip_outliers", "column": "g", "factor": 3.0},
+        {"action": "clip_outliers", "column": "amt", "factor": 3.0}]}), spec=spec)
+    assert "g" not in spec.clip_bounds and "amt" in spec.clip_bounds
+    assert (ag.df["g"] > 0).sum() == (df["g"] > 0).sum()          # signal intact
+    log = "\n".join(f"{e['action']} {e['details']}" for e in ag.logger.logs)
+    assert "SKIP clip_outliers" in log and "IQR=0" in log
+
+
+def test_data_quality_warnings_reach_reports():
+    import tempfile
+    from pipeline import AutoMLPipeline
+    pl = AutoMLPipeline.__new__(AutoMLPipeline)
+    pl.logger, pl._dq_issues = AgentLogger(), []
+    pl._record_dq("Stage 0b distribution", "psi_drift", "warn", "valid",
+                  "2 column(s) with PSI > 0.25 vs train", {"g1": 9.9, "g2": 1.2})
+    pl._record_null_issues("oot", [
+        {"column": "amt", "check": "scale_unit_change", "severity": "critical", "message": "amt: magnitude shifted x1000"},
+        {"column": "g", "check": "scale_distribution_shift", "severity": "warn", "message": "g: distribution shifted x47"},
+        {"column": "h", "check": "scale_distribution_shift", "severity": "warn", "message": "h: distribution shifted x12"}])
+    pl.logger.log("DataCleaner", "SKIP clip_outliers", "'g' has IQR=0 — refused")
+    md = pl._render_data_quality_section()
+    assert "1 critical · 2 warning(s) · 1 other notice(s)" in md
+    assert md.index("critical |") < md.index("psi_drift")                 # critical rows first
+    assert "2 column(s) shifted median or p95" in md and "SKIP clip_outliers" in md
+    saved = Config.DATA_QUALITY_REPORT_PATH
+    Config.DATA_QUALITY_REPORT_PATH = str(Path(tempfile.mkdtemp()) / "dq.json")
+    try:
+        pl._save_dq_report()
+        body = json.loads(Path(Config.DATA_QUALITY_REPORT_PATH).read_text(encoding="utf-8"))
+    finally:
+        Config.DATA_QUALITY_REPORT_PATH = saved
+    assert body["summary"] == {"critical": 1, "warn": 2}
+    assert body["issues"][0]["columns"] == {"g1": 9.9, "g2": 1.2} and body["issues"][0]["hint"]
+
+
 if __name__ == "__main__":
     assert "flag_for_review" in BaseAgent.NOTE_ACTIONS
     for t in (test_agent2_skips_missing_flags_on_imputed_columns, test_prompt_mentions_stage_1b,
-              test_cv_tree_headroom_and_cap_warning, test_llm_summary_never_sees_in_sample_metrics):
+              test_cv_tree_headroom_and_cap_warning, test_llm_summary_never_sees_in_sample_metrics,
+              test_clip_refused_on_zero_inflated_column, test_data_quality_warnings_reach_reports):
         t()
         print("PASS ", t.__name__)
     print("\nALL REVIEW-FIX CHECKS PASSED")

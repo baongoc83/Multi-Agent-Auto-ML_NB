@@ -88,6 +88,10 @@ class AutoMLPipeline:
         # split is frozen; read when the replay manifest is written.
         self._split_key_cols: List[str] = []
         self._split_key_positional: bool = False
+        # Data-quality findings of every stage, as warnings rather than stops:
+        # thresholds are domain-specific, so the run carries on and the user judges.
+        # Written to data_quality_report.json and the top of final_report.md.
+        self._dq_issues: List[Dict[str, Any]] = []
         self.logger.log("PIPELINE", "Run dir",
             f"persisted → {run_dir} | intermediates → "
             f"{'(same dir, KEEP_INTERMEDIATES=true)' if Config.KEEP_INTERMEDIATES else Config.TMP_DIR}")
@@ -429,6 +433,11 @@ class AutoMLPipeline:
                     f"{len(high_drift)} cols with PSI > {threshold:.2f} between train and {part}. "
                     f"Top {len(topk)}: {top_str}{more}. "
                     "Agent 3's PSI step will likely drop these features.")
+                self._record_dq(
+                    "Stage 0b distribution", "psi_drift", "warn", part,
+                    f"{len(high_drift)} column(s) with PSI > {threshold:.2f} vs train "
+                    f"(max {max_psi:.2f} on '{max_col}'). Agent 3's PSI step will likely drop them.",
+                    {c: s for c, s in high_drift})
 
     def run(
         self,
@@ -733,7 +742,8 @@ class AutoMLPipeline:
         proc = NullProcessor({"features": rules}, on_unconfigured="ignore",
                              drift_warn_threshold=Config.NULL_DRIFT_WARN_THRESHOLD,
                              scale_warn_ratio=Config.NULL_SCALE_WARN_RATIO,
-                             scale_fail_ratio=Config.NULL_SCALE_FAIL_RATIO)
+                             scale_fail_ratio=Config.NULL_SCALE_FAIL_RATIO,
+                             guard_action="raise" if Config.DATA_GUARD_ACTION in ("fail", "raise") else "warn")
         proc.fit(train[cols], train[target_column] if target_column in train.columns else None)
         proc.passthrough_columns_ = [c for c in train.columns if c not in cols]
         sha = proc.save(Config.NULL_PROCESSOR_PATH)
@@ -755,9 +765,10 @@ class AutoMLPipeline:
             df = train if tag == "train" else BaseAgent.load_dataframe(path)
             out = proc.transform(df)
             out.to_parquet(path, compression="snappy", index=False)
-            alerts = proc.report_.get("alerts", [])
+            issues = proc.report_.get("issues", [])
             self.logger.log("PIPELINE", f"Null processor {tag}",
-                f"shape {df.shape} -> {out.shape}" + (f" | {len(alerts)} drift alert(s): {alerts[:3]}" if alerts else ""))
+                f"shape {df.shape} -> {out.shape}" + (f" | {len(issues)} data-quality issue(s)" if issues else ""))
+            self._record_null_issues(tag, issues)
             del out
             if tag != "train":
                 del df
@@ -771,9 +782,102 @@ class AutoMLPipeline:
                          if r.missing_strategy in ("none", "missing_indicator_only")],
             "indicators": list(proc.indicator_columns_),
         }
+        self._save_dq_report()                      # step report, rewritten at the end of the run
         return {"file": Path(Config.NULL_PROCESSOR_PATH).name, "sha256": sha,
                 "n_rules": len(rules), "n_indicators": len(proc.indicator_columns_),
                 "llm": llm_call is not None}
+
+    # ── Data-quality warnings (all stages) ──────────────────────────────────
+
+    _DQ_HINTS = {
+        "psi_drift": "Population / feature-pipeline change between periods? Check with the data owner; "
+                     "tune DRIFT_PSI_THRESHOLD / PSI_THRESHOLD for this domain.",
+        "scale_unit_change": "Median AND p95 moved together: unit / definition change likely "
+                             "(e.g. VND vs thousand VND). Verify upstream; tune NULL_SCALE_FAIL_RATIO.",
+        "scale_distribution_shift": "One quantile moved (heavy tail / mix change), not a unit change. "
+                                    "Tune NULL_SCALE_WARN_RATIO if expected for this domain.",
+        "missing_rate_drift": "NULL share differs from train: upstream join / coverage change? "
+                              "Tune NULL_DRIFT_WARN_THRESHOLD.",
+        "unparseable": "Non-numeric values in a numeric column were treated as NULL.",
+    }
+
+    def _record_dq(self, stage: str, check: str, severity: str, partition: Optional[str],
+                   message: str, columns: Optional[Dict[str, Any]] = None) -> None:
+        cols = dict(list((columns or {}).items())[:300])        # keep the report readable
+        self.__dict__.setdefault("_dq_issues", []).append({
+            "stage": stage, "check": check, "severity": severity, "partition": partition,
+            "message": message, "n_columns": len(columns or {}), "columns": cols,
+            "hint": self._DQ_HINTS.get(check, ""),
+        })
+        self.logger.log("PIPELINE", f"DATA QUALITY {severity.upper()} [{stage}{'/' + partition if partition else ''}]",
+                        message)
+
+    def _record_null_issues(self, partition: str, issues: List[Dict[str, Any]]) -> None:
+        """Fold per-column NullProcessor issues into one entry per (check, severity)."""
+        groups: Dict[Tuple[str, str], Dict[str, str]] = {}
+        for it in issues:
+            groups.setdefault((it["check"], it["severity"]), {})[it["column"]] = it["message"]
+        labels = {"scale_unit_change": "changed scale (median and p95 together) beyond "
+                                       f"x{Config.NULL_SCALE_FAIL_RATIO:g}",
+                  "scale_distribution_shift": f"shifted median or p95 beyond x{Config.NULL_SCALE_WARN_RATIO:g}",
+                  "missing_rate_drift": f"missing rate differs from train by > {Config.NULL_DRIFT_WARN_THRESHOLD:.0%}",
+                  "unparseable": "had unparseable values (treated as NULL)"}
+        for (check, sev), cols in sorted(groups.items(), key=lambda kv: kv[0][1] != "critical"):
+            first = next(iter(cols.values()))
+            self._record_dq("Stage 1b null processing", check, sev, partition,
+                            f"{len(cols)} column(s) {labels.get(check, check)}. e.g. {first}", cols)
+
+    def _save_dq_report(self) -> None:
+        sev = [i["severity"] for i in getattr(self, "_dq_issues", [])]
+        body = {"guard_action": Config.DATA_GUARD_ACTION,
+                "summary": {"critical": sev.count("critical"), "warn": sev.count("warn")},
+                "issues": getattr(self, "_dq_issues", [])}
+        try:
+            Path(Config.DATA_QUALITY_REPORT_PATH).write_text(
+                json.dumps(body, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        except Exception as e:      # a report must never cost the run
+            self.logger.log("PIPELINE", "Data quality report ERROR", f"{type(e).__name__}: {e}")
+
+    def _collect_log_warnings(self) -> List[Tuple[str, str, str]]:
+        """WARN / SKIP lines logged by any stage that are not already structured."""
+        seen, out = set(), []
+        for e in self.logger.logs:
+            act = e.get("action", "")
+            if act.startswith(("Distribution WARN", "DATA QUALITY")):
+                continue
+            if "WARN" in act or act.startswith("SKIP"):
+                key = (e["agent"], act, str(e["details"])[:300])
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+        return out
+
+    def _render_data_quality_section(self) -> str:
+        crit = [i for i in getattr(self, "_dq_issues", []) if i["severity"] == "critical"]
+        warn = [i for i in getattr(self, "_dq_issues", []) if i["severity"] == "warn"]
+        other = self._collect_log_warnings()
+        if not (crit or warn or other):
+            return "# Data quality\n\nNo data-quality warnings were raised.\n\n"
+        out = ["# Data quality warnings\n\n",
+               f"**{len(crit)} critical · {len(warn)} warning(s) · {len(other)} other notice(s)** "
+               f"(DATA_GUARD_ACTION=`{Config.DATA_GUARD_ACTION}`: the run continued; review before go-live). "
+               f"Full column lists: `{Path(Config.DATA_QUALITY_REPORT_PATH).name}`.\n\n"]
+        if crit or warn:
+            out += ["| Severity | Stage | Partition | Check | Finding | What to check |\n",
+                    "|---|---|---|---|---|---|\n"]
+            for i in crit + warn:
+                msg = i["message"].replace("|", "\\|")
+                out.append(f"| {'🔴 critical' if i['severity'] == 'critical' else '🟡 warn'} | "
+                           f"{i['stage']} | {i['partition'] or '-'} | `{i['check']}` | {msg} | {i['hint']} |\n")
+            out.append("\n")
+        if other:
+            out.append("**Other notices logged by the agents:**\n\n")
+            for agent, act, det in other[:40]:
+                out.append(f"- {agent} · {act}: {det.replace(chr(10), ' ')[:300]}\n")
+            if len(other) > 40:
+                out.append(f"- … {len(other) - 40} more in agent_execution.log\n")
+            out.append("\n")
+        return "".join(out)
 
     # ── Replay bundle: manifest + driver ────────────────────────────────────
 
@@ -829,6 +933,12 @@ class AutoMLPipeline:
             # Applied after cleaning (and train-only row ops), before the feature
             # spec. None when the stage was disabled for this run.
             "null_processing": getattr(self, "_null_info", None),
+            "data_quality": {
+                "report": Path(Config.DATA_QUALITY_REPORT_PATH).name,
+                "guard_action": Config.DATA_GUARD_ACTION,
+                "critical": sum(i["severity"] == "critical" for i in getattr(self, "_dq_issues", [])),
+                "warn": sum(i["severity"] == "warn" for i in getattr(self, "_dq_issues", [])),
+            },
             "feature_engineering": {
                 "spec_file": Path(Config.PIPELINE_PROCESS_FE_SPEC_PATH).name,
                 "n_final_features": len(report2.get("final_features", []) or []),
@@ -1166,7 +1276,12 @@ class AutoMLPipeline:
         )
 
     def _generate_final_report(self, report1, report2, report3, metrics):
+        self._save_dq_report()
         markdown = self.logger.get_markdown_report()
+        # Data-quality warnings go first so nobody has to dig through the log for them
+        cut = markdown.find("## [")
+        cut = len(markdown) if cut < 0 else cut
+        markdown = markdown[:cut] + self._render_data_quality_section() + markdown[cut:]
         markdown += "\n# Final Summary\n\n"
         markdown += "## Agent 1: Data Cleaner\n"
         markdown += f"- Actions: {report1.get('summary', 'N/A')}\n\n"
