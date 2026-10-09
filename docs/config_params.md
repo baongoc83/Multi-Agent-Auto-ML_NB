@@ -189,6 +189,24 @@ Dùng khi `BaseAgent.load_dataframe` nhận path `s3://...`. Hỗ trợ S3-compa
 | `IV_MAX_NULL_RATIO` | `0.50` | Bỏ qua compute IV cho cột missing trên mức này (IV bị NaN-bin chi phối, vô nghĩa) |
 | `WOE_MIN_IV` | `0.02` | IV tối thiểu để được `apply_woe_transform`; dưới mức này WoE thêm noise hơn là tuyến tính hóa |
 
+### Replay bundle
+
+Mỗi run ghi `replay_pipeline.py` + `replay_manifest.json` + `split_assignment.parquet` + `cleaning_spec.pkl` vào RUN_DIR, đủ để chạy lại toàn trình (split → transform → retrain/score) ở môi trường khác. Không có tham số bật/tắt — bundle luôn được ghi, và lỗi khi ghi bundle không làm hỏng run. Chi tiết: [docs/replay.md](replay.md).
+
+### IV stability train ↔ valid/oot (diagnostic)
+
+Sau khi transform mỗi partition holdout, Agent 2 tính lại IV trên partition đó bằng **bin edges đóng băng từ train**, rồi so với IV train. Bắt được thứ PSI không thấy: feature có phân phối X ổn định nhưng quan hệ với target suy yếu hoặc **đảo chiều**. Kết quả ghi vào `feature_engineer_report.json` key `iv_stability`. Thuần diagnostic — không drop feature; Agent 3 PSI / SHAP+PSI prune vẫn là nơi duy nhất loại feature.
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `FE_IV_STABILITY_ENABLED` | `true` | Bật/tắt toàn bộ bước kiểm tra. Tự skip nếu `compute_iv` hoặc `apply_woe_transform` không chạy (không có bin đóng băng để so) |
+| `FE_IV_STABILITY_MAX_DROP` | `0.30` | % sụt IV so với train vượt ngưỡng → flag `UNSTABLE` (reason `iv_drop`) |
+| `FE_IV_STABILITY_MIN_WOE_CORR` | `0.50` | Pearson giữa vector WoE train và WoE holdout (theo bin) dưới ngưỡng → flag (reason `woe_reversal`). Âm = quan hệ đảo chiều hẳn |
+| `FE_IV_STABILITY_MIN_BIN_COUNT` | `30` | Bin có ít hơn số dòng này ở holdout bị loại khỏi phép tính sign-flip / corr (đuôi quá nhiễu) |
+| `FE_IV_STABILITY_TOP_N` | `20` | Số feature kém ổn định nhất liệt kê trong dòng log WARN |
+
+Feature có `iv_train < WOE_MIN_IV` được bỏ qua (`n_skipped_weak`) — vốn đã vô dụng trên train thì không có gì để "ổn định".
+
 ---
 
 ## Model Training — Agent 3
@@ -393,3 +411,36 @@ Pipeline áp 4 lớp tối ưu RAM mặc định (không có env knob — đã b
 - Sau downcast: 190 MB (≈9.6×)
 
 Cộng dồn 3 lớp + `JOBLIB_TEMP_FOLDER` đủ chạy 500k × 1500 cols dưới 8 GB RAM trên Linux/Docker.
+
+## Null processing (Stage 1b)
+
+| Param | Default | Meaning |
+|---|---|---|
+| `NULL_PROCESSOR_ENABLED` | `true` | Fit a per-feature missing-value policy on TRAIN after Agent 1 and replay it on all partitions and in the replay bundle (`null_processor.json`, SHA-256 verified on load). |
+| `NULL_PROCESSOR_USE_LLM` | `true` | Rules proposed by the LLM behind deterministic guardrails (stats only, no row values); `false` = heuristic only. No human review step. |
+| `NULL_DRIFT_WARN_THRESHOLD` | `0.10` | Absolute missing-rate gap vs train that triggers a warning. |
+
+| `NULL_SCALE_WARN_RATIO` | `3.0` | Unit-change guard: median / p95 of \|x\| of a batch vs the frozen train value; ratio (either direction) ≥ this warns. |
+| `NULL_SCALE_FAIL_RATIO` | `10.0` | Same ratio ≥ this raises `NullContractError` (×1000 VND→thousand-VND shifts are caught). `0` disables. Batches under 100 non-null rows are never judged. |
+
+## Feature ranking / pruning (Agent 3)
+
+Every option has a legacy value, so the old behaviour stays available. Unknown values fall back to the default with a `Config WARN` log line.
+
+| Param | Default | Options / meaning |
+|---|---|---|
+| `FEATURE_RANK_METHOD` | `importance` | `importance`: one model fit, rank, drop near-duplicates (minutes). `rfe`: legacy sklearn RFE (hours; `RFE_STEP`, `RFE_N_ESTIMATORS`, `ENABLE_RFECV` apply). The number of candidates kept is `RFE_TARGET_FEATURES`. |
+| `FEATURE_RANK_IMPORTANCE` | `gain` | `gain` (from the fitted booster) or `shap` (mean \|SHAP\|, slower). Used by ranking and by the batch prune. |
+| `FEATURE_RANK_CORR_THRESHOLD` | `0.90` | Of two candidates with \|corr\| above this, keep the more important. `0` disables. |
+| `FEATURE_RANK_N_ESTIMATORS` / `FEATURE_RANK_LEARNING_RATE` | `500` / `0.05` | Tree budget and learning-rate floor of the ranking & prune models (early stopping on valid). |
+| `PRUNE_METHOD` | `batch_tolerance` | `batch_tolerance`: remove `PRUNE_BATCH_FRACTION` of the weakest per round, keep the smallest set within `PRUNE_AUC_TOLERANCE` of the best AUC. `one_by_one`: legacy SHAP+PSI loop (`SHAP_PSI_MAX_NO_IMPROVE`, `SHAP_N_ESTIMATORS`). |
+| `PRUNE_BATCH_FRACTION` | `0.10` | Share removed per round (min 1 feature). |
+| `PRUNE_AUC_TOLERANCE` | `0.001` | Absolute valid-AUC loss accepted for a smaller set; `0` never trades AUC. |
+| `PRUNE_STOP_DROP` | `0.010` | Stop shrinking once AUC is this far below the best seen. |
+| `PRUNE_MAX_ROUNDS` | `40` | Safety bound on rounds. |
+| `FEATURE_CAP_POLICY` | `cap_first` | `cap_first`: the final set has at most `MAX_FINAL_FEATURES` (best-AUC set under the cap if the tolerance rule alone would leave more). `auc_first`: the cap is only a soft target. |
+| `OPTUNA_AFTER_SELECTION` | `true` | `true`: FLAML → rank/prune with FLAML's params → Optuna once on the final features (no re-tune). `false`: legacy order (Optuna → rank → prune → optional re-tune, `ENABLE_RETUNE_AFTER_PRUNE`). |
+| `OPTUNA_TRIAL_TIMEOUT` / `OPTUNA_ENABLE_DART` / `TREE_ENSEMBLE_MAX_ESTIMATORS` / `RETUNE_MIN_GAIN` | `0` (auto) / `false` / `500` / `0.0005` | Per-trial wall-clock cap, DART in the LightGBM space, tree cap for rf/extra_tree, and the AUC gain a re-tune must show to replace tuned params. |
+| `PRUNE_SMOOTH_WINDOW` | `3` | Odd window of the moving average applied to the AUC-vs-size curve before the tolerance rule (1 = raw). Stops the rule latching onto a lucky spike on small valid sets. |
+| `PRUNE_SE_MULTIPLIER` | `0.0` | Widen the tolerance to this multiple of the Hanley-McNeil standard error of the valid AUC (0 = off; ~0.5 for small / noisy validation sets). |
+| `FINAL_ES_TREE_HEADROOM` | `2.0` | Final-model CV folds get this multiple of the tuned tree count so early stopping (not the ceiling) picks `best_iteration`. `1` = legacy (reproduce bundles written before this option). |

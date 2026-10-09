@@ -111,7 +111,7 @@ report = {
     "actions_taken": [...],
     "summary": "...",
 }
-# → forward sang Agent 2 + Agent 3 qua Handoff
+# → pipeline forward thẳng report này sang Agent 2 + Agent 3
 ```
 
 Không phải "chat" giữa agents (autogen-style), mà là **structured handoff** — predictable, debuggable.

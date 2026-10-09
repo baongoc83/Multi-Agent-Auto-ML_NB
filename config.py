@@ -114,6 +114,13 @@ class Config:
     PIPELINE_PROCESS_FE_PATH: str = f"{OUTPUT_DIR}/pipeline_process_feature_engineer.py"
     PIPELINE_PROCESS_FE_SPEC_PATH: str = f"{OUTPUT_DIR}/feature_spec.pkl"
     PIPELINE_PROCESS_TM_PATH: str = f"{OUTPUT_DIR}/pipeline_process_train_model.py"
+    PIPELINE_PROCESS_DC_SPEC_PATH: str = f"{OUTPUT_DIR}/cleaning_spec.pkl"
+    NULL_PROCESSOR_PATH: str = f"{OUTPUT_DIR}/null_processor.json"
+    # End-to-end replay bundle: re-run this exact run (split -> clean -> FE ->
+    # retrain / score) in another environment. See docs/replay.md.
+    REPLAY_DRIVER_PATH: str = f"{OUTPUT_DIR}/replay_pipeline.py"
+    REPLAY_MANIFEST_PATH: str = f"{OUTPUT_DIR}/replay_manifest.json"
+    SPLIT_ASSIGNMENT_PATH: str = f"{OUTPUT_DIR}/split_assignment.parquet"
 
     # Intermediate handoff files (TMP_DIR by default — deleted after run)
     CLEAN_DATA_PATH: str = f"{OUTPUT_DIR}/clean_data.parquet"
@@ -121,9 +128,17 @@ class Config:
     CLEAN_TRAIN_PATH: str = f"{OUTPUT_DIR}/clean_train.parquet"
     CLEAN_VALID_PATH: str = f"{OUTPUT_DIR}/clean_valid.parquet"
     CLEAN_OOT_PATH:   str = f"{OUTPUT_DIR}/clean_oot.parquet"
+    CLEAN_TEST_PATH:  str = f"{OUTPUT_DIR}/clean_test.parquet"
     ENGINEERED_TRAIN_PATH: str = f"{OUTPUT_DIR}/engineered_train.parquet"
     ENGINEERED_VALID_PATH: str = f"{OUTPUT_DIR}/engineered_valid.parquet"
     ENGINEERED_OOT_PATH:   str = f"{OUTPUT_DIR}/engineered_oot.parquet"
+    ENGINEERED_TEST_PATH:  str = f"{OUTPUT_DIR}/engineered_test.parquet"
+    # Single-file mode: partitions cut from the raw input before Agent 1 runs,
+    # so cleaning + feature engineering fit on TRAIN only (no holdout leakage).
+    AUTOSPLIT_TRAIN_PATH: str = f"{OUTPUT_DIR}/autosplit_train.parquet"
+    AUTOSPLIT_VALID_PATH: str = f"{OUTPUT_DIR}/autosplit_valid.parquet"
+    AUTOSPLIT_OOT_PATH:   str = f"{OUTPUT_DIR}/autosplit_oot.parquet"
+    AUTOSPLIT_TEST_PATH:  str = f"{OUTPUT_DIR}/autosplit_test.parquet"
 
     @classmethod
     def init_run(cls) -> str:
@@ -207,6 +222,11 @@ class Config:
         cls.PIPELINE_PROCESS_FE_PATH      = f"{rd}/pipeline_process_feature_engineer.py"
         cls.PIPELINE_PROCESS_FE_SPEC_PATH = f"{rd}/feature_spec.pkl"
         cls.PIPELINE_PROCESS_TM_PATH      = f"{rd}/pipeline_process_train_model.py"
+        cls.PIPELINE_PROCESS_DC_SPEC_PATH = f"{rd}/cleaning_spec.pkl"
+        cls.NULL_PROCESSOR_PATH           = f"{rd}/null_processor.json"
+        cls.REPLAY_DRIVER_PATH            = f"{rd}/replay_pipeline.py"
+        cls.REPLAY_MANIFEST_PATH          = f"{rd}/replay_manifest.json"
+        cls.SPLIT_ASSIGNMENT_PATH         = f"{rd}/split_assignment.parquet"
 
         # Intermediate handoff files → TMP_DIR
         td = cls.TMP_DIR
@@ -215,9 +235,15 @@ class Config:
         cls.CLEAN_TRAIN_PATH       = f"{td}/clean_train.parquet"
         cls.CLEAN_VALID_PATH       = f"{td}/clean_valid.parquet"
         cls.CLEAN_OOT_PATH         = f"{td}/clean_oot.parquet"
+        cls.CLEAN_TEST_PATH        = f"{td}/clean_test.parquet"
         cls.ENGINEERED_TRAIN_PATH  = f"{td}/engineered_train.parquet"
         cls.ENGINEERED_VALID_PATH  = f"{td}/engineered_valid.parquet"
         cls.ENGINEERED_OOT_PATH    = f"{td}/engineered_oot.parquet"
+        cls.ENGINEERED_TEST_PATH   = f"{td}/engineered_test.parquet"
+        cls.AUTOSPLIT_TRAIN_PATH   = f"{td}/autosplit_train.parquet"
+        cls.AUTOSPLIT_VALID_PATH   = f"{td}/autosplit_valid.parquet"
+        cls.AUTOSPLIT_OOT_PATH     = f"{td}/autosplit_oot.parquet"
+        cls.AUTOSPLIT_TEST_PATH    = f"{td}/autosplit_test.parquet"
 
         return cls.RUN_DIR
 
@@ -297,6 +323,21 @@ class Config:
     # Max numeric columns to run outlier detection on (for performance)
     OUTLIER_NUMERIC_COLS_LIMIT: int = int(os.getenv("OUTLIER_NUMERIC_COLS_LIMIT", 10))
 
+    # ── Null processing (Stage 1b, between Agent 1 and Agent 2) ──────────────
+    # Fits a per-feature missing-value policy on TRAIN, replays it on every
+    # other partition and in the replay bundle (see preprocessing/). Fully
+    # automatic: rules come from the LLM (guard-railed) or a heuristic, and are
+    # recorded in null_processor.json. false → skip the stage (legacy behaviour).
+    NULL_PROCESSOR_ENABLED: bool = os.getenv("NULL_PROCESSOR_ENABLED", "true").lower() == "true"
+    # false → heuristic rules only (no LLM call for this stage)
+    NULL_PROCESSOR_USE_LLM: bool = os.getenv("NULL_PROCESSOR_USE_LLM", "true").lower() == "true"
+    # Warn when a partition's missing rate differs from train by more than this (absolute)
+    NULL_DRIFT_WARN_THRESHOLD: float = float(os.getenv("NULL_DRIFT_WARN_THRESHOLD", 0.10))
+    # Scale (unit-change) guard: batch magnitude vs train, either direction.
+    # >= WARN warns, >= FAIL raises; FAIL <= 0 disables. Batches under 100 rows are not judged.
+    NULL_SCALE_WARN_RATIO: float = float(os.getenv("NULL_SCALE_WARN_RATIO", 3.0))
+    NULL_SCALE_FAIL_RATIO: float = float(os.getenv("NULL_SCALE_FAIL_RATIO", 10.0))
+
     # ── Feature Engineering ───────────────────────────────────────────────────
     HIGH_CORRELATION_THRESHOLD: float = float(os.getenv("HIGH_CORRELATION_THRESHOLD", 0.8))
     LOW_CORRELATION_THRESHOLD: float = float(os.getenv("LOW_CORRELATION_THRESHOLD", 0.04))
@@ -351,6 +392,27 @@ class Config:
     # than it linearises — better to leave the raw value for GBM to split on.
     # 0.02 matches the Siddiqi useless/weak boundary used elsewhere in the agent.
     WOE_MIN_IV: float = float(os.getenv("WOE_MIN_IV", 0.02))
+
+    # ── IV stability (train ↔ valid/oot, diagnostic only) ────────────────────
+    # After Agent 2 transforms a holdout partition it re-computes IV there using
+    # the bin edges FROZEN from train, then compares against the train IV. This
+    # catches what PSI cannot: a feature whose X-distribution is perfectly stable
+    # but whose relationship to the target weakens or reverses out of time.
+    # Diagnostic only — nothing is dropped here; Agent 3's PSI / SHAP+PSI prune
+    # remain the only places features are removed.
+    FE_IV_STABILITY_ENABLED: bool = os.getenv("FE_IV_STABILITY_ENABLED", "true").lower() == "true"
+    # Relative IV loss vs train above which a feature is flagged UNSTABLE.
+    # 0.30 = "IV on OOT fell by more than 30%" — the common scorecard rule of thumb.
+    FE_IV_STABILITY_MAX_DROP: float = float(os.getenv("FE_IV_STABILITY_MAX_DROP", 0.30))
+    # Pearson corr between the train WoE vector and the holdout WoE vector (per
+    # bin). Below this the bin-level log-odds pattern no longer agrees with train
+    # — the "relationship flipped" signal. Negative corr = outright reversal.
+    FE_IV_STABILITY_MIN_WOE_CORR: float = float(os.getenv("FE_IV_STABILITY_MIN_WOE_CORR", 0.50))
+    # Bins with fewer rows than this in the holdout are ignored for sign-flip and
+    # WoE-correlation purposes — tail bins are too noisy to judge.
+    FE_IV_STABILITY_MIN_BIN_COUNT: int = int(os.getenv("FE_IV_STABILITY_MIN_BIN_COUNT", 30))
+    # How many worst-offending features to name in the WARN log line.
+    FE_IV_STABILITY_TOP_N: int = int(os.getenv("FE_IV_STABILITY_TOP_N", 20))
 
     # ── Model Training ────────────────────────────────────────────────────────
     TRAIN_TEST_SPLIT_SIZE: float = float(os.getenv("TRAIN_TEST_SPLIT_SIZE", 0.2))
@@ -437,6 +499,12 @@ class Config:
     # while still giving FLAML enough signal to select the best estimator type.
     FLAML_MAX_ROWS: int = int(os.getenv("FLAML_MAX_ROWS", 500_000))
 
+    # Final-model CV: early stopping picks best_iteration, but the tree ceiling comes from the tuned
+    # n_estimators, so a fold can stop AT the ceiling (ES never fired). CV folds get this multiple of
+    # the tuned tree count as headroom (boosters only; 1 = legacy behaviour, needed to reproduce
+    # bundles written before this option existed).
+    FINAL_ES_TREE_HEADROOM: float = float(os.getenv("FINAL_ES_TREE_HEADROOM", 2.0))
+
     # ── Optuna ────────────────────────────────────────────────────────────────
     # Trials raised 150 → 300 + timeout 30min → 2h to give the search room when
     # boosting_type=dart is included in the LightGBM space (DART is ~3-5x slower
@@ -444,6 +512,18 @@ class Config:
     # only — drop these back if Optuna time is a constraint.
     OPTUNA_N_TRIALS: int = int(os.getenv("OPTUNA_N_TRIALS", 300))
     OPTUNA_TIMEOUT: int = int(os.getenv("OPTUNA_TIMEOUT", 7200))
+    # Optuna's `timeout` is only checked BETWEEN trials, so one slow trial (DART, a 2000-tree
+    # forest) can overrun the whole budget by hours. Each trial now gets its own wall-clock
+    # cap (LightGBM / XGBoost: checked every boosting round, then the trial is pruned).
+    # 0 = auto: max(120 s, study timeout / 8).
+    OPTUNA_TRIAL_TIMEOUT: int = int(os.getenv("OPTUNA_TRIAL_TIMEOUT", 0))
+    # DART has no early stopping and is 3-5x slower per trial; off by default.
+    OPTUNA_ENABLE_DART: bool = os.getenv("OPTUNA_ENABLE_DART", "false").lower() == "true"
+    # rf / extra_tree cannot be interrupted mid-fit, so bound their tree count instead.
+    TREE_ENSEMBLE_MAX_ESTIMATORS: int = int(os.getenv("TREE_ENSEMBLE_MAX_ESTIMATORS", 500))
+    # The post-prune re-tune replaces the tuned params only if it beats them (re-scored on the
+    # final feature set) by at least this much AUC.
+    RETUNE_MIN_GAIN: float = float(os.getenv("RETUNE_MIN_GAIN", 0.0005))
 
     # ── RFE ───────────────────────────────────────────────────────────────────
     RFE_TARGET_FEATURES: int = int(os.getenv("RFE_TARGET_FEATURES", 150))
@@ -452,6 +532,51 @@ class Config:
     ENABLE_RFECV: bool = os.getenv("ENABLE_RFECV", "false").lower() == "true"
     # n_estimators used for the base model fitted during RFE selection
     RFE_N_ESTIMATORS: int = int(os.getenv("RFE_N_ESTIMATORS", 200))
+
+    # ── Feature ranking / pruning strategy (Agent 3) ──────────────────────────
+    # Every knob in this block picks HOW the candidate set is cut down; the legacy
+    # behaviour of each is still available.
+    #
+    # FEATURE_RANK_METHOD — how RFE_TARGET_FEATURES candidates are chosen from the input set:
+    #   "importance" (default) one model fit, rank by importance, drop near-duplicates.
+    #                Minutes instead of hours.
+    #   "rfe"        legacy sklearn RFE (refits many times; RFE_STEP controls the pace).
+    FEATURE_RANK_METHOD: str = os.getenv("FEATURE_RANK_METHOD", "importance").lower()
+    # Importance used for ranking AND for the batch prune below:
+    #   "gain" (default, free from the fitted booster) | "shap" (mean |SHAP|, slower).
+    FEATURE_RANK_IMPORTANCE: str = os.getenv("FEATURE_RANK_IMPORTANCE", "gain").lower()
+    # Ranking-time near-duplicate filter: of two features with |corr| above this, keep the more
+    # important one. 0 disables. (Applied on a row sample; -999 sentinel is treated as missing.)
+    FEATURE_RANK_CORR_THRESHOLD: float = float(os.getenv("FEATURE_RANK_CORR_THRESHOLD", 0.90))
+    # Trees / learning-rate floor of the ranking & prune models (early stopping on valid).
+    FEATURE_RANK_N_ESTIMATORS: int = int(os.getenv("FEATURE_RANK_N_ESTIMATORS", 500))
+    FEATURE_RANK_LEARNING_RATE: float = float(os.getenv("FEATURE_RANK_LEARNING_RATE", 0.05))
+    # PRUNE_METHOD — final cut after PSI / Stability:
+    #   "batch_tolerance" (default) remove PRUNE_BATCH_FRACTION of the weakest features per round,
+    #                    record valid AUC per size, then pick the SMALLEST set whose AUC is within
+    #                    PRUNE_AUC_TOLERANCE of the best (cap policy below can force <= MAX_FINAL_FEATURES).
+    #   "one_by_one"     legacy SHAP+PSI loop (1 feature per step, stops after SHAP_PSI_MAX_NO_IMPROVE).
+    PRUNE_METHOD: str = os.getenv("PRUNE_METHOD", "batch_tolerance").lower()
+    PRUNE_BATCH_FRACTION: float = float(os.getenv("PRUNE_BATCH_FRACTION", 0.10))
+    # Absolute valid-AUC loss accepted in exchange for a smaller feature set. 0 = never trade AUC.
+    # (CV std on this kind of data is ~0.003, so 0.001 is inside the noise.)
+    PRUNE_AUC_TOLERANCE: float = float(os.getenv("PRUNE_AUC_TOLERANCE", 0.001))
+    # Stop shrinking once AUC is this far below the best seen: smaller sets are clearly worse.
+    # The AUC-vs-size curve is noisy on small valid sets, and "smallest set within tolerance of the
+    # peak" would latch onto a lucky spike. The rule is therefore applied to a moving average of
+    # PRUNE_SMOOTH_WINDOW neighbouring sizes (odd; 1 = raw curve), and the tolerance can be widened to
+    # PRUNE_SE_MULTIPLIER x the Hanley-McNeil standard error of the valid AUC (0 = off, default:
+    # on Home Credit 0.5 cut 98 -> 52 features and cost ~0.003 test AUC; use 0.5 only for
+    # small / noisy validation sets).
+    PRUNE_SMOOTH_WINDOW: int = int(os.getenv("PRUNE_SMOOTH_WINDOW", 3))
+    PRUNE_SE_MULTIPLIER: float = float(os.getenv("PRUNE_SE_MULTIPLIER", 0.0))
+    PRUNE_STOP_DROP: float = float(os.getenv("PRUNE_STOP_DROP", 0.010))
+    PRUNE_MAX_ROUNDS: int = int(os.getenv("PRUNE_MAX_ROUNDS", 40))
+    # Optuna placement:
+    #   true (default)  FLAML -> rank/prune with FLAML's params -> Optuna ONCE on the final features
+    #                   (no re-tune step).
+    #   false           legacy: Optuna on all features first, prune, then optional re-tune.
+    OPTUNA_AFTER_SELECTION: bool = os.getenv("OPTUNA_AFTER_SELECTION", "true").lower() == "true"
 
     # ── PSI ───────────────────────────────────────────────────────────────────
     # 0.30 = finance standard "feature drift" cut-off. Raised to 0.35 because
@@ -507,7 +632,9 @@ class Config:
     #
     # Pick "cap_first" when you have a hard deployment / interpretability
     # budget; pick "auc_first" when you care most about AUC.
-    FEATURE_CAP_POLICY: str = os.getenv("FEATURE_CAP_POLICY", "auc_first").lower()
+    #   (batch_tolerance prune: "cap_first" picks the best-AUC set with <= MAX_FINAL_FEATURES when the
+    #    tolerance rule alone would leave more; "auc_first" keeps the smallest set within tolerance.)
+    FEATURE_CAP_POLICY: str = os.getenv("FEATURE_CAP_POLICY", "cap_first").lower()
 
     # ── Probability Calibration (IFRS9 / scorecard requirement) ──────────────
     # Wraps the final model with isotonic / sigmoid calibration fitted on a
@@ -520,6 +647,12 @@ class Config:
     #                (banking default; safe at 1.5M-row scale)
     #   'sigmoid'  — Platt scaling; cheaper, OK for very small calibration sets
     CALIBRATION_METHOD: str = os.getenv("CALIBRATION_METHOD", "isotonic")
+    # PD floor / cap applied to calibrated probabilities. Isotonic can output exactly
+    # 0 (no defaults in the lowest score band), which is not a usable PD for IFRS9 /
+    # Basel (retail PD floor 0.03%). Stored in the model artifact, so scoring uses the
+    # same bounds. Set PD_FLOOR=0 / PD_CAP=1 to disable.
+    PD_FLOOR: float = float(os.getenv("PD_FLOOR", 0.0003))
+    PD_CAP: float = float(os.getenv("PD_CAP", 0.9999))
 
     # ── Multi-seed bagging for final model ────────────────────────────────────
     # Trains N copies of the best-Optuna config with different random_state
@@ -578,6 +711,11 @@ class Config:
     # OOF reference replaced in-sample valid after the refit-on-train+valid change
     # (valid is now in-sample) to avoid false overfit triggers.
     OVERFIT_THRESHOLD: float = float(os.getenv("OVERFIT_THRESHOLD", 0.12))
+
+    # true → never try the LiteLLM proxy (no local gateway hosted): go straight to the
+    # direct providers (OpenAI if a key is set, else Claude). Saves the ~14 s connection
+    # retry that every LLM call otherwise burns before falling back.
+    LLM_SKIP_PROXY: bool = os.getenv("LLM_SKIP_PROXY", "false").lower() == "true"
 
     # ── Direct Cloud Fallback — order: LiteLLM proxy → OpenAI → Claude ─────────
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")

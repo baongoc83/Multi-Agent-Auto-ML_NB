@@ -159,9 +159,9 @@ def _print_metrics(final_metrics: dict) -> None:
     auc_keys = [
         ("cv_auc_mean",        "CV AUC (mean)   "),
         ("cv_auc_std",         "CV AUC (std)    "),
-        ("valid_temporal_auc", "Valid temporal  "),
-        ("valid_random_auc",   "Valid random    "),
-        ("valid_auc",          "Valid           "),
+        ("valid_temporal_auc", "Valid temporal (IN-SAMPLE)"),
+        ("valid_random_auc",   "Valid random (IN-SAMPLE)  "),
+        ("valid_auc",          "Valid (IN-SAMPLE)         "),
         ("oot_auc",            "OOT             "),
         ("test_auc",           "Test (holdout)  "),
     ]
