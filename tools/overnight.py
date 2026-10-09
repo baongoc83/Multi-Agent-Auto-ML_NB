@@ -18,16 +18,17 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-V2 = Path(r"D:\Ngoc\AI Project\Test_1st_version\multi-agent-auto-ml-v2")
+# Where the datasets live: --data-root, else $AUTOML_DATA_ROOT, else <repo>/data.
+DATA_ROOT = Path(os.environ.get("AUTOML_DATA_ROOT", ROOT / "data"))
 
 RUNS = [
     {"name": "snapdate_sample_data",
-     "args": [str(V2 / "outputs" / "sample_data.csv"), "label",
+     "args": ["{DATA}/sample_data.csv", "label",
               "--entity-id", "customer_id", "--keys", "customer_id,snap_dt",
               "--domain", "credit_risk", "--product-type", "consumer_unsecured",
               "--col-desc", str(ROOT / "data" / "col_descriptions.json")]},
     {"name": "home_credit_application_train",
-     "args": [str(V2 / "data" / "home-credit-default-risk" / "application_train_processed.csv"), "TARGET",
+     "args": ["{DATA}/home-credit-default-risk/application_train_processed.csv", "TARGET",
               "--entity-id", "SK_ID_CURR", "--keys", "SK_ID_CURR",
               "--domain", "credit_risk", "--product-type", "consumer_unsecured",
               "--col-desc", str(ROOT / "data" / "HomeCredit_columns_description.csv"),
@@ -49,7 +50,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*", default=None, help="run names to execute (default: all)")
     ap.add_argument("--env", nargs="*", default=[], help="extra KEY=VALUE for the pipeline processes")
+    ap.add_argument("--data-root", default=str(DATA_ROOT),
+                    help="folder holding the datasets (default $AUTOML_DATA_ROOT or <repo>/data)")
     args = ap.parse_args()
+    data_root = Path(args.data_root).resolve()
+    for r in RUNS:
+        r["args"] = [a.replace("{DATA}", str(data_root)) for a in r["args"]]
     runs = [r for r in RUNS if not args.only or r["name"] in args.only]
     _keep_awake()
     out = ROOT / "outputs" / f"overnight_{datetime.now():%Y%m%d_%H%M%S}"
@@ -66,7 +72,7 @@ def main():
             p = subprocess.run([sys.executable, str(ROOT / "main.py"), *r["args"]],
                                cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
         text = log.read_text(encoding="utf-8", errors="replace")
-        m = re.search(r"persisted → (\S+)", text)
+        m = re.search(r"persisted → (.+?) \| intermediates", text)    # paths may contain spaces
         run_dir = (ROOT / m.group(1)) if m else None
         status = "OK" if p.returncode == 0 else f"FAILED (exit {p.returncode})"
         dur = f"{(time.time() - t0) / 3600:.2f} h"

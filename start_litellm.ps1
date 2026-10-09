@@ -10,7 +10,8 @@
 # Skip running this script if you use a hosted gateway (set ANTHROPIC_BASE_URL
 # to the remote URL instead).
 
-$litellm = "C:\Users\DATANEST\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\Scripts\litellm.exe"
+# litellm executable: $env:LITELLM_EXE if set, else whatever `litellm` resolves to on PATH.
+$litellm = if ($env:LITELLM_EXE) { $env:LITELLM_EXE } else { (Get-Command litellm -ErrorAction SilentlyContinue).Source }
 $config  = Join-Path $PSScriptRoot "config.yaml"
 $envFile = Join-Path $PSScriptRoot ".env"
 
@@ -29,8 +30,8 @@ if (Test-Path $envFile) {
     Write-Warning ".env not found. OPENAI_API_KEY may not be set. Copy .env.example to .env and fill in your key."
 }
 
-if (-not (Test-Path $litellm)) {
-    Write-Error "litellm.exe not found at: $litellm"
+if (-not $litellm -or -not (Test-Path $litellm)) {
+    Write-Error "litellm not found (set LITELLM_EXE or put litellm on PATH)"
     Write-Host "Install it with:  pip install litellm"
     exit 1
 }

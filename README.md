@@ -479,7 +479,7 @@ Train data  ─►  FLAML        ─►  estimator + base hyperparams (AutoML)
 
 ## Yêu cầu môi trường
 
-- Python 3.10+
+- Python 3.12 (pinned in `.python-version`; numpy 2.3 needs >= 3.11 and the reference runs used 3.12)
 - Windows / macOS / Linux
 - GPU (tuỳ chọn) — auto-detect qua `nvidia-smi`
 - RAM khuyến nghị (sau dtype-downcast tại Agent 3):

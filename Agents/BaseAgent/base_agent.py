@@ -84,8 +84,29 @@ class BaseAgent:
         if Config.LLM_SEED is not None:
             kwargs["seed"] = Config.LLM_SEED
         if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
+            if getattr(Config, "LLM_JSON_MODE_NATIVE", True):
+                kwargs["response_format"] = {"type": "json_object"}
+            else:
+                kwargs["messages"][0]["content"] = (
+                    system_prompt + "\n\nIMPORTANT: Respond with valid JSON only. No text outside the JSON object.")
+        for p in getattr(Config, "LLM_OMIT_PARAMS", ()):
+            kwargs.pop(p, None)
+        extra = getattr(Config, "LLM_EXTRA_BODY", None)
+        if extra:
+            kwargs["extra_body"] = dict(extra)
         return kwargs
+
+    @staticmethod
+    def _message_text(response) -> str:
+        """Final answer text of an OpenAI-style response; some reasoning servers leave
+        `content` empty and put everything in `reasoning_content`."""
+        msg = response.choices[0].message
+        text = getattr(msg, "content", None) or ""
+        if not text.strip():
+            text = getattr(msg, "reasoning_content", None) or ""
+        if not text.strip():
+            raise ValueError("LLM returned an empty message")
+        return text
 
     def _log_token_usage(self, model: str, response) -> None:
         usage = getattr(response, "usage", None)
@@ -113,10 +134,19 @@ class BaseAgent:
             try:
                 response = self.client.chat.completions.create(**kwargs)
                 self._log_token_usage(model, response)
-                return response.choices[0].message.content
+                return self._message_text(response)
             except Exception as e:
-                if self._is_connection_error(e):
+                # With external fallback allowed, a dead proxy is handed to the next provider
+                # at once; on-prem (no fallback) it is retried like a transient server error.
+                if self._is_connection_error(e) and getattr(Config, "LLM_ALLOW_EXTERNAL_FALLBACK", True):
                     raise
+                if self._is_connection_error(e) and attempt < Config.LLM_MAX_RETRIES:
+                    wait = Config.LLM_RETRY_DELAY * (2 ** (attempt - 1))
+                    self.logger.log(self.name, "LLM Retry",
+                        f"Attempt {attempt}/{Config.LLM_MAX_RETRIES} — {e} — retrying in {wait:.1f}s")
+                    time.sleep(wait)
+                    last_exc = e
+                    continue
                 last_exc = e
                 if attempt < Config.LLM_MAX_RETRIES and self._is_retryable_error(e):
                     wait = Config.LLM_RETRY_DELAY * (2 ** (attempt - 1))
@@ -144,7 +174,7 @@ class BaseAgent:
             try:
                 response = direct_client.chat.completions.create(**kwargs)
                 self._log_token_usage(model, response)
-                result = response.choices[0].message.content
+                result = self._message_text(response)
                 self.logger.log(self.name, "LLM Response",
                     f"Direct API ({model}) | {len(result)} chars | fallback=direct")
                 return result
@@ -266,8 +296,24 @@ class BaseAgent:
                     raise
         raise last_exc
 
+    @staticmethod
+    def _strip_reasoning(text: str) -> str:
+        """Remove reasoning preambles emitted by thinking models before the answer."""
+        if not text:
+            return text
+        t = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I)
+        if re.search(r"</think>", t, flags=re.I):          # server stripped the opening tag
+            t = re.split(r"</think>", t, maxsplit=1, flags=re.I)[1]
+        t = re.sub(r"<\|(?:begin|end)_of_box\|>", "", t)    # GLM answer-box tokens
+        return t.strip()
+
     def call_llm(self, prompt: str, system_prompt: str, json_mode: bool = False,
                  max_tokens: Optional[int] = None) -> str:
+        text = self._call_llm_raw(prompt, system_prompt, json_mode, max_tokens)
+        return self._strip_reasoning(text) if getattr(Config, "LLM_STRIP_REASONING", True) else text
+
+    def _call_llm_raw(self, prompt: str, system_prompt: str, json_mode: bool = False,
+                      max_tokens: Optional[int] = None) -> str:
         # ── Gateway backend: single source, no application-level fallback ─────
         if getattr(Config, "BACKEND", "legacy") == "gateway":
             return self._call_via_gateway(prompt, system_prompt, json_mode, max_tokens)
@@ -281,8 +327,12 @@ class BaseAgent:
             f"temp={Config.LLM_TEMPERATURE} | top_p={Config.LLM_TOP_P} | "
             f"max_tokens={effective_max} | json_mode={json_mode}")
 
+        ext_ok = getattr(Config, "LLM_ALLOW_EXTERNAL_FALLBACK", True)
         # ── No proxy hosted: straight to the direct providers ─────────────────
         if getattr(Config, "LLM_SKIP_PROXY", False):
+            if not ext_ok:
+                raise RuntimeError("LLM_SKIP_PROXY=true needs LLM_ALLOW_EXTERNAL_FALLBACK=true "
+                                   "(there is no other provider to call).")
             if Config.OPENAI_API_KEY:
                 try:
                     return self._call_direct_api(system_prompt, prompt, json_mode, max_tokens)
@@ -297,7 +347,7 @@ class BaseAgent:
                 f"model={model} | {len(result)} chars")
             return result
         except Exception as e:
-            if self._is_connection_error(e):
+            if self._is_connection_error(e) and ext_ok:
                 self.logger.log(self.name, "ERROR",
                     f"Cannot reach LiteLLM proxy at {Config.LITELLM_URL}: {e}")
                 if Config.OPENAI_API_KEY:
@@ -321,6 +371,11 @@ class BaseAgent:
             return result
         except Exception as e2:
             self.logger.log(self.name, "ERROR", f"Both proxy models failed: {e2}")
+            if not ext_ok:
+                raise RuntimeError(
+                    f"LLM endpoint {Config.LITELLM_URL} failed for models '{model}' and "
+                    f"'{fallback_model}', and LLM_ALLOW_EXTERNAL_FALLBACK=false forbids public "
+                    f"APIs. Last error: {e2}") from e2
 
         # ── Fallback 2: OpenAI direct API ────────────────────────────────────
         if Config.OPENAI_API_KEY:
@@ -429,17 +484,29 @@ class BaseAgent:
 
     @staticmethod
     def _extract_json(text: str) -> str:
-        """Strip markdown fences; fall back to regex extraction of first {...} block."""
-        text = text.strip()
-        if "```json" in text:
-            return text.split("```json")[1].split("```")[0].strip()
-        if "```" in text:
-            return text.split("```")[1].split("```")[0].strip()
-        # Fallback: LLM returned prose before/after the JSON object
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return match.group(0)
-        return text
+        """Return the JSON object in an LLM answer.
+
+        Handles reasoning preambles (<think>…</think>, unterminated reasoning, GLM box
+        tokens), markdown fences and prose around the object. The object is found with a
+        real JSON decoder scanning every '{' — a greedy regex breaks as soon as the
+        reasoning or a trailing remark contains a brace.
+        """
+        text = BaseAgent._strip_reasoning(text or "").strip()
+        fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S | re.I)
+        if fence:
+            text = fence.group(1).strip()
+        dec = json.JSONDecoder()
+        best = None
+        for i, ch in enumerate(text):
+            if ch != "{":
+                continue
+            try:
+                obj, end = dec.raw_decode(text, i)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and (best is None or end - i > len(best)):
+                best = text[i:end]
+        return best if best is not None else text
 
     def execute_tool(self, tool_name: str, **kwargs) -> Any:
         self.logger.log(self.name, f"Tool: {tool_name}", f"Parameters: {kwargs}")

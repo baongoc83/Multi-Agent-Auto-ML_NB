@@ -444,3 +444,18 @@ Every option has a legacy value, so the old behaviour stays available. Unknown v
 | `PRUNE_SMOOTH_WINDOW` | `3` | Odd window of the moving average applied to the AUC-vs-size curve before the tolerance rule (1 = raw). Stops the rule latching onto a lucky spike on small valid sets. |
 | `PRUNE_SE_MULTIPLIER` | `0.0` | Widen the tolerance to this multiple of the Hanley-McNeil standard error of the valid AUC (0 = off; ~0.5 for small / noisy validation sets). |
 | `FINAL_ES_TREE_HEADROOM` | `2.0` | Final-model CV folds get this multiple of the tuned tree count so early stopping (not the ceiling) picks `best_iteration`. `1` = legacy (reproduce bundles written before this option). |
+
+
+## On-prem / enterprise LLM endpoints
+
+The legacy backend (`LLM_BACKEND=legacy`) uses the OpenAI chat API, so `LITELLM_URL` can be a LiteLLM proxy, an enterprise gateway, or a vLLM / SGLang / Ollama server directly (append `/v1` for those). `LLM_BACKEND=gateway` is only for Anthropic-compatible gateways.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `LLM_ALLOW_EXTERNAL_FALLBACK` | `true` | `false` = never call OpenAI / Anthropic directly; proxy errors (incl. connection errors) are retried, then the run fails with a clear error. Use `false` on-prem. |
+| `LLM_JSON_MODE_NATIVE` | `true` | Send `response_format={"type":"json_object"}`; `false` moves the JSON instruction into the system prompt for servers that reject it. |
+| `LLM_EXTRA_BODY` | empty | JSON merged into every request body, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}` (Qwen3 on vLLM/SGLang). |
+| `LLM_OMIT_PARAMS` | empty | Comma list of sampling params to drop (`frequency_penalty,presence_penalty,seed`). |
+| `LLM_STRIP_REASONING` | `true` | Remove `<think>…</think>` / unterminated reasoning / GLM box tokens before parsing. JSON is extracted with a real decoder, so braces in reasoning or prose no longer break parsing. |
+| `TIMEOUT` | `60` | Seconds per call; raise (e.g. 300) for local models. |
+| `LLM_MAX_TOKENS_LARGE` | `4000` | Raise (e.g. 8000) for thinking models that are not switched off. |

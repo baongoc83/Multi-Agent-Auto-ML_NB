@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -49,6 +50,26 @@ class Config:
     # Prompts longer than this (chars) are routed to the cloud model
     MODEL_ROUTING_THRESHOLD: int = int(os.getenv("MODEL_ROUTING_THRESHOLD", 6000))
 
+    # ── On-prem / OpenAI-compatible servers (vLLM, SGLang, Ollama, LiteLLM) ──
+    # false → never send data to public APIs (OpenAI / Anthropic direct). Proxy errors are
+    # retried and then raised. Set false for on-prem production.
+    LLM_ALLOW_EXTERNAL_FALLBACK: bool = os.getenv("LLM_ALLOW_EXTERNAL_FALLBACK", "true").lower() == "true"
+    # true → send response_format={"type":"json_object"}. Set false for servers that reject it
+    # (the JSON instruction is then put in the system prompt instead).
+    LLM_JSON_MODE_NATIVE: bool = os.getenv("LLM_JSON_MODE_NATIVE", "true").lower() == "true"
+    # Extra JSON merged into every OpenAI-style request body, e.g. disable "thinking":
+    #   Qwen3 on vLLM/SGLang : {"chat_template_kwargs": {"enable_thinking": false}}
+    #   GLM-4.5 / Z.ai style : {"thinking": {"type": "disabled"}}
+    LLM_EXTRA_BODY_RAW: str = os.getenv("LLM_EXTRA_BODY", "").strip()
+    try:
+        LLM_EXTRA_BODY: dict = json.loads(LLM_EXTRA_BODY_RAW) if LLM_EXTRA_BODY_RAW else {}
+    except json.JSONDecodeError as _e:
+        raise ValueError(f"LLM_EXTRA_BODY is not valid JSON: {_e}") from None
+    # Comma list of sampling params some servers reject, e.g. "frequency_penalty,presence_penalty,seed"
+    LLM_OMIT_PARAMS: tuple = tuple(p.strip() for p in os.getenv("LLM_OMIT_PARAMS", "").split(",") if p.strip())
+    # Strip <think>…</think> / reasoning preambles (Qwen3, DeepSeek-R1, GLM) before parsing.
+    LLM_STRIP_REASONING: bool = os.getenv("LLM_STRIP_REASONING", "true").lower() == "true"
+
     # ── Output Paths ─────────────────────────────────────────────────────────
     # Output layout (set by init_run() at pipeline construction):
     #   OUTPUT_DIR/<YYYY-MM-DD>/run_<NN>/         ← RUN_DIR (persisted)
@@ -64,7 +85,10 @@ class Config:
     #     └── clean_*.parquet + engineered_*.parquet (intermediate handoffs)
     #
     # Set KEEP_INTERMEDIATES=true to redirect TMP_DIR → RUN_DIR (debugging, tests).
-    OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "outputs")
+    # Relative values are anchored to the repo root (not the current working directory), so a
+    # job started from any folder writes to the same place. Absolute values are used as-is.
+    OUTPUT_DIR: str = (lambda p: p if os.path.isabs(p) else str(Path(__file__).resolve().parent / p))(
+        os.getenv("OUTPUT_DIR", "outputs"))
     KEEP_INTERMEDIATES: bool = os.getenv("KEEP_INTERMEDIATES", "false").lower() == "true"
     # Minimum free disk space (GB) on OUTPUT_DIR's filesystem at pipeline start.
     # Pipeline raises if below this — prevents mid-run write failures on production
